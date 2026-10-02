@@ -10,16 +10,18 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
-        "title": "DISCOnect — hello world",
-        "width": 800,
-        "height": 600
+        "title": "DISCOnect",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 390,
+        "minHeight": 600
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {
@@ -31,6 +33,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "resources/hearthbeat-core/": "hearthbeat-core/"
+    }
   }
 }
