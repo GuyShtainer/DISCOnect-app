@@ -1,0 +1,28 @@
+{
+  "created_at": "2026-10-02T19:31:14+00:00",
+  "format": "hearthbeat-keys",
+  "format_version": 1,
+  "key_id": "b4714bc6c191877abbd67d79274a4fd2",
+  "sqlcipher": {
+    "compat": 4,
+    "db_salt": null,
+    "key_form": "raw-hex",
+    "page_size": 4096
+  },
+  "wraps": [
+    {
+      "aead": "chacha20poly1305",
+      "ct": "V9ldEulrKqhNrJfFJWIt2gAX64D9UNKDeJv57upX70LBYtHp0BWcz190/D17tFjB",
+      "kdf": "argon2id",
+      "nonce": "feiiopymz3qAp4zk",
+      "params": {
+        "m_kib": 262144,
+        "p": 1,
+        "t": 3,
+        "v": 19
+      },
+      "purpose": "passphrase",
+      "salt": "8ara7GpGxQ+frTpZLGy/gQ=="
+    }
+  ]
+}
