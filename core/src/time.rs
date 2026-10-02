@@ -19,13 +19,25 @@ pub fn parse_iso_utc(text: &str) -> Option<Instant> {
     NaiveDateTime::parse_from_str(text, ISO).ok().map(|naive| Utc.from_utc_datetime(&naive))
 }
 
+/// TEST-ONLY clock pin, `YYYY-MM-DDTHH:MM:SSZ` (the twin of `storage/_time.py`'s `NOW_ENV`): both
+/// cores honour it at their one `now()` site so a differential run is deterministic. The desktop
+/// sidecar's env allowlist never passes it on; an unparseable value is ignored.
+pub const NOW_ENV: &str = "DISCONECT_NOW";
+
+/// The one clock this crate reads: Unix seconds now, or the `DISCONECT_NOW` pin.
+pub fn now_unix() -> u64 {
+    if let Some(pinned) = std::env::var(NOW_ENV).ok().filter(|v| !v.is_empty())
+        && let Some(moment) = parse_iso_utc(&pinned)
+        && let Ok(secs) = u64::try_from(moment.timestamp())
+    {
+        return secs;
+    }
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// Now, as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn utc_now_iso() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    iso_from_unix(secs)
+    iso_from_unix(now_unix())
 }
 
 /// Format Unix seconds (>= 0) as `YYYY-MM-DDTHH:MM:SSZ`.

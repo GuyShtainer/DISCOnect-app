@@ -1,0 +1,1047 @@
+{
+  "contract_version": "1",
+  "conventions": {
+    "time": "Sample timestamps (ts_utc) are RFC 3339 in UTC with a trailing 'Z'. Daily values are keyed by the watch's local calendar date (YYYY-MM-DD), resolved with the UTC offset the watch itself reported nearest to that moment; a night of sleep is keyed by the local date it ended. The time a file was imported (imported_at) is not the time a measurement happened and never stands in for it.",
+    "missing_values": "Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
+    "sources": "source_scope names the layer a value came from. 'device' is decoded from the watch's own FIT bytes, whichever way they arrived (USB, a Connect account export, Gadgetbridge). 'vendor_cloud' is a figure Garmin Connect computed and delivered as JSON. 'local' is computed here from device data. The scopes are stored side by side and never merged; every value says which scope it belongs to.",
+    "privacy": "Reads one local SQLite file. Opens no network connection and no port. Returns no device serial numbers, file paths, account identifiers, or GPS coordinates.",
+    "coverage": "Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. Coverage is derived from the retained raw files each time it is asked for; it is never guessed."
+  },
+  "source_scopes": [
+    "device",
+    "vendor_cloud",
+    "local"
+  ],
+  "metrics": [
+    {
+      "metric": "heart_rate",
+      "unit": "bpm",
+      "cadence": "sample",
+      "description": "Wrist heart rate from all-day monitoring, every minute or two."
+    },
+    {
+      "metric": "stress",
+      "unit": "score",
+      "cadence": "sample",
+      "description": "Stress level 0-100 once a minute; invalid readings dropped."
+    },
+    {
+      "metric": "respiration_rate",
+      "unit": "breaths/min",
+      "cadence": "sample",
+      "description": "Respiration rate once a minute; invalid readings dropped."
+    },
+    {
+      "metric": "spo2",
+      "unit": "%",
+      "cadence": "sample",
+      "description": "Pulse oximetry reading (periodic or spot check); off-wrist readings dropped."
+    },
+    {
+      "metric": "hrv_rmssd",
+      "unit": "ms",
+      "cadence": "sample",
+      "description": "Five-minute heart-rate variability (RMSSD) measured during sleep."
+    },
+    {
+      "metric": "energy_reserve",
+      "unit": "score",
+      "cadence": "sample",
+      "description": "The watch's own body-energy gauge, 0-100, one reading a minute: it rises with rest and sleep and falls with stress and effort. Read from the watch's files, not estimated."
+    },
+    {
+      "metric": "steps",
+      "unit": "steps",
+      "cadence": "daily",
+      "description": "Steps for the local day. From device data this is the sum over activity types of each type's highest cumulative count that day."
+    },
+    {
+      "metric": "distance",
+      "unit": "m",
+      "cadence": "daily",
+      "description": "Distance walked and run for the day."
+    },
+    {
+      "metric": "resting_heart_rate",
+      "unit": "bpm",
+      "cadence": "daily",
+      "description": "Resting heart rate as the watch reports it for the day."
+    },
+    {
+      "metric": "resting_heart_rate_current_day",
+      "unit": "bpm",
+      "cadence": "daily",
+      "description": "The watch's running resting-heart-rate estimate for the current day."
+    },
+    {
+      "metric": "heart_rate_min",
+      "unit": "bpm",
+      "cadence": "daily",
+      "description": "Lowest heart rate of the day."
+    },
+    {
+      "metric": "heart_rate_max",
+      "unit": "bpm",
+      "cadence": "daily",
+      "description": "Highest heart rate of the day."
+    },
+    {
+      "metric": "stress_avg",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Average stress level over the whole day."
+    },
+    {
+      "metric": "energy_reserve_high",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Highest energy-reserve reading of the local day."
+    },
+    {
+      "metric": "energy_reserve_low",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Lowest energy-reserve reading of the local day."
+    },
+    {
+      "metric": "energy_reserve_charged",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Energy reserve gained over the local day: the sum of the gauge's upward steps between consecutive readings at most 15 minutes apart, counted from the day's first reading."
+    },
+    {
+      "metric": "energy_reserve_drained",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Energy reserve spent over the local day: the sum of the gauge's downward steps between consecutive readings at most 15 minutes apart, counted from the day's first reading."
+    },
+    {
+      "metric": "spo2_avg",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Average pulse oximetry reading for the day."
+    },
+    {
+      "metric": "spo2_lowest",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Lowest pulse oximetry reading for the day."
+    },
+    {
+      "metric": "respiration_avg_waking",
+      "unit": "breaths/min",
+      "cadence": "daily",
+      "description": "Average respiration rate while awake."
+    },
+    {
+      "metric": "respiration_lowest",
+      "unit": "breaths/min",
+      "cadence": "daily",
+      "description": "Lowest respiration rate of the day."
+    },
+    {
+      "metric": "respiration_highest",
+      "unit": "breaths/min",
+      "cadence": "daily",
+      "description": "Highest respiration rate of the day."
+    },
+    {
+      "metric": "intensity_minutes_moderate",
+      "unit": "min",
+      "cadence": "daily",
+      "description": "Moderate-intensity minutes."
+    },
+    {
+      "metric": "intensity_minutes_vigorous",
+      "unit": "min",
+      "cadence": "daily",
+      "description": "Vigorous-intensity minutes."
+    },
+    {
+      "metric": "calories_total",
+      "unit": "kcal",
+      "cadence": "daily",
+      "description": "Total energy expenditure for the day."
+    },
+    {
+      "metric": "calories_active",
+      "unit": "kcal",
+      "cadence": "daily",
+      "description": "Active energy expenditure for the day."
+    },
+    {
+      "metric": "calories_bmr",
+      "unit": "kcal",
+      "cadence": "daily",
+      "description": "Basal metabolic energy for the day."
+    },
+    {
+      "metric": "resting_metabolic_rate",
+      "unit": "kcal/day",
+      "cadence": "daily",
+      "description": "Resting metabolic rate the watch used for the day."
+    },
+    {
+      "metric": "sleep_score",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Overall sleep score 0-100 for the night ending that day."
+    },
+    {
+      "metric": "sleep_duration",
+      "unit": "min",
+      "cadence": "daily",
+      "description": "Minutes asleep (deep + light + REM) for the night ending that day."
+    },
+    {
+      "metric": "hrv_weekly_average",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Seven-day average of nightly HRV."
+    },
+    {
+      "metric": "hrv_last_night_average",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Average HRV of the last night."
+    },
+    {
+      "metric": "hrv_last_night_5min_high",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Highest five-minute HRV of the last night."
+    },
+    {
+      "metric": "hrv_baseline_low_upper",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Upper bound of the personal 'low' HRV band the watch reports."
+    },
+    {
+      "metric": "hrv_baseline_balanced_lower",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Lower bound of the personal 'balanced' HRV band the watch reports."
+    },
+    {
+      "metric": "hrv_baseline_balanced_upper",
+      "unit": "ms",
+      "cadence": "daily",
+      "description": "Upper bound of the personal 'balanced' HRV band the watch reports."
+    },
+    {
+      "metric": "skin_temp_nightly",
+      "unit": "degC",
+      "cadence": "daily",
+      "description": "Overnight skin temperature value as the watch reports it."
+    },
+    {
+      "metric": "skin_temp_deviation",
+      "unit": "degC",
+      "cadence": "daily",
+      "description": "Overnight skin temperature deviation from the personal baseline."
+    },
+    {
+      "metric": "skin_temp_7day_deviation",
+      "unit": "degC",
+      "cadence": "daily",
+      "description": "Seven-day average skin temperature deviation."
+    },
+    {
+      "metric": "vo2max",
+      "unit": "mL/kg/min",
+      "cadence": "daily",
+      "description": "VO2max estimate on the day the watch updated it."
+    },
+    {
+      "metric": "body_battery_high",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Highest body battery level of the day."
+    },
+    {
+      "metric": "body_battery_low",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Lowest body battery level of the day."
+    },
+    {
+      "metric": "body_battery_charged",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Body battery gained over the day."
+    },
+    {
+      "metric": "body_battery_drained",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Body battery spent over the day."
+    },
+    {
+      "metric": "training_readiness",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Training readiness score 0-100, the morning value when one exists."
+    },
+    {
+      "metric": "readiness_factor_sleep",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of last night's sleep to readiness."
+    },
+    {
+      "metric": "readiness_factor_recovery_time",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of remaining recovery time to readiness."
+    },
+    {
+      "metric": "readiness_factor_load_ratio",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of the acute:chronic load ratio to readiness."
+    },
+    {
+      "metric": "readiness_factor_stress_history",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of recent stress to readiness."
+    },
+    {
+      "metric": "readiness_factor_hrv",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of HRV status to readiness."
+    },
+    {
+      "metric": "readiness_factor_sleep_history",
+      "unit": "%",
+      "cadence": "daily",
+      "description": "Vendor's stated contribution of recent sleep history to readiness."
+    },
+    {
+      "metric": "recovery_time",
+      "unit": "h",
+      "cadence": "daily",
+      "description": "Recovery time remaining, as reported."
+    },
+    {
+      "metric": "training_load_acute",
+      "unit": "load",
+      "cadence": "daily",
+      "description": "Acute (seven-day) training load as reported, alongside training_load_chronic and training_load_ratio."
+    },
+    {
+      "metric": "training_load_chronic",
+      "unit": "load",
+      "cadence": "daily",
+      "description": "Chronic (four-week) training load as reported, alongside training_load_acute and training_load_ratio."
+    },
+    {
+      "metric": "training_load_ratio",
+      "unit": "ratio",
+      "cadence": "daily",
+      "description": "Ratio of acute to chronic training load as reported."
+    },
+    {
+      "metric": "endurance_score",
+      "unit": "score",
+      "cadence": "daily",
+      "description": "Endurance Score as the cloud computes it for the day."
+    },
+    {
+      "metric": "fitness_age",
+      "unit": "years",
+      "cadence": "daily",
+      "description": "Estimated fitness age as of the assessment's date."
+    },
+    {
+      "metric": "weight_kg",
+      "unit": "kg",
+      "cadence": "daily",
+      "description": "Body weight as logged in the vendor's biometrics; grams are converted to kilograms."
+    },
+    {
+      "metric": "active_minutes",
+      "unit": "min",
+      "cadence": "daily",
+      "description": "Minutes of active movement for the day, from the daily wellness rollup."
+    },
+    {
+      "metric": "highly_active_minutes",
+      "unit": "min",
+      "cadence": "daily",
+      "description": "Minutes of highly active movement for the day, from the daily wellness rollup."
+    },
+    {
+      "metric": "hydration_ml",
+      "unit": "mL",
+      "cadence": "daily",
+      "description": "Fluid intake logged for the day."
+    },
+    {
+      "metric": "sweat_loss_ml",
+      "unit": "mL",
+      "cadence": "daily",
+      "description": "Estimated sweat loss for the day."
+    }
+  ],
+  "labels": [
+    {
+      "metric": "hrv_status",
+      "unit": "label",
+      "cadence": "daily",
+      "description": "HRV status band: balanced, unbalanced, low, poor, or none."
+    },
+    {
+      "metric": "training_readiness_level",
+      "unit": "label",
+      "cadence": "daily",
+      "description": "Readiness band: prime, high, moderate, low, or poor."
+    },
+    {
+      "metric": "training_readiness_context",
+      "unit": "label",
+      "cadence": "daily",
+      "description": "Which of the day's readiness updates the score was taken from."
+    },
+    {
+      "metric": "vo2max_sport",
+      "unit": "label",
+      "cadence": "daily",
+      "description": "Sport the VO2max estimate belongs to."
+    },
+    {
+      "metric": "training_load_status",
+      "unit": "label",
+      "cadence": "daily",
+      "description": "Acute:chronic training-load status band, lower-cased as the cloud reports it."
+    }
+  ],
+  "streams_for": [
+    {
+      "metric": "heart_rate",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "stress",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "energy_reserve",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "respiration_rate",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "spo2",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "hrv_rmssd",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "steps",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "distance",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "stress_avg",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "heart_rate_min",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "heart_rate_max",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "energy_reserve_high",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "energy_reserve_low",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "energy_reserve_charged",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "energy_reserve_drained",
+      "source_scope": "local",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "resting_heart_rate",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "resting_heart_rate_current_day",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "resting_metabolic_rate",
+      "source_scope": "device",
+      "streams": [
+        "fit:monitoring_b"
+      ]
+    },
+    {
+      "metric": "sleep_score",
+      "source_scope": "device",
+      "streams": [
+        "fit:sleep"
+      ]
+    },
+    {
+      "metric": "sleep_duration",
+      "source_scope": "device",
+      "streams": [
+        "fit:sleep"
+      ]
+    },
+    {
+      "metric": "hrv_weekly_average",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_last_night_average",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_last_night_5min_high",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_baseline_low_upper",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_baseline_balanced_lower",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_baseline_balanced_upper",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "hrv_status",
+      "source_scope": "device",
+      "streams": [
+        "fit:hrv"
+      ]
+    },
+    {
+      "metric": "skin_temp_nightly",
+      "source_scope": "device",
+      "streams": [
+        "fit:skin_temp"
+      ]
+    },
+    {
+      "metric": "skin_temp_deviation",
+      "source_scope": "device",
+      "streams": [
+        "fit:skin_temp"
+      ]
+    },
+    {
+      "metric": "skin_temp_7day_deviation",
+      "source_scope": "device",
+      "streams": [
+        "fit:skin_temp"
+      ]
+    },
+    {
+      "metric": "vo2max",
+      "source_scope": "device",
+      "streams": [
+        "fit:metrics"
+      ]
+    },
+    {
+      "metric": "vo2max_sport",
+      "source_scope": "device",
+      "streams": [
+        "fit:metrics"
+      ]
+    },
+    {
+      "metric": "steps",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "distance",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "resting_heart_rate",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "resting_heart_rate_current_day",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "heart_rate_min",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "heart_rate_max",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "stress_avg",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "spo2_avg",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "spo2_lowest",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "respiration_avg_waking",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "respiration_lowest",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "respiration_highest",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "intensity_minutes_moderate",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "intensity_minutes_vigorous",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "calories_total",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "calories_active",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "calories_bmr",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "body_battery_high",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "body_battery_low",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "body_battery_charged",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "body_battery_drained",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "active_minutes",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "highly_active_minutes",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "hydration_ml",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "sweat_loss_ml",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:uds"
+      ]
+    },
+    {
+      "metric": "sleep_score",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:sleep"
+      ]
+    },
+    {
+      "metric": "sleep_duration",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:sleep"
+      ]
+    },
+    {
+      "metric": "training_readiness",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_sleep",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_recovery_time",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_load_ratio",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_stress_history",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_hrv",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "readiness_factor_sleep_history",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "hrv_weekly_average",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "recovery_time",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "training_readiness_level",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "training_readiness_context",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:readiness"
+      ]
+    },
+    {
+      "metric": "vo2max",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:vo2max"
+      ]
+    },
+    {
+      "metric": "vo2max_sport",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:vo2max"
+      ]
+    },
+    {
+      "metric": "training_load_acute",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:training_load"
+      ]
+    },
+    {
+      "metric": "training_load_chronic",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:training_load"
+      ]
+    },
+    {
+      "metric": "training_load_ratio",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:training_load"
+      ]
+    },
+    {
+      "metric": "training_load_status",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:training_load"
+      ]
+    },
+    {
+      "metric": "endurance_score",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:endurance"
+      ]
+    },
+    {
+      "metric": "fitness_age",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:fitness_age"
+      ]
+    },
+    {
+      "metric": "weight_kg",
+      "source_scope": "vendor_cloud",
+      "streams": [
+        "json:biometrics"
+      ]
+    }
+  ],
+  "sparse_metrics": [
+    "endurance_score",
+    "fitness_age",
+    "hrv_baseline_balanced_lower",
+    "hrv_baseline_balanced_upper",
+    "hrv_baseline_low_upper",
+    "hydration_ml",
+    "resting_metabolic_rate",
+    "spo2",
+    "spo2_avg",
+    "spo2_lowest",
+    "sweat_loss_ml",
+    "training_load_acute",
+    "training_load_chronic",
+    "training_load_ratio",
+    "training_load_status",
+    "vo2max",
+    "vo2max_sport",
+    "weight_kg"
+  ],
+  "comparison_targets": [
+    {
+      "metric": "energy_reserve_high",
+      "source_scope": "local",
+      "compared_with": "body_battery_high",
+      "compared_scope": "vendor_cloud"
+    },
+    {
+      "metric": "energy_reserve_low",
+      "source_scope": "local",
+      "compared_with": "body_battery_low",
+      "compared_scope": "vendor_cloud"
+    },
+    {
+      "metric": "energy_reserve_charged",
+      "source_scope": "local",
+      "compared_with": "body_battery_charged",
+      "compared_scope": "vendor_cloud"
+    },
+    {
+      "metric": "energy_reserve_drained",
+      "source_scope": "local",
+      "compared_with": "body_battery_drained",
+      "compared_scope": "vendor_cloud"
+    }
+  ],
+  "insight": {
+    "rules": [
+      "Comparisons are against this person's own earlier data only; no population norms exist here.",
+      "With fewer than three baseline days a fact has no comparison and confidence 'insufficient'.",
+      "Facts describe direction and size; they do not diagnose, and 'higher' is not 'better'."
+    ],
+    "confidence_bands": [
+      {
+        "min_days": 8,
+        "label": "high"
+      },
+      {
+        "min_days": 5,
+        "label": "medium"
+      },
+      {
+        "min_days": 3,
+        "label": "low"
+      }
+    ]
+  },
+  "coverage_refinements": {
+    "available": "claimed export windows and failure spans are recorded for imports made at schema v2 or later; earlier imports contribute their files' spans only",
+    "unavailable": "claimed export windows and failure spans are not recorded on this database (schema v1); files' spans still decide coverage. Any import or reparse upgrades the schema; re-importing the export records its windows"
+  }
+}

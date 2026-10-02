@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+//! `disconect-core [--db <path>]` (no subcommand, or `serve`) runs the JSON-lines sidecar protocol on
+//! stdio; the default store is `$HEARTHBEAT_DB`, else `~/.hearthbeat/hearthbeat.db`.
+//!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
 //!  | sync push|pull|status|forget [--relay <folder> [--remember]]`
 //!
@@ -16,7 +19,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use disconect_core::keys::{KeyError, PassphraseSource};
+use disconect_core::keys::{self, KeyError, PassphraseSource};
+use disconect_core::serve;
 use disconect_core::relay::folder::{FolderRelay, RelayError};
 use disconect_core::relay::sync::{self, PullResult, StatusReport, SyncError};
 use disconect_core::sources::{self, SourceError, TRANSPORTS};
@@ -33,9 +37,10 @@ const EXIT_DATABASE: u8 = 6;
 const EXIT_SCHEMA: u8 = 7;
 
 struct Args {
-    db: PathBuf,
+    db: Option<PathBuf>,
     passphrase_file: Option<PathBuf>,
-    command: String,
+    /// None: serve.
+    command: Option<String>,
     json: bool,
     import_path: Option<PathBuf>,
     transport: Option<String>,
@@ -63,7 +68,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--relay" => relay = Some(it.next().ok_or("--relay needs a folder")?),
             "--remember" => remember = true,
-            "status" | "init" | "import" | "sync" if command.is_none() => command = Some(arg),
+            "status" | "init" | "import" | "sync" | "serve" if command.is_none() => command = Some(arg),
             "push" | "pull" | "status" | "forget"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
@@ -76,9 +81,9 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     Ok(Args {
-        db: db.ok_or("--db <path> is required")?,
+        db,
         passphrase_file: pass,
-        command: command.ok_or("a command is required: status --json | init | import <path> | sync push|pull|status|forget")?,
+        command: command.filter(|c| c != "serve"),
         json,
         import_path,
         transport,
@@ -128,7 +133,7 @@ fn import_exit_code(err: &SourceError) -> u8 {
 /// Import a path; the summary is counts only. Exit 0 on ok, 1 on partial/failed.
 fn run_import(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String)> {
     let path = args.import_path.as_ref().ok_or((EXIT_USAGE, "import needs a path".to_string()))?;
-    let opened = store::open_for_write(&args.db, "import", 10.0, source).map_err(|e| {
+    let opened = store::open_for_write(db_of(args)?, "import", 10.0, source).map_err(|e| {
         let code = match &e {
             StoreError::Lock(LockError::Busy { .. }) => EXIT_BUSY,
             StoreError::SchemaTooNew { .. } => EXIT_SCHEMA,
@@ -268,7 +273,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
     let open_err = |e: StoreError| (open_error_code(&e), e.to_string());
     match action {
         "forget" => {
-            let opened = store::open_for_write(&args.db, "sync", 10.0, source).map_err(open_err)?;
+            let opened = store::open_for_write(db_of(args)?, "sync", 10.0, source).map_err(open_err)?;
             sync::forget_relay_state(opened.conn()).map_err(failed)?;
             emit(
                 args.json,
@@ -278,7 +283,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             Ok(())
         }
         "status" => {
-            let opened = store::open_for_write(&args.db, "sync", 10.0, source).map_err(open_err)?;
+            let opened = store::open_for_write(db_of(args)?, "sync", 10.0, source).map_err(open_err)?;
             let report = sync::status(opened.conn()).map_err(failed)?;
             let bundles: Map<String, Value> = report.bundles.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
             let payload = json!({
@@ -293,7 +298,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             Ok(())
         }
         _ => {
-            let master = store::resolve_master(&args.db, source).map_err(open_err)?;
+            let master = store::resolve_master(db_of(args)?, source).map_err(open_err)?;
             let Some(master) = master else {
                 return Err((
                     EXIT_LOCKED,
@@ -302,7 +307,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             };
             let relay = relay_for(args)?;
             let opened =
-                store::open_for_write_with(&args.db, "sync", 10.0, Some(&master)).map_err(open_err)?;
+                store::open_for_write_with(db_of(args)?, "sync", 10.0, Some(&master)).map_err(open_err)?;
             if action == "push" {
                 let result = sync::push(opened.conn(), &*master, &relay).map_err(failed)?;
                 emit(
@@ -338,6 +343,11 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
     }
 }
 
+/// The store a command works on: `--db` is required for everything except `serve`.
+fn db_of(args: &Args) -> Result<&PathBuf, (u8, String)> {
+    args.db.as_ref().ok_or((1, "--db <path> is required".to_string()))
+}
+
 fn run(args: &Args) -> Result<(), (u8, String)> {
     let phrase = match &args.passphrase_file {
         Some(p) => Some(read_passphrase(p).map_err(|m| (1, m))?),
@@ -348,17 +358,43 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
         None => PassphraseSource::Env,
     };
     let fail = |e: StoreError| (exit_code_for(&e), e.to_string());
-    match args.command.as_str() {
+    match args.command.as_deref().unwrap_or_default() {
         "import" => run_import(args, source),
         "sync" => run_sync(args, source),
         "status" if args.json => {
-            let value = status(&args.db, source).map_err(fail)?;
+            let value = status(db_of(args)?, source).map_err(fail)?;
             println!("{value}");
             Ok(())
         }
         "status" => Err((1, "status requires --json".to_string())),
-        _ => store::open_for_write(&args.db, "init", 10.0, source).map(|_| ()).map_err(fail),
+        _ => store::open_for_write(db_of(args)?, "init", 10.0, source).map(|_| ()).map_err(fail),
     }
+}
+
+/// `serve`: scrub the secret variables first (before any thread exists), then speak the protocol.
+fn run_serve(args: &Args) -> ExitCode {
+    let unexpected = args.json
+        || args.passphrase_file.is_some()
+        || args.import_path.is_some()
+        || args.transport.is_some()
+        || args.sync_action.is_some()
+        || args.relay.is_some()
+        || args.remember;
+    if unexpected {
+        eprintln!("error: serve takes only --db <path>");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    // `--db` is taken literally (the oracle's argparse default is the only place `~` is expanded)
+    let Some(db) = args.db.clone().or_else(serve::default_db_path) else {
+        eprintln!("error: no store: pass --db <path> or set HEARTHBEAT_DB (HOME is not set)");
+        return ExitCode::from(1);
+    };
+    let removed = keys::scrub_env_secrets();
+    let warnings: Vec<String> = removed
+        .then(|| format!("{} is ignored by serve and was removed from the environment", keys::PASSPHRASE_ENV))
+        .into_iter()
+        .collect();
+    ExitCode::from(u8::try_from(serve::run(db, &warnings)).unwrap_or(1))
 }
 
 fn main() -> ExitCode {
@@ -370,6 +406,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if args.command.is_none() {
+        return run_serve(&args);
+    }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err((code, message)) => {

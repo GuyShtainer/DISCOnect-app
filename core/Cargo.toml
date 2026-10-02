@@ -37,6 +37,15 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ryu = "1.0.23"
 getrandom = "0.4"
 
+# The OS keychain behind `key.cache` (MIT/Apache-2.0; talks to the Security framework in-process,
+# so the master key never appears in a child process's argv). Other platforms: no keychain.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+# `serve` isolates the protocol on a private descriptor (dup/dup2); unix-only (row 13 for Windows).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

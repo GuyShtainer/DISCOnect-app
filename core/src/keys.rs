@@ -24,6 +24,7 @@ pub const PASSPHRASE_ENV: &str = "HEARTHBEAT_PASSPHRASE";
 pub const KEYS_ENV: &str = "HEARTHBEAT_KEYS";
 pub const KEY_FILE_SUFFIX: &str = ".keys.json";
 pub const NEXT_SUFFIX: &str = ".next";
+pub const RECOVERY_WORDS_ENV: &str = "HEARTHBEAT_RECOVERY_WORDS";
 pub const PURPOSE_PASSPHRASE: &str = "passphrase";
 
 const KDF_FLOOR_M_KIB: u64 = 64 * 1024;
@@ -66,10 +67,19 @@ pub struct KeyFile {
     pub wraps: Vec<Value>,
 }
 
-/// `$HEARTHBEAT_KEYS` if set and non-empty, else `<db>.keys.json` beside the database.
+/// `Path.expanduser()` for a leading `~` or `~/`: `$HOME` stands in for the home directory.
+/// (`~name` is left alone; Python would look `name` up in the password database.)
+pub fn expand_user(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `$HEARTHBEAT_KEYS` (with `~` expanded) if set and non-empty, else `<db>.keys.json` beside the database.
 pub fn key_path_for(db_path: &Path) -> PathBuf {
     match std::env::var_os(KEYS_ENV) {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
+        Some(p) if !p.is_empty() => expand_user(Path::new(&p)),
         _ => sibling_with_suffix(db_path, KEY_FILE_SUFFIX),
     }
 }
@@ -264,6 +274,21 @@ pub fn take_env_passphrase() -> Option<Zeroizing<String>> {
     // SAFETY: called early on the calling thread; this crate does not read the env concurrently.
     unsafe { std::env::remove_var(PASSPHRASE_ENV) };
     value.filter(|v| !v.is_empty()).map(Zeroizing::new)
+}
+
+/// Remove both secret variables (`serve` never unlocks from the environment). Returns whether the
+/// passphrase variable was set, even to an empty string (that is what the oracle warns about).
+///
+/// Call this first thing in `main`, before any thread exists: `remove_var` is unsafe in edition 2024
+/// because another thread's `getenv` may race it.
+pub fn scrub_env_secrets() -> bool {
+    let was_set = std::env::var_os(PASSPHRASE_ENV).is_some();
+    // SAFETY: documented above; the binary calls this before it spawns anything.
+    unsafe {
+        std::env::remove_var(PASSPHRASE_ENV);
+        std::env::remove_var(RECOVERY_WORDS_ENV);
+    }
+    was_set
 }
 
 /// Where a passphrase may come from in this slice (no keychain, no prompt).
