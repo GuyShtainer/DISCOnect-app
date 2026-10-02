@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Local calendar dates from the watch's own UTC offsets: the twin of `ingest/clock.py`.
+//!
+//! The resolver picks the stated offset nearest in time to the moment being dated (ties go to the
+//! earlier entry). With no offset known at all it falls back to UTC and counts it in
+//! [`ClockOffsets::assumed_utc`] rather than guessing a zone.
+
+use std::cell::Cell;
+
+use chrono::Duration;
+use rusqlite::{Connection, params};
+
+use crate::model::{ClockOffset, Instant};
+use crate::time::{iso_utc, parse_iso_utc};
+
+/// Sorted (moment, offset) pairs with nearest-neighbour lookup.
+#[derive(Debug, Default)]
+pub struct ClockOffsets {
+    moments: Vec<i64>,
+    offsets: Vec<i64>,
+    /// How many dates were resolved without any known offset.
+    assumed_utc: Cell<u64>,
+}
+
+impl ClockOffsets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Offsets already persisted by earlier imports.
+    pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        let mut offsets = Self::new();
+        let mut stmt = conn.prepare("SELECT ts_utc, offset_s FROM clock_offsets")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (ts_utc, offset_s) = row?;
+            let ts_utc = parse_iso_utc(&ts_utc).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    "clock_offsets.ts_utc is not YYYY-MM-DDTHH:MM:SSZ".into(),
+                )
+            })?;
+            offsets.add(ClockOffset { ts_utc, offset_s });
+        }
+        Ok(offsets)
+    }
+
+    pub fn len(&self) -> usize {
+        self.moments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.moments.is_empty()
+    }
+
+    /// How many dates were resolved without any known offset.
+    pub fn assumed_utc(&self) -> u64 {
+        self.assumed_utc.get()
+    }
+
+    /// Insert, or replace the offset stated for the very same moment.
+    pub fn add(&mut self, offset: ClockOffset) {
+        let key = offset.ts_utc.timestamp();
+        let index = self.moments.partition_point(|m| *m < key); // bisect_left
+        if self.moments.get(index) == Some(&key) {
+            self.offsets[index] = offset.offset_s;
+            return;
+        }
+        self.moments.insert(index, key);
+        self.offsets.insert(index, offset.offset_s);
+    }
+
+    pub fn extend(&mut self, offsets: impl IntoIterator<Item = ClockOffset>) {
+        for offset in offsets {
+            self.add(offset);
+        }
+    }
+
+    /// The stated offset nearest to `moment` (ties to the earlier entry), or None if none is known.
+    pub fn offset_at(&self, moment: Instant) -> Option<i64> {
+        if self.moments.is_empty() {
+            return None;
+        }
+        let key = moment.timestamp();
+        let index = self.moments.partition_point(|m| *m < key); // bisect_left
+        let mut best: Option<usize> = None;
+        // Candidates index-1 then index; the first minimum wins.
+        for candidate in [index.checked_sub(1), Some(index)].into_iter().flatten() {
+            if candidate >= self.moments.len() {
+                continue;
+            }
+            let distance = (self.moments[candidate] - key).abs();
+            let better = match best {
+                None => true,
+                Some(b) => distance < (self.moments[b] - key).abs(),
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+        best.map(|i| self.offsets[i])
+    }
+
+    /// `YYYY-MM-DD` on the watch's clock at `moment`.
+    pub fn local_date(&self, moment: Instant) -> String {
+        let offset = self.offset_at(moment).unwrap_or_else(|| {
+            self.assumed_utc.set(self.assumed_utc.get() + 1);
+            0
+        });
+        (moment + Duration::seconds(offset)).date_naive().format("%Y-%m-%d").to_string()
+    }
+
+    /// Persist offsets a file stated (`INSERT OR REPLACE`).
+    pub fn persist(
+        conn: &Connection,
+        offsets: &[ClockOffset],
+        device_id: Option<&str>,
+        raw_record_id: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        let mut stmt = conn.prepare_cached(
+            "INSERT OR REPLACE INTO clock_offsets(ts_utc, offset_s, device_id, raw_record_id) VALUES(?, ?, ?, ?)",
+        )?;
+        for o in offsets {
+            stmt.execute(params![iso_utc(&o.ts_utc), o.offset_s, device_id, raw_record_id])?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn at(secs: i64) -> Instant {
+        Utc.timestamp_opt(secs, 0).single().expect("valid instant")
+    }
+
+    fn offset(secs: i64, offset_s: i64) -> ClockOffset {
+        ClockOffset { ts_utc: at(secs), offset_s }
+    }
+
+    #[test]
+    fn no_offsets_means_utc_and_is_counted() {
+        let clock = ClockOffsets::new();
+        assert_eq!(clock.offset_at(at(0)), None);
+        assert_eq!(clock.local_date(at(86_400 * 3 + 5)), "1970-01-04");
+        assert_eq!(clock.local_date(at(86_399)), "1970-01-01");
+        assert_eq!(clock.assumed_utc(), 2);
+    }
+
+    #[test]
+    fn nearest_wins_and_ties_go_to_the_earlier_entry() {
+        let mut clock = ClockOffsets::new();
+        clock.extend([offset(1000, 3600), offset(2000, 7200), offset(500, -1800)]);
+        assert_eq!(clock.len(), 3);
+        assert_eq!(clock.offset_at(at(0)), Some(-1800));
+        assert_eq!(clock.offset_at(at(700)), Some(-1800));
+        assert_eq!(clock.offset_at(at(800)), Some(3600));
+        assert_eq!(clock.offset_at(at(1500)), Some(3600), "exact tie: the earlier entry");
+        assert_eq!(clock.offset_at(at(1501)), Some(7200));
+        assert_eq!(clock.offset_at(at(9999)), Some(7200));
+        assert_eq!(clock.assumed_utc(), 0);
+    }
+
+    #[test]
+    fn an_equal_moment_replaces_instead_of_duplicating() {
+        let mut clock = ClockOffsets::new();
+        clock.add(offset(1000, 3600));
+        clock.add(offset(1000, 7200));
+        assert_eq!(clock.len(), 1);
+        assert_eq!(clock.offset_at(at(5)), Some(7200));
+    }
+
+    #[test]
+    fn local_date_crosses_midnight_with_the_offset() {
+        let mut clock = ClockOffsets::new();
+        clock.add(offset(0, -12_600)); // -03:30
+        assert_eq!(clock.local_date(at(86_400 + 3600)), "1970-01-01");
+        assert_eq!(clock.local_date(at(86_400 + 12_600)), "1970-01-02");
+    }
+
+    #[test]
+    fn persist_then_load_round_trips() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            "CREATE TABLE clock_offsets(ts_utc TEXT NOT NULL, offset_s INTEGER NOT NULL, device_id TEXT, raw_record_id INTEGER,
+             UNIQUE(ts_utc, device_id))",
+        )
+        .expect("table");
+        ClockOffsets::persist(&conn, &[offset(1_700_000_000, 3600), offset(1_700_003_600, 7200)], Some("d"), None)
+            .expect("persist");
+        let loaded = ClockOffsets::load(&conn).expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.offset_at(at(1_700_000_001)), Some(3600));
+    }
+}

@@ -3,6 +3,22 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{NaiveDateTime, TimeZone, Utc};
+
+use crate::model::Instant;
+
+const ISO: &str = "%Y-%m-%dT%H:%M:%SZ";
+
+/// An instant in the store's one shape (`iso_utc` in `storage/_time.py`).
+pub fn iso_utc(moment: &Instant) -> String {
+    moment.format(ISO).to_string()
+}
+
+/// Parse the store's `YYYY-MM-DDTHH:MM:SSZ` text back into an instant; None if it is not that shape.
+pub fn parse_iso_utc(text: &str) -> Option<Instant> {
+    NaiveDateTime::parse_from_str(text, ISO).ok().map(|naive| Utc.from_utc_datetime(&naive))
+}
+
 /// Now, as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn utc_now_iso() -> String {
     let secs = SystemTime::now()
