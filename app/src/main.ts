@@ -9,17 +9,26 @@ async function render(): Promise<void> {
   const note = document.getElementById("note") as HTMLParagraphElement;
   try {
     const rows = await invoke<DailySteps[]>("daily_steps");
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const chart = echarts.init(host, dark ? "dark" : undefined, { renderer: "canvas" });
+    // Design tokens (Bet 6): every colour the chart draws comes from tokens.css, never a literal.
+    const token = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const scope = rows[0]?.source ?? "device";
+    const scopeToken = scope.startsWith("steps[local]") || scope === "local" ? "--local"
+      : scope.includes("vendor") ? "--vendor-cloud" : "--device";
+    const legend = document.getElementById("legend") as HTMLParagraphElement;
+    legend.textContent = `${rows.length} days · source ${scope}`;
+    legend.style.color = token(scopeToken);
+    const chart = echarts.init(host, undefined, { renderer: "canvas" });
     chart.setOption({
       backgroundColor: "transparent",
       animation: false, // deterministic frames so a window capture is always the final state
-      title: { text: "Daily steps", subtext: `${rows.length} days · source ${rows[0]?.source ?? "?"}` },
+      textStyle: { color: token("--ink"), fontFamily: token("--font-sans") },
       tooltip: { trigger: "axis" },
-      grid: { left: 56, right: 24, bottom: 64 },
-      xAxis: { type: "category", data: rows.map((r) => r.date), axisLabel: { rotate: 45 } },
-      yAxis: { type: "value", name: "steps" },
-      series: [{ type: "bar", data: rows.map((r) => r.steps), itemStyle: { color: "#4f8cff" } }],
+      grid: { left: 56, right: 24, top: 24, bottom: 64 },
+      xAxis: { type: "category", data: rows.map((r) => r.date),
+               axisLabel: { rotate: 45, color: token("--axis") }, axisLine: { lineStyle: { color: token("--axis") } } },
+      yAxis: { type: "value", name: "steps", nameTextStyle: { color: token("--ink-muted") },
+               axisLabel: { color: token("--axis") }, splitLine: { lineStyle: { color: token("--hairline") } } },
+      series: [{ type: "bar", data: rows.map((r) => r.steps), itemStyle: { color: token(scopeToken) } }],
     });
     window.addEventListener("resize", () => chart.resize());
     note.textContent = "Tauri 2 · Rust command → WKWebView · ECharts 6 · data from the Python oracle's CSV export";
