@@ -252,7 +252,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
     let ported: Vec<&str> = METHODS.iter().map(|(name, _)| *name).collect();
     assert_eq!(
         ported,
-        ["app.info", "key.status", "key.unlock", "key.cache"]
+        ["app.info", "key.status", "key.unlock", "key.cache", "data.facts"]
     );
     for name in DEFERRED_METHODS {
         assert!(
@@ -267,6 +267,72 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
         assert_eq!(reply["error"]["code"], "unknown_method", "{name}");
         assert_eq!(reply["error"]["message"], "no such method");
     }
+}
+
+// ---- data.facts ----
+
+fn synthetic_copy() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("synthetic.db");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../hearthbeat/tests/fixtures/serve/synthetic.hbdb");
+    std::fs::copy(source, &db).expect("copy the committed synthetic store");
+    (dir, db)
+}
+
+#[test]
+fn facts_on_an_empty_store_say_so_and_carry_the_rules() {
+    let (_dir, db) = plain_store();
+    let reply = Rig::new(&db).send("data.facts", json!({}));
+    let result = &reply["result"];
+    assert_eq!(result["as_of"], Value::Null);
+    assert_eq!(result["facts"], json!([]));
+    assert_eq!(result["reason"], "nothing stored yet");
+    assert_eq!(result["ignored_metrics"], json!([]));
+    assert_eq!(result["rules"].as_array().map(Vec::len), Some(3));
+    assert_eq!(result.as_object().map(|o| o.len()), Some(5));
+}
+
+#[test]
+fn facts_need_an_unlocked_store_and_then_answer() {
+    let (_dir, db) = encrypted_copy();
+    let mut rig = Rig::new(&db);
+    assert_eq!(rig.code("data.facts", json!({})), "locked");
+    assert_eq!(rig.code("data.facts", json!({"days": "x"})), "locked", "locked is checked before the params");
+    rig.send("key.unlock", json!({"passphrase": PASSPHRASE}));
+    let reply = rig.send("data.facts", json!({}));
+    assert!(reply["result"].get("as_of").is_some(), "{reply}");
+}
+
+#[test]
+fn facts_parameters_are_integers_and_are_clamped_like_the_oracle() {
+    let (_dir, db) = synthetic_copy();
+    let mut rig = Rig::new(&db);
+    for bad in [json!(true), json!("7"), json!(7.5), json!(7.0), json!(null), json!([7])] {
+        assert_eq!(rig.code("data.facts", json!({"days": bad})), "bad_params");
+        assert_eq!(rig.code("data.facts", json!({"baseline_days": bad})), "bad_params");
+    }
+    let wide = rig.send("data.facts", json!({"days": 99999, "baseline_days": 1_000_000}))["result"].clone();
+    assert_eq!((wide["window"]["days"].clone(), wide["baseline"]["days"].clone()), (json!(31), json!(365)));
+    let narrow = rig.send("data.facts", json!({"days": -3, "baseline_days": 0}))["result"].clone();
+    assert_eq!((narrow["window"]["days"].clone(), narrow["baseline"]["days"].clone()), (json!(1), json!(1)));
+    let huge = rig.feed(
+        format!("{{\"id\":2,\"method\":\"data.facts\",\"params\":{{\"days\":1{}}}}}\n", "0".repeat(4299)).as_bytes(),
+    );
+    assert_eq!(huge[0]["result"]["window"]["days"], 31, "a bigint clamps like Python's");
+}
+
+#[test]
+fn facts_leave_out_the_convention_text_and_the_manufacturer_name() {
+    let (_dir, db) = synthetic_copy();
+    let result = Rig::new(&db).send("data.facts", json!({}))["result"].clone();
+    assert!(result.get("sources").is_none());
+    assert!(result.get("missing_values").is_some());
+    assert!(!result.to_string().to_lowercase().contains("garmin"));
+    let facts = result["facts"].as_array().expect("facts");
+    assert!(facts.len() > 20);
+    let keys: Vec<&str> = facts[0].as_object().expect("fact").keys().map(String::as_str).collect();
+    assert_eq!(keys.len(), 14);
 }
 
 // ---- source rules ----

@@ -3,15 +3,43 @@
 //! decoded by SQLite storage class, with `serve` as a thin transport over them. The phone (row 12)
 //! has no child processes, so this is a library first and a protocol second.
 //!
-//! Slice 3A only scaffolds it. What lands here later, in the pitch's order: `insight` (`data.facts`),
-//! `coverage` / `queries` (`data.metric`, `data.today`), `health` (`data.health`), then the `import.*`
-//! progress hook. Until then each of those methods is absent from [`crate::serve::METHODS`].
+//! Slice 3A scaffolded it; slice 3B adds `insight` (`data.facts`), `queries` (the sample-day
+//! aggregates it reads) and `numerics` (`fsum` and the exact `stdev` of Python's `statistics`).
+//! What lands next, in the pitch's order: `coverage` / `queries` (`data.metric`, `data.today`),
+//! `health` (`data.health`), then the `import.*` progress hook. Until then each of those methods is
+//! absent from [`crate::serve::METHODS`].
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
+use crate::contract::ContractError;
+
+pub mod insight;
+pub mod numerics;
+pub mod queries;
+
+/// Why a read failed, before it has a protocol code (`serve` maps it; a phone shell maps it its own way).
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// The store could not be read (`database`).
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
+    /// Python raised a `ValueError` here (`bad_params`): a malformed stored date or time, a value that
+    /// cannot be written as JSON.
+    #[error("{0}")]
+    Value(String),
+    /// Python raised something unexpected here (`internal`, reported as `unexpected <name>`).
+    #[error("unexpected {0}")]
+    Unexpected(&'static str),
+    #[error(transparent)]
+    Contract(#[from] ContractError),
+}
 
 /// The protocol methods the oracle has that this core does not answer yet. Each answers
 /// `unknown_method`; `tools/serve_diff.py` counts a Python success against it as "not yet ported",
 /// never as a difference. A test keeps this list and `METHODS` disjoint and complete.
 pub const DEFERRED_METHODS: &[&str] = &[
-    "data.facts",
     "data.metric",
     "data.today",
     "data.health",

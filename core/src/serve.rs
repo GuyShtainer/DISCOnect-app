@@ -4,7 +4,7 @@
 //! `docs/serve-protocol.md` follows them).
 //!
 //! Slice 3A ports the transport and the start-up methods: `app.info`, `key.status`, `key.unlock`,
-//! `key.cache`. Every other method of the protocol is simply absent from [`METHODS`], so it answers
+//! `key.cache`; slice 3B adds `data.facts`. Every other method of the protocol is simply absent from [`METHODS`], so it answers
 //! `unknown_method` until its slice lands (never a new error code, never a fake result); the list of
 //! what is still absent is [`crate::read::DEFERRED_METHODS`].
 //!
@@ -39,9 +39,11 @@ use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 use crate::contract::{Contract, ContractError};
-use crate::identity::{NOTICE, PRODUCT};
+use crate::identity::{self, NOTICE, PRODUCT};
 use crate::keychain::{self, KeychainError, KeychainState};
 use crate::keys::{self, KeyError, Secret32};
+use crate::read::ReadError;
+use crate::read::insight::{self, FactsQuery};
 use crate::redact::redact_text;
 use crate::store::{self, StoreError};
 use crate::wirejson::{self, Id, Json, PyStr};
@@ -63,6 +65,7 @@ pub enum Failure {
     Store(StoreError),
     Keychain(KeychainError),
     Contract(ContractError),
+    Read(ReadError),
     Io(io::Error),
 }
 
@@ -93,6 +96,7 @@ impl Failure {
                 "non-hexadecimal number found in fromhex() arg at position 0".into(),
             ),
             Failure::Contract(_) => ("internal", "unexpected ContractError".into()),
+            Failure::Read(error) => read_parts(error),
             Failure::Io(error) => io_parts(error),
         }
     }
@@ -130,6 +134,17 @@ fn store_parts(error: &StoreError) -> (&'static str, String) {
     }
 }
 
+/// A read failure under the oracle's class-to-code map: a `ValueError` is `bad_params` and quotes its
+/// text, a database error is `database`, anything else reports only its Python class name.
+fn read_parts(error: &ReadError) -> (&'static str, String) {
+    match error {
+        ReadError::Value(message) => ("bad_params", message.clone()),
+        ReadError::Db(inner) => ("database", format!("database error: {inner}")),
+        ReadError::Unexpected(name) => ("internal", format!("unexpected {name}")),
+        ReadError::Contract(_) => ("internal", "unexpected ContractError".into()),
+    }
+}
+
 fn io_parts(error: &io::Error) -> (&'static str, String) {
     match error.kind() {
         io::ErrorKind::NotFound => ("not_found", error.to_string()),
@@ -151,6 +166,11 @@ impl From<StoreError> for Failure {
 impl From<KeychainError> for Failure {
     fn from(error: KeychainError) -> Failure {
         Failure::Keychain(error)
+    }
+}
+impl From<ReadError> for Failure {
+    fn from(error: ReadError) -> Failure {
+        Failure::Read(error)
     }
 }
 impl From<ContractError> for Failure {
@@ -266,6 +286,16 @@ impl Session {
         }
     }
 
+    /// A read-only connection for one call (`Session.reader`). Never prompts: the store must already be
+    /// unlocked, and a store this process cannot open answers with the usual codes.
+    pub fn reader(&self) -> Result<store::Store, Failure> {
+        self.require_unlocked()?;
+        Ok(store::open_read_only_with(
+            &self.db_path,
+            self.unlocked.as_ref(),
+        )?)
+    }
+
     /// The master key unlocked in this process, if any. Never tries an unlock path.
     pub fn unlocked_master(&self) -> Option<&Secret32> {
         self.unlocked.as_ref()
@@ -287,7 +317,21 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("key.status", key_status),
     ("key.unlock", key_unlock),
     ("key.cache", key_cache),
+    ("data.facts", data_facts),
 ];
+
+/// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
+/// integer beyond 64 bits is clamped, which every caller's own clamp makes the same as Python's bigint.
+fn int_param(call: &Call, name: &str, default: i64) -> Result<i64, Failure> {
+    match call.params.get(name) {
+        None => Ok(default),
+        Some(Json::Int(value)) => Ok(value.clamped_i64()),
+        Some(_) => Err(Failure::serve(
+            "bad_params",
+            format!("{name} must be an integer"),
+        )),
+    }
+}
 
 fn bool_param(call: &Call, name: &str) -> Result<bool, Failure> {
     match call.params.get(name) {
@@ -442,6 +486,29 @@ fn key_cache(session: &mut Session, call: &Call) -> Result<Value, Failure> {
         keychain::delete(&key_id)?;
     }
     Ok(json!({"keychain": keychain::state(&key_id)?.as_str()}))
+}
+
+// ---- data ----
+
+/// The recent window against this person's own baseline, as facts with confidence. The convention
+/// text `sources` is left out and the manufacturer's name scrubbed, as in the oracle.
+fn data_facts(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let window_days = int_param(call, "days", insight::DEFAULT_WINDOW_DAYS)?;
+    let baseline_days = int_param(call, "baseline_days", insight::DEFAULT_BASELINE_DAYS)?;
+    let store = session.reader()?;
+    let mut facts = insight::period_facts(
+        store.conn(),
+        &FactsQuery {
+            window_days,
+            baseline_days,
+        },
+    )?;
+    if let Some(object) = facts.as_object_mut() {
+        object.remove("sources");
+    }
+    identity::neutral(&mut facts);
+    Ok(facts)
 }
 
 // ---- the loop ----
