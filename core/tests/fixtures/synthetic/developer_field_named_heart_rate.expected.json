@@ -1,0 +1,36 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [],
+  "device_id": "42",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:02:00Z",
+  "intervals": [],
+  "labels": [],
+  "message_counts": {
+   "developer_data_id": 1,
+   "field_description": 1,
+   "file_id": 1,
+   "monitoring": 3
+  },
+  "offsets": [],
+  "record_count": 2,
+  "samples": [
+   {
+    "metric": "heart_rate",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 61.0
+   },
+   {
+    "metric": "heart_rate",
+    "ts_utc": "2025-06-15T06:02:00Z",
+    "value": 63.0
+   }
+  ],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:monitoring_b",
+  "warnings": 0
+ }
+}
