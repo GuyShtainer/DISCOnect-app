@@ -95,48 +95,49 @@ function locked(): boolean {
   return !!keyStatus && keyStatus.encrypted && !keyStatus.unlocked;
 }
 
-let triedKeychain = false;
+let generation = 0;
 
+/** Render the current screen. Single-flight: a newer route() wins and an older one draws nothing. */
 async function route(): Promise<void> {
+  const mine = ++generation;
   await refreshKey();
-  if (locked() && !triedKeychain) {
-    triedKeychain = true;
-    if (await core.unlockFromKeychain()) await refreshKey();
-  }
+  if (mine !== generation) return;
   renderNav();
-  main.replaceChildren();
-  if (banner) main.append(el("div", "banner body", banner));
   const id = current();
   if (locked() && id !== "key") {
-    location.hash = "#/key";
+    location.hash = "#/key"; // hashchange re-enters route()
     return;
   }
+  const out = document.createDocumentFragment();
+  if (banner) out.append(el("div", "banner body", banner));
   try {
-    if (id === "today") await screenToday();
-    else if (id === "trend") await screenTrend();
-    else if (id === "health") await screenHealth();
-    else await screenKey();
+    if (id === "today") await screenToday(out);
+    else if (id === "trend") await screenTrend(out);
+    else if (id === "health") await screenHealth(out);
+    else await screenKey(out);
   } catch (e) {
     if (core.isCoreError(e) && e.code === "locked") {
       location.hash = "#/key";
       return;
     }
-    main.append(el("div", "banner body error", core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e)));
+    out.append(el("div", "banner body error", core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e)));
   }
-  main.append(el("footer", "notice", NOTICE));
+  if (mine !== generation) return;
+  out.append(el("footer", "notice", NOTICE));
+  main.replaceChildren(out);
 }
 
-function header(title: string, sub: string): void {
+function header(out: ParentNode, title: string, sub: string): void {
   const row = el("div", "row");
   row.append(el("h1", "display", title));
   row.append(el("span", "caption muted", sub));
-  main.append(row);
+  out.append(row);
 }
 
 // ---- Today -----------------------------------------------------------------------------
-async function screenToday(): Promise<void> {
+async function screenToday(out: ParentNode): Promise<void> {
   const [today, facts] = await Promise.all([core.call<Today>("data.today"), core.call<Facts>("data.facts", { days: 7, baseline_days: 28 })]);
-  header("Today", today.day);
+  header(out, "Today", today.day);
   const cards = el("div", "cards");
   for (const row of today.metrics) {
     const card = el("div", "card");
@@ -151,7 +152,7 @@ async function screenToday(): Promise<void> {
     card.append(line);
     cards.append(card);
   }
-  main.append(cards);
+  out.append(cards);
   const card = el("div", "card");
   card.append(el("h2", "heading", `Last ${facts.window.days} days vs your ${facts.baseline.days}-day baseline`));
   const grid = el("div", "grid3 body");
@@ -169,14 +170,14 @@ async function screenToday(): Promise<void> {
   if (!facts.facts.length) grid.append(el("span", "muted", facts.as_of ? "no metric has data in this window" : "nothing imported yet"));
   card.append(grid);
   card.append(el("span", "caption muted", "Comparisons are against your own history only. They describe; they do not diagnose."));
-  main.append(card);
+  out.append(card);
 }
 
 // ---- Trend ------------------------------------------------------------------------------
 let trendMetric = TREND_METRICS[0];
 let trendDays = 90;
 
-async function screenTrend(): Promise<void> {
+async function screenTrend(out: ParentNode): Promise<void> {
   const controls = el("div", "row");
   const select = el("select") as HTMLSelectElement;
   for (const m of TREND_METRICS) {
@@ -194,9 +195,9 @@ async function screenTrend(): Promise<void> {
     range.append(o);
   }
   range.onchange = () => { trendDays = Number(range.value); void route(); };
-  header(metricLabel(trendMetric), "");
+  header(out, metricLabel(trendMetric), "");
   controls.append(select, range);
-  main.append(controls);
+  out.append(controls);
 
   const results = await Promise.all(SCOPES.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays })));
   const series: Series[] = results
@@ -209,11 +210,11 @@ async function screenTrend(): Promise<void> {
     item.append(sw, document.createTextNode(scopeWord(s.scope)));
     legend.append(item);
   }
-  main.append(legend);
+  out.append(legend);
   const card = el("div", "card");
   const chart = el("div", "chart");
   card.append(chart);
-  main.append(card);
+  out.append(card);
   if (!series.length) {
     card.append(el("span", "muted body", "No source has values for this metric in the window."));
     return;
@@ -226,19 +227,19 @@ async function screenTrend(): Promise<void> {
 }
 
 // ---- Data health ------------------------------------------------------------------------
-async function screenHealth(): Promise<void> {
+async function screenHealth(out: ParentNode): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: 90 });
   const cov = health.coverage;
-  header("Data health", `Why a day is missing · ${cov.window.from} → ${cov.window.to} · one row per metric and source`);
+  header(out, "Data health", `Why a day is missing · ${cov.window.from} → ${cov.window.to} · one row per metric and source`);
   const legend = el("div", "legend caption");
   for (const [status, word] of [["present", "present"], ["failed", "failed (striped, taller)"], ["source_empty", "source empty"], ["not_covered", "not covered"]]) {
     const item = el("span");
     item.append(el("span", `chip ${status}`), document.createTextNode(word));
     legend.append(item);
   }
-  main.append(legend);
+  out.append(legend);
   if (health.never_imported) {
-    main.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: hearthbeat import <export zip | GARMIN folder>."));
+    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: hearthbeat import <export zip | GARMIN folder>."));
     return;
   }
   const card = el("div", "card ledger");
@@ -273,17 +274,17 @@ async function screenHealth(): Promise<void> {
     card.append(block);
   }
   card.append(el("span", "caption muted", `Counts are days out of ${cov.window.days}, in status order, not time order. "present" can still be a partial day. A sparse metric is recorded only on some days, so its empty days are normal.`));
-  main.append(card);
+  out.append(card);
 }
 
 // ---- Your key ---------------------------------------------------------------------------
-async function screenKey(): Promise<void> {
+async function screenKey(out: ParentNode): Promise<void> {
   const info = await core.call<AppInfo>("app.info");
-  header("Your key", info.encrypted ? "Your database and its backups are encrypted with a key only you hold." : "This database is not encrypted yet.");
+  header(out, "Your key", info.encrypted ? "Your database and its backups are encrypted with a key only you hold." : "This database is not encrypted yet.");
   const card = el("div", "card");
   if (!keyStatus) {
     card.append(el("span", "body", "The core is not running, so nothing can be unlocked."));
-    main.append(card);
+    out.append(card);
     return;
   }
   if (!keyStatus.encrypted) {
@@ -291,7 +292,7 @@ async function screenKey(): Promise<void> {
     card.append(el("p", "body", "Run this once in a terminal, where the recovery words can be shown to you and to no one else:"));
     card.append(el("pre", "mono body", "hearthbeat key init"));
     card.append(el("p", "caption muted", "The app never shows the 24 words. They are the key; a screenshot or a transcript would be a copy."));
-    main.append(card);
+    out.append(card);
     return;
   }
   if (!keyStatus.unlocked) {
@@ -320,7 +321,7 @@ async function screenKey(): Promise<void> {
     };
     card.append(form, err);
     card.append(el("p", "caption muted", "Lost the passphrase? Recovery with the 24 words is done in a terminal: hearthbeat key recover."));
-    main.append(card);
+    out.append(card);
     setTimeout(() => input.focus(), 0);
     return;
   }
@@ -337,7 +338,7 @@ async function screenKey(): Promise<void> {
       await refreshKey(); renderNav();
     } catch (e) {
       box.checked = !box.checked;
-      main.append(el("div", "banner body error", core.isCoreError(e) ? e.message : String(e)));
+      out.append(el("div", "banner body error", core.isCoreError(e) ? e.message : String(e)));
     }
   };
   const wrap = el("span"); wrap.style.display = "inline-flex"; wrap.style.alignItems = "center"; wrap.style.gap = "var(--space-2)";
@@ -345,12 +346,12 @@ async function screenKey(): Promise<void> {
   label.append(wrap);
   card.append(label);
   card.append(el("p", "caption muted", "Off by default: you are asked for your passphrase each time the app starts. On, it is convenient, but programs you approve can then read the key. The app and the terminal each keep their own copy, and an update of the app forgets its copy: cache again afterwards."));
-  main.append(card);
+  out.append(card);
   const about = el("div", "card body");
   about.append(el("h2", "heading", "About"));
   about.append(el("span", "muted", `core ${info.core}`));
   about.append(el("span", "muted", `database ${info.db}`));
-  main.append(about);
+  out.append(about);
 }
 
 // ---- Boot -------------------------------------------------------------------------------
@@ -359,8 +360,14 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () 
 void core.onCoreEvent("restarted", () => { banner = "The core restarted after an error; the last request was lost."; void route(); });
 void core.onCoreEvent("exited", () => { banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
 void (async () => {
+  await refreshKey();
+  if (locked() && (await core.unlockFromKeychain())) await refreshKey();
   const args = await core.launchArgs().catch(() => [] as string[]);
   const i = args.indexOf("--screen");
-  if (i >= 0 && args[i + 1] && SCREENS.some((s) => s.id === args[i + 1])) location.hash = `#/${args[i + 1]}`;
-  await route();
+  const wanted = i >= 0 && SCREENS.some((s) => s.id === args[i + 1]) ? args[i + 1] : null;
+  if (wanted && current() !== wanted) {
+    location.hash = `#/${wanted}`; // hashchange runs route()
+  } else {
+    await route();
+  }
 })();
