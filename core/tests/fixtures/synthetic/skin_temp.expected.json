@@ -1,0 +1,47 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [
+   {
+    "date": null,
+    "metric": "skin_temp_nightly",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 33.5
+   },
+   {
+    "date": null,
+    "metric": "skin_temp_deviation",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": -0.20000000298023224
+   },
+   {
+    "date": null,
+    "metric": "skin_temp_7day_deviation",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 0.10000000149011612
+   }
+  ],
+  "device_id": "1234567890",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:00:00Z",
+  "intervals": [],
+  "labels": [],
+  "message_counts": {
+   "file_id": 1,
+   "skin_temp_overnight": 1
+  },
+  "offsets": [
+   {
+    "offset_s": 10800,
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "record_count": 4,
+  "samples": [],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:skin_temp",
+  "warnings": 0
+ }
+}

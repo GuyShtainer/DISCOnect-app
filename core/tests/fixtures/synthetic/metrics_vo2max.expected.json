@@ -1,0 +1,37 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [
+   {
+    "date": null,
+    "metric": "vo2max",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 45.3
+   }
+  ],
+  "device_id": "1234567890",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:00:00Z",
+  "intervals": [],
+  "labels": [
+   {
+    "date": null,
+    "label": "running",
+    "metric": "vo2max_sport",
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "message_counts": {
+   "file_id": 1,
+   "max_met_data": 1
+  },
+  "offsets": [],
+  "record_count": 2,
+  "samples": [],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:metrics",
+  "warnings": 0
+ }
+}

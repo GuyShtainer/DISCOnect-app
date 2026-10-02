@@ -1,0 +1,28 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [],
+  "device_id": "1234567890",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:00:00Z",
+  "intervals": [],
+  "labels": [],
+  "message_counts": {
+   "file_id": 1,
+   "monitoring_info": 1
+  },
+  "offsets": [
+   {
+    "offset_s": 7200,
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "record_count": 1,
+  "samples": [],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:79",
+  "warnings": 0
+ }
+}

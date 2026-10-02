@@ -1,0 +1,45 @@
+{
+ "ok": {
+  "activities": [
+   {
+    "avg_hr": 150,
+    "avg_speed_mps": 2.85,
+    "calories_kcal": 350,
+    "distance_m": 5000.0,
+    "end_utc": "2025-06-15T06:30:00Z",
+    "max_hr": 175,
+    "sport": "running",
+    "start_utc": "2025-06-15T06:00:00Z",
+    "sub_sport": "generic",
+    "total_ascent_m": null,
+    "total_descent_m": null,
+    "total_elapsed_s": 1800.0,
+    "total_timer_s": 1750.0
+   }
+  ],
+  "daily": [],
+  "device_id": "1234567890",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:00:00Z",
+  "intervals": [],
+  "labels": [],
+  "message_counts": {
+   "file_id": 1,
+   "session": 1,
+   "timestamp_correlation": 1
+  },
+  "offsets": [
+   {
+    "offset_s": 10800,
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "record_count": 2,
+  "samples": [],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:activity",
+  "warnings": 0
+ }
+}

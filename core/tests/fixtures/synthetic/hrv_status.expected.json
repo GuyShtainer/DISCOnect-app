@@ -1,0 +1,61 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [
+   {
+    "date": null,
+    "metric": "hrv_weekly_average",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 52.5
+   },
+   {
+    "date": null,
+    "metric": "hrv_last_night_average",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 48.0
+   },
+   {
+    "date": null,
+    "metric": "hrv_last_night_5min_high",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 70.0
+   }
+  ],
+  "device_id": "1234567890",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:00:00Z",
+  "intervals": [],
+  "labels": [
+   {
+    "date": null,
+    "label": "balanced",
+    "metric": "hrv_status",
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "message_counts": {
+   "file_id": 1,
+   "hrv_status_summary": 1,
+   "hrv_value": 2
+  },
+  "offsets": [],
+  "record_count": 6,
+  "samples": [
+   {
+    "metric": "hrv_rmssd",
+    "ts_utc": "2025-06-15T06:00:00Z",
+    "value": 51.0
+   },
+   {
+    "metric": "hrv_rmssd",
+    "ts_utc": "2025-06-15T06:05:00Z",
+    "value": 53.0
+   }
+  ],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:hrv",
+  "warnings": 0
+ }
+}

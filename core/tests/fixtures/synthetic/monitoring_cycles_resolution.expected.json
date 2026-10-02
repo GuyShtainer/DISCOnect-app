@@ -1,0 +1,74 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [],
+  "device_id": "42",
+  "dropped": {},
+  "end_utc": "2025-06-15T06:04:00Z",
+  "intervals": [
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "walking",
+    "cycles": 105.0,
+    "distance_m": null,
+    "intensity": null,
+    "steps": 105,
+    "ts_utc": "2025-06-15T06:00:00Z"
+   },
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "walking",
+    "cycles": 105.0,
+    "distance_m": null,
+    "intensity": 2,
+    "steps": 105,
+    "ts_utc": "2025-06-15T06:01:00Z"
+   },
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "sedentary",
+    "cycles": 52.5,
+    "distance_m": null,
+    "intensity": 0,
+    "steps": null,
+    "ts_utc": "2025-06-15T06:02:00Z"
+   },
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "running",
+    "cycles": 24.0,
+    "distance_m": null,
+    "intensity": null,
+    "steps": 24,
+    "ts_utc": "2025-06-15T06:03:00Z"
+   },
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "cycling",
+    "cycles": 30.0,
+    "distance_m": null,
+    "intensity": null,
+    "steps": null,
+    "ts_utc": "2025-06-15T06:04:00Z"
+   }
+  ],
+  "labels": [],
+  "message_counts": {
+   "file_id": 1,
+   "monitoring": 5
+  },
+  "offsets": [],
+  "record_count": 5,
+  "samples": [],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T06:00:00Z",
+  "stream": "fit:monitoring_b",
+  "warnings": 0
+ }
+}

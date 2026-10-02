@@ -1,0 +1,52 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [],
+  "device_id": "42",
+  "dropped": {
+   "timestamp_16_far_from_reference": 1
+  },
+  "end_utc": "2025-06-15T15:00:00Z",
+  "intervals": [
+   {
+    "active_calories_kcal": null,
+    "active_time_s": null,
+    "activity_type": "walking",
+    "cycles": 10.0,
+    "distance_m": null,
+    "intensity": null,
+    "steps": 10,
+    "ts_utc": "2025-06-15T06:00:00Z"
+   }
+  ],
+  "labels": [],
+  "message_counts": {
+   "file_id": 1,
+   "monitoring": 4
+  },
+  "offsets": [],
+  "record_count": 4,
+  "samples": [
+   {
+    "metric": "heart_rate",
+    "ts_utc": "2025-06-15T05:58:00Z",
+    "value": 70.0
+   },
+   {
+    "metric": "heart_rate",
+    "ts_utc": "2025-06-15T15:00:00Z",
+    "value": 72.0
+   },
+   {
+    "metric": "heart_rate",
+    "ts_utc": "2025-06-15T06:01:00Z",
+    "value": 73.0
+   }
+  ],
+  "sleep": null,
+  "source_scope": "device",
+  "start_utc": "2025-06-15T05:58:00Z",
+  "stream": "fit:monitoring_b",
+  "warnings": 0
+ }
+}

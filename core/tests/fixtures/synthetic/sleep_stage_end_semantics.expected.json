@@ -1,0 +1,74 @@
+{
+ "ok": {
+  "activities": [],
+  "daily": [],
+  "device_id": "1234567890",
+  "dropped": {
+   "sleep_stage_zero_length": 1
+  },
+  "end_utc": "2025-06-15T22:40:00Z",
+  "intervals": [],
+  "labels": [],
+  "message_counts": {
+   "event": 2,
+   "file_id": 1,
+   "sleep_assessment": 1,
+   "sleep_level": 4
+  },
+  "offsets": [],
+  "record_count": 4,
+  "samples": [],
+  "sleep": {
+   "avg_hr": null,
+   "avg_respiration": null,
+   "avg_spo2": null,
+   "avg_stress": 12.0,
+   "awake_s": 600,
+   "awake_time_score": null,
+   "awakenings_count": 2,
+   "awakenings_count_score": null,
+   "combined_awake_score": null,
+   "date": null,
+   "deep_s": 3600,
+   "deep_score": 70,
+   "duration_score": null,
+   "end_utc": "2025-06-15T22:40:00Z",
+   "highest_respiration": null,
+   "interruptions_score": null,
+   "light_s": 1800,
+   "light_score": 75,
+   "lowest_respiration": null,
+   "lowest_spo2": null,
+   "overall_score": 81,
+   "quality_score": null,
+   "recovery_score": null,
+   "rem_s": 0,
+   "rem_score": 60,
+   "restlessness_score": null,
+   "retro": false,
+   "stages": [
+    {
+     "end_utc": "2025-06-15T21:30:00Z",
+     "stage": "light",
+     "start_utc": "2025-06-15T21:00:00Z"
+    },
+    {
+     "end_utc": "2025-06-15T22:30:00Z",
+     "stage": "deep",
+     "start_utc": "2025-06-15T21:30:00Z"
+    },
+    {
+     "end_utc": "2025-06-15T22:40:00Z",
+     "stage": "awake",
+     "start_utc": "2025-06-15T22:30:00Z"
+    }
+   ],
+   "start_utc": "2025-06-15T21:00:00Z",
+   "unmeasurable_s": null
+  },
+  "source_scope": "device",
+  "start_utc": "2025-06-15T21:00:00Z",
+  "stream": "fit:sleep",
+  "warnings": 0
+ }
+}
