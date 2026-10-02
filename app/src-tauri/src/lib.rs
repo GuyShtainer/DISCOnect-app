@@ -1,10 +1,8 @@
 //! DISCOnect desktop shell (Bet 7). Rust holds no business logic: every command is a thin
 //! relay to the Python core through [`sidecar`], and the webview draws what the core answers.
-//! The Bet-3 CSV command stays until the Trend screen reads `data.metric` (slice 3c).
 
 pub mod sidecar;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -12,61 +10,6 @@ use tauri::{Emitter, Manager, RunEvent, State};
 use zeroize::Zeroizing;
 
 use sidecar::{CoreError, EventSink, Launch, Sidecar};
-
-#[derive(serde::Serialize)]
-pub struct DailySteps {
-    pub date: String,
-    pub steps: u32,
-    pub source: String,
-}
-
-fn csv_path() -> PathBuf {
-    std::env::var_os("DISCONECT_DAILY_CSV")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/daily.csv"))
-}
-
-/// Pick the steps column: device scope first, then local, then any `steps[...]`.
-fn steps_column(header: &[&str]) -> Option<(usize, String)> {
-    let preferred = ["steps[device]", "steps[local]"];
-    for want in preferred {
-        if let Some(i) = header.iter().position(|h| *h == want) {
-            return Some((i, want.to_string()));
-        }
-    }
-    header
-        .iter()
-        .position(|h| h.starts_with("steps["))
-        .map(|i| (i, header[i].to_string()))
-}
-
-pub fn parse_daily_steps(text: &str) -> Result<Vec<DailySteps>, String> {
-    let mut lines = text.lines();
-    let header: Vec<&str> = lines.next().ok_or("empty CSV")?.split(',').collect();
-    let date_col = header.iter().position(|h| *h == "date").ok_or("no date column")?;
-    let (steps_col, source) = steps_column(&header).ok_or("no steps column")?;
-    let mut rows = Vec::new();
-    for line in lines {
-        let fields: Vec<&str> = line.split(',').collect();
-        let Some(raw) = fields.get(steps_col) else { continue };
-        if raw.is_empty() {
-            continue;
-        }
-        let steps = raw
-            .parse::<f64>()
-            .map_err(|e| format!("bad steps value {raw:?}: {e}"))? as u32;
-        rows.push(DailySteps { date: fields[date_col].to_string(), steps, source: source.clone() });
-    }
-    Ok(rows)
-}
-
-#[tauri::command]
-fn daily_steps() -> Result<Vec<DailySteps>, String> {
-    let path = csv_path();
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    parse_daily_steps(&text)
-}
 
 /// The core, or why it is not there. Stored in Tauri state so commands can reach it.
 pub struct Core(pub Result<Sidecar, CoreError>);
@@ -140,15 +83,9 @@ pub fn run() {
             Ok(())
         });
     #[cfg(debug_assertions)]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        daily_steps,
-        core_call,
-        core_unlock,
-        core_stderr,
-        debug_unlock_from_file
-    ]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, debug_unlock_from_file]);
     #[cfg(not(debug_assertions))]
-    let builder = builder.invoke_handler(tauri::generate_handler![daily_steps, core_call, core_unlock, core_stderr]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr]);
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -159,30 +96,4 @@ pub fn run() {
             }
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_daily_steps;
-
-    #[test]
-    fn prefers_device_scope_and_skips_blanks() {
-        let csv = "date,steps[vendor_cloud],steps[device]\n2025-06-11,100,120\n2025-06-12,,\n2025-06-13,90,";
-        let rows = parse_daily_steps(csv).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].date.as_str(), rows[0].steps), ("2025-06-11", 120));
-        assert_eq!(rows[0].source, "steps[device]");
-    }
-
-    #[test]
-    fn falls_back_to_any_steps_column() {
-        let csv = "date,steps[vendor_cloud]\n2025-06-11,7\n";
-        let rows = parse_daily_steps(csv).unwrap();
-        assert_eq!(rows[0].source, "steps[vendor_cloud]");
-    }
-
-    #[test]
-    fn missing_steps_column_is_an_error() {
-        assert!(parse_daily_steps("date,foo\n2025-06-11,1\n").is_err());
-    }
 }
