@@ -15,8 +15,9 @@ imported_at)`. For a FIT file: `source_key = payload_hash = sha256(file bytes) h
 trip; the compressed bytes are **not** part of parity, the decompressed bytes and the hash are —
 `payload_bytes = len(bytes)`, `decode_summary = json.dumps({"messages": message_counts,
 "dropped": dropped, "warnings": warnings[:10]}, sort_keys=True)` (excluded from parity),
-`transport` = the run's transport (`usb` for a GARMIN tree, else the CLI's `--transport`
-default — read `cli.py`), `imported_at = now`. Duplicate test for FIT is **by source_key alone**:
+`transport` = the run's transport: the CLI's `--transport` choice (`connect_export | usb |
+gadgetbridge | ciq | drop`), else `connect_export` when the path looks like an account export,
+else **`drop`** (verified in `sources.import_path`); `imported_at = now`. Duplicate test for FIT is **by source_key alone**:
 `SELECT 1 FROM raw_records WHERE payload_kind='fit' AND source_key=?` → DUPLICATE before decode.
 `INSERT OR IGNORE` returning no row → DUPLICATE too (rollback).
 
@@ -115,13 +116,14 @@ error, else `failed` when files_failed and no files_imported, `partial` when any
 lines; counts only.
 
 ## Batch driver (`sources._import_fit_batch`)
-For every file: `offsets.extend(scan_clock_offsets(bytes))` (ClockOffsets also pre-loaded from
-the store's `clock_offsets` table at writer start — check `cli.py`/`sources.py` for the exact
-load point); then `write_fit` per file in order; then `derive_daily_steps`;
-`derive_daily_from_samples`. Labels passed to `write_fit` are PII-masked names
-(`connect_export.mask_label`) — the Rust side can use the file's relative path with any `@…`
-local-part masked the same way; labels never reach the tables except `import_failures`? (no:
-failures keep `file: label` only in the run summary, not in a table).
+`Writer(conn, ClockOffsets.load(conn), transport)` — offsets pre-loaded from the store's
+`clock_offsets` table (verified: `sources.import_path`), `begin_run()`. For every file:
+`offsets.extend(scan_clock_offsets(bytes))`; then `write_fit` per file in order; then
+`derive_daily_steps`; `derive_daily_from_samples`; `stats.dates_assumed_utc =
+offsets.assumed_utc`; `finish_run()`; an exception → `finish_run(error="Type: msg")` then
+re-raise. Labels passed to `write_fit` are `mask_label(relative path)`: e-mail addresses →
+`{email}`, long digit runs → `{id}`; labels appear only in the run's failure summary, never in a
+table.
 
 ## Parity checklist for `tools/core_diff.py`
 Compare P and R on: `raw_records` (stream, source_key, source_scope, transport, device_id,
