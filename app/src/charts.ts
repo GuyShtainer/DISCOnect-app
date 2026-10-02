@@ -67,7 +67,8 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       type: "line",
       showSymbol: false,
       connectNulls: false,
-      lineStyle: { width: 1.5 },
+      // vendor cloud is dashed: when it agrees with device the two lines overlap exactly and both must stay visible
+      lineStyle: { width: 1.5, type: s.scope === "vendor_cloud" ? "dashed" : "solid" },
       itemStyle: { color: token(SCOPE_TOKEN[s.scope] ?? "--ink") },
       data: s.days.map((d) => d.value),
       markArea: i === 0
