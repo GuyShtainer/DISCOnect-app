@@ -255,6 +255,7 @@ dependencies = [
  "fitparser",
  "flate2",
  "fs2",
+ "getrandom",
  "hex",
  "hkdf",
  "rusqlite",

@@ -483,7 +483,7 @@ impl From<String> for DecodeError {
 
 type Decode<T> = Result<T, DecodeError>;
 
-fn type_name(value: &Value) -> &'static str {
+pub(crate) fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "NoneType",
         Value::Bool(_) => "bool",
@@ -1214,6 +1214,39 @@ fn record_decoder(stream: &str) -> Option<RecordDecoder> {
         "json:biometrics" => decode_biometrics,
         _ => return None,
     })
+}
+
+/// `BATCH_STREAMS`: streams whose canonical value is decided across all their records at once.
+pub fn is_batch_stream(stream: &str) -> bool {
+    stream == "json:readiness"
+}
+
+/// Whether `RECORD_DECODERS` has an entry for `stream`.
+pub fn has_record_decoder(stream: &str) -> bool {
+    record_decoder(stream).is_some()
+}
+
+/// `RECORD_DECODERS[stream](record)` for a record read back from the store (the relay and the
+/// reparse path). `Ok(None)` is a decoder that yields nothing (no usable date). A record that is
+/// not a JSON object is the oracle's `AttributeError` on `record.get` (an `Abort`). The caller
+/// has checked [`has_record_decoder`].
+pub fn decode_stored_record(stream: &str, record: &Value) -> Decode<Keyed> {
+    let Some(decoder) = record_decoder(stream) else {
+        return Err(DecodeError::Abort(format!("KeyError: '{stream}'")));
+    };
+    match record {
+        Value::Object(members) => decoder(members),
+        other => Err(DecodeError::Abort(format!(
+            "AttributeError: '{}' object has no attribute 'get'",
+            type_name(other)
+        ))),
+    }
+}
+
+/// `decode_readiness_records` over every readiness record of the store at once (the relay's
+/// store-wide re-batch). The caller has checked that every record is an object.
+pub fn decode_readiness_batch(records: &[Value]) -> (Vec<Step>, Option<String>) {
+    decode_readiness(records)
 }
 
 /// What decoding one file's records yields: the steps in write order, then maybe the abort the

@@ -5,17 +5,20 @@
 //! Two passes over the FIT bytes: first collect every UTC offset the files state, so local dates
 //! resolve consistently regardless of file order; then decode and write.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params, params_from_iter};
 
+use crate::canon::{self, Value};
 use crate::clock::ClockOffsets;
-use crate::export;
-use crate::fit;
-use crate::redact::mask_label;
-use crate::writer::{ImportStats, Writer, WriterError};
+use crate::export::{self, DecodeError, Step};
+use crate::fit::{self, FitDecodeError};
+use crate::model::Decoded;
+use crate::redact::{mask_label, redact_text};
+use crate::writer::{Failure, ImportStats, WriteOutcome, Writer, WriterError, fit_summary, json_summary};
 
 pub const TRANSPORT_DROP: &str = "drop";
 pub const TRANSPORT_CONNECT_EXPORT: &str = "connect_export";
@@ -256,6 +259,349 @@ pub fn import_path(conn: &Connection, path: &Path, transport: Option<&str>) -> R
     writer.stats.dates_assumed_utc = writer.offsets.assumed_utc();
     writer.finish_run(None)?;
     Ok(writer.stats)
+}
+
+// ---- reparse: replay retained raw records through today's decoders ----
+
+/// Largest zlib payload this port inflates from a stored record (the oracle has no limit; a record
+/// past this is treated as undecodable instead of exhausting memory).
+const MAX_INFLATED: u64 = 1 << 30;
+
+/// `zlib.decompress` of a stored payload, capped at [`MAX_INFLATED`]. `None` is the oracle's
+/// `zlib.error` (the class `error`).
+pub fn inflate(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut decoder = flate2::read::ZlibDecoder::new(blob).take(MAX_INFLATED + 1);
+    decoder.read_to_end(&mut out).ok()?;
+    (out.len() as u64 <= MAX_INFLATED).then_some(out)
+}
+
+/// A stored JSON payload parsed back: `Err((class, message))` carries the oracle's exception class.
+pub fn parse_stored_json(blob: &[u8]) -> Result<Value, (&'static str, String)> {
+    let data = inflate(blob).ok_or(("error", "Error -3 while decompressing data".to_string()))?;
+    if std::str::from_utf8(&data).is_err() {
+        return Err(("UnicodeDecodeError", "invalid utf-8".to_string()));
+    }
+    canon::parse(&data).map_err(|error| match error {
+        canon::CanonError::Syntax(why) => ("JSONDecodeError", why.to_string()),
+        canon::CanonError::Unsupported(why) => ("unsupported_json", format!("JSON this port refuses ({why})")),
+    })
+}
+
+/// `_reparse_readiness`: redecode every `json:readiness` raw record of the store together, in
+/// one batch (rowid order), and rewrite the canonical rows of every one of them. A record whose
+/// stored bytes fail to parse is recorded as a failure and left out of the batch. A record that
+/// is not a JSON object is the oracle's uncaught `AttributeError`.
+pub fn reparse_readiness(conn: &Connection, writer: &mut Writer<'_>) -> Result<(), SourceError> {
+    let rows: Vec<(i64, String, Vec<u8>)> = {
+        let mut stmt = conn.prepare("SELECT id, source_key, payload FROM raw_records WHERE stream='json:readiness' ORDER BY id")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<Result<_, _>>()?
+    };
+    let mut records = Vec::with_capacity(rows.len());
+    let mut raw_id_by_key: HashMap<String, i64> = HashMap::new();
+    for (raw_id, source_key, blob) in rows {
+        match parse_stored_json(&blob) {
+            Ok(record) => {
+                records.push(record);
+                raw_id_by_key.insert(source_key, raw_id);
+            }
+            Err((class, message)) => writer.record_parse_failure(
+                "json:readiness",
+                &format!("raw_record:{raw_id}"),
+                class,
+                &message,
+                None,
+                None,
+                Some(raw_id),
+                None,
+                true,
+            )?,
+        }
+    }
+    if let Some(bad) = records.iter().find(|r| !matches!(r, Value::Object(_))) {
+        return Err(SourceError::Abort(format!(
+            "AttributeError: '{}' object has no attribute 'get'",
+            export::type_name(bad)
+        )));
+    }
+    let (steps, abort) = export::decode_readiness_batch(&records);
+    if let Some(message) = abort {
+        return Err(SourceError::Abort(message));
+    }
+    for step in steps {
+        let Step::Record { key, decoded, .. } = step else { continue };
+        let Some(&raw_id) = raw_id_by_key.get(&key) else {
+            continue; // decoder derived a key with no matching stored record
+        };
+        let summary = json_summary(&decoded);
+        writer.rewrite_canonical(raw_id, "json:readiness", &decoded, &summary)?;
+    }
+    Ok(())
+}
+
+/// Why `decode_raw` could not decode a retained record.
+#[derive(Debug)]
+pub enum RawDecodeError {
+    /// `FitDecodeError`: the FIT payload no longer parses.
+    Fit(FitDecodeError),
+    /// Any other exception: its Python class name and message. `caught` is true for the classes
+    /// `reparse_record` turns into an `unrecognized_payload` failure, false for the ones it lets
+    /// escape (an `AttributeError` on a record that is not an object, an `OverflowError`).
+    Other { class: String, message: String, caught: bool },
+}
+
+impl RawDecodeError {
+    /// `getattr(exc, "kind", type(exc).__name__)`, what `_dry_run` reports.
+    pub fn kind(&self) -> String {
+        match self {
+            RawDecodeError::Fit(error) => error.kind.clone(),
+            RawDecodeError::Other { class, .. } => class.clone(),
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            RawDecodeError::Fit(error) => error.message.clone(),
+            RawDecodeError::Other { class, message, .. } => format!("{class}: {message}"),
+        }
+    }
+}
+
+fn caught_class(class: &str) -> bool {
+    matches!(class, "ValueError" | "JSONDecodeError" | "UnicodeDecodeError" | "error" | "TypeError" | "KeyError")
+}
+
+fn other(class: &str, message: impl Into<String>) -> RawDecodeError {
+    RawDecodeError::Other { class: class.to_string(), message: message.into(), caught: caught_class(class) }
+}
+
+/// `Writer.decode_raw`: decode one retained raw record again, writing nothing. Returns
+/// `(stream, decoded, summary)`.
+pub fn decode_raw(conn: &Connection, raw_id: i64) -> Result<(String, Decoded, Value), RawDecodeError> {
+    let row: Option<(String, String, Vec<u8>)> = conn
+        .query_row("SELECT stream, payload_kind, payload FROM raw_records WHERE id=?", params![raw_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .ok();
+    let Some((stream, kind, blob)) = row else {
+        return Err(other("ValueError", format!("no raw_records row with id={raw_id}")));
+    };
+    if export::is_batch_stream(&stream) {
+        return Err(other("ValueError", format!("{stream} reparses as a batch -- use sources.reparse_all")));
+    }
+    let data = inflate(&blob).ok_or_else(|| other("error", "Error -3 while decompressing data"))?;
+    match kind.as_str() {
+        "fit" => {
+            let decoded = fit::decode_fit(&data).map_err(RawDecodeError::Fit)?;
+            let summary = fit_summary(&decoded);
+            Ok((stream, decoded, summary))
+        }
+        "json" => {
+            if !export::has_record_decoder(&stream) {
+                return Err(other("ValueError", format!("no reparse decoder registered for stream '{stream}'")));
+            }
+            let record = parse_stored_json(&blob).map_err(|(class, message)| other(class, message))?;
+            match export::decode_stored_record(&stream, &record) {
+                Ok(Some((_key, decoded))) => {
+                    let summary = json_summary(&decoded);
+                    Ok((stream, decoded, summary))
+                }
+                Ok(None) => Err(other("ValueError", "decoder produced no facts for this record")),
+                Err(DecodeError::Refused(message)) => Err(other("ValueError", message)),
+                Err(DecodeError::Abort(message)) => {
+                    let (class, rest) = message.split_once(": ").unwrap_or(("Exception", message.as_str()));
+                    Err(other(class, rest))
+                }
+            }
+        }
+        _ => Err(other("ValueError", format!("unknown payload_kind '{kind}'"))),
+    }
+}
+
+/// `Writer.reparse_record`: redecode one retained raw record and replace the canonical rows it
+/// produced. A decode failure is recorded and returns `Failed`; a caller bug or an exception the
+/// oracle lets escape is `Err(SourceError::Abort)`.
+pub fn reparse_record(conn: &Connection, writer: &mut Writer<'_>, raw_id: i64) -> Result<WriteOutcome, SourceError> {
+    let label = format!("raw_record:{raw_id}");
+    let stream_of = |conn: &Connection| -> String {
+        conn.query_row("SELECT stream FROM raw_records WHERE id=?", params![raw_id], |r| r.get(0)).unwrap_or_default()
+    };
+    match decode_raw(conn, raw_id) {
+        Ok((stream, decoded, summary)) => Ok(writer.rewrite_canonical(raw_id, &stream, &decoded, &summary)?),
+        Err(RawDecodeError::Fit(error)) => {
+            let stream = stream_of(conn);
+            writer.record_parse_failure(&stream, &label, &error.kind, &error.message, None, None, Some(raw_id), None, true)?;
+            Ok(WriteOutcome::Failed)
+        }
+        Err(RawDecodeError::Other { class, message, caught }) => {
+            let programming_error = message.starts_with("no raw_records row") || message.contains("reparses as a batch");
+            if !caught || programming_error {
+                return Err(SourceError::Abort(format!("{class}: {message}")));
+            }
+            let stream = stream_of(conn);
+            let text = if class == "ValueError" || class == "JSONDecodeError" || class == "UnicodeDecodeError" {
+                message
+            } else {
+                format!("{class}: {message}")
+            };
+            writer.record_parse_failure(&stream, &label, "unrecognized_payload", &text, None, None, Some(raw_id), None, true)?;
+            Ok(WriteOutcome::Failed)
+        }
+    }
+}
+
+/// `(id, stream)` for every raw record, oldest `start_utc` first, optionally filtered by stream.
+fn raw_ids_by_stream(conn: &Connection, streams: Option<&[String]>) -> rusqlite::Result<Vec<(i64, String)>> {
+    let (sql, bound): (String, Vec<&String>) = match streams {
+        Some(list) if !list.is_empty() => {
+            let marks = vec!["?"; list.len()].join(",");
+            (
+                format!("SELECT id, stream FROM raw_records WHERE stream IN ({marks}) ORDER BY start_utc, id"),
+                list.iter().collect(),
+            )
+        }
+        _ => ("SELECT id, stream FROM raw_records ORDER BY start_utc, id".to_string(), Vec::new()),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let mapped = stmt.query_map(params_from_iter(bound), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    mapped.collect()
+}
+
+/// `_dry_run`: decode every record in scope without writing; the failures.
+fn dry_run(conn: &Connection, rows: &[(i64, String)]) -> Result<Vec<Failure>, SourceError> {
+    let mut failures = Vec::new();
+    for (raw_id, stream) in rows {
+        let failed = if export::is_batch_stream(stream) {
+            let blob: Vec<u8> = conn.query_row("SELECT payload FROM raw_records WHERE id=?", params![raw_id], |r| r.get(0))?;
+            match parse_stored_json(&blob) {
+                Ok(_) => None,
+                Err((class, message)) => Some((class.to_string(), format!("{class}: {message}"))),
+            }
+        } else {
+            decode_raw(conn, *raw_id).err().map(|e| (e.kind(), e.message()))
+        };
+        if let Some((kind, error)) = failed {
+            failures.push(Failure { file: format!("raw_record:{raw_id}"), kind, error: redact_text(&error) });
+        }
+    }
+    Ok(failures)
+}
+
+/// `_clear_canonical`: delete every canonical row the raw records in scope produced, in one transaction.
+fn clear_canonical(conn: &Connection, streams: Option<&[String]>) -> rusqlite::Result<()> {
+    let (scope_sql, bound): (String, Vec<&String>) = match streams {
+        Some(list) if !list.is_empty() => {
+            let marks = vec!["?"; list.len()].join(",");
+            (format!("raw_record_id IN (SELECT id FROM raw_records WHERE stream IN ({marks}))"), list.iter().collect())
+        }
+        _ => ("raw_record_id IS NOT NULL".to_string(), Vec::new()),
+    };
+    conn.execute_batch("BEGIN")?;
+    let run = || -> rusqlite::Result<()> {
+        conn.execute(
+            &format!("DELETE FROM sleep_stages WHERE sleep_id IN (SELECT sleep_id FROM sleep_sessions WHERE {scope_sql})"),
+            params_from_iter(bound.iter()),
+        )?;
+        for table in [
+            "metric_samples",
+            "daily_metrics",
+            "daily_labels",
+            "monitoring_intervals",
+            "activities",
+            "clock_offsets",
+            "sleep_sessions",
+        ] {
+            conn.execute(&format!("DELETE FROM {table} WHERE {scope_sql}"), params_from_iter(bound.iter()))?;
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+/// `_clear_failures`: forget earlier reparse failures of records about to be redecoded.
+fn clear_failures(conn: &Connection, raw_ids: &[i64]) -> rusqlite::Result<()> {
+    for chunk in raw_ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        conn.execute(
+            &format!("DELETE FROM import_failures WHERE raw_record_id IN ({marks})"),
+            params_from_iter(chunk.iter()),
+        )?;
+    }
+    Ok(())
+}
+
+/// `sources.reparse_all`: redecode every retained raw record in scope and replace the canonical
+/// rows it produced (`streams = None` is every stream). Records go in `start_utc, id` order, FIT
+/// first; `json:readiness` is redecoded as one batch. Everything is decoded once before anything
+/// is cleared: if any fails, nothing is touched and the run finishes `failed` unless `force`.
+pub fn reparse_all(conn: &Connection, streams: Option<&[String]>, force: bool) -> Result<ImportStats, SourceError> {
+    let mut writer = Writer::new(conn, ClockOffsets::load(conn)?, "reparse");
+    writer.begin_run()?;
+    let outcome = reparse_body(conn, &mut writer, streams, force);
+    match outcome {
+        Err(error) => {
+            writer.finish_run(Some(&error.to_string()))?;
+            Err(error)
+        }
+        Ok(Some(message)) => {
+            writer.finish_run(Some(&message))?;
+            Ok(writer.stats)
+        }
+        Ok(None) => {
+            writer.finish_run(None)?;
+            Ok(writer.stats)
+        }
+    }
+}
+
+/// The body of `reparse_all`; `Ok(Some(message))` is the dry run refusing to touch anything.
+fn reparse_body(
+    conn: &Connection,
+    writer: &mut Writer<'_>,
+    streams: Option<&[String]>,
+    force: bool,
+) -> Result<Option<String>, SourceError> {
+    let rows = raw_ids_by_stream(conn, streams)?;
+    writer.stats.files_seen = rows.len() as i64;
+    let failures = dry_run(conn, &rows)?;
+    if !failures.is_empty() && !force {
+        writer.stats.files_failed = failures.len() as i64;
+        let message = format!(
+            "{} record(s) fail to decode; nothing was changed (fix the decoder or pass force)",
+            failures.len()
+        );
+        writer.stats.failures = failures;
+        return Ok(Some(message));
+    }
+    clear_canonical(conn, streams)?;
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    clear_failures(conn, &ids)?;
+    let fit_ids: Vec<i64> = rows.iter().filter(|(_, s)| s.starts_with("fit:")).map(|(id, _)| *id).collect();
+    let json_ids: Vec<i64> = rows
+        .iter()
+        .filter(|(_, s)| !export::is_batch_stream(s) && !s.starts_with("fit:"))
+        .map(|(id, _)| *id)
+        .collect();
+    for raw_id in fit_ids {
+        reparse_record(conn, writer, raw_id)?;
+    }
+    writer.offsets = ClockOffsets::load(conn)?; // pick up any offset a FIT reparse just corrected
+    for raw_id in json_ids {
+        reparse_record(conn, writer, raw_id)?;
+    }
+    if streams.is_none_or(|list| list.iter().any(|s| export::is_batch_stream(s))) {
+        reparse_readiness(conn, writer)?;
+    }
+    writer.derive_daily_steps()?;
+    writer.derive_daily_from_samples()?;
+    Ok(None)
 }
 
 #[cfg(test)]
