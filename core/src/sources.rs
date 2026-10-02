@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Turn a path into an import: a `.fit` file, a folder of them, or a zip of them (the twin of the
-//! FIT half of `ingest/sources.py`; a Connect-export layout is recognised and refused until
-//! slice 2 adds export ingest).
+//! Turn a path into an import: a `.fit` file, a folder of them, a zip of them, or a Connect account
+//! export (the twin of `ingest/sources.py`; the export's JSON half lives in `export.rs`).
 //!
 //! Two passes over the FIT bytes: first collect every UTC offset the files state, so local dates
 //! resolve consistently regardless of file order; then decode and write.
@@ -13,11 +12,13 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use crate::clock::ClockOffsets;
+use crate::export;
 use crate::fit;
 use crate::redact::mask_label;
 use crate::writer::{ImportStats, Writer, WriterError};
 
 pub const TRANSPORT_DROP: &str = "drop";
+pub const TRANSPORT_CONNECT_EXPORT: &str = "connect_export";
 /// The transports `--transport` accepts.
 pub const TRANSPORTS: [&str; 5] = ["connect_export", "usb", "gadgetbridge", "ciq", "drop"];
 
@@ -33,8 +34,10 @@ pub enum SourceError {
     Writer(#[from] WriterError),
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
-    #[error("this looks like a Connect account export; export ingest arrives in slice 2 of the Rust port")]
-    ExportUnsupported,
+    /// An error the oracle raises as an uncaught Python exception (`BadZipFile`, `OverflowError`,
+    /// ...): the run is booked as failed and the import aborts. The text is `Type: message`.
+    #[error("{0}")]
+    Abort(String),
 }
 
 /// The folder an extracted Connect account export keeps its data in.
@@ -68,7 +71,7 @@ pub fn looks_like_export(path: &Path) -> bool {
 }
 
 /// Python's `PurePath.suffix`: the text from the last dot, unless the dot is the first or last character.
-fn suffix_lower(name: &str) -> String {
+pub(crate) fn suffix_lower(name: &str) -> String {
     match name.rfind('.') {
         Some(i) if i > 0 && i + 1 < name.len() => name[i..].to_lowercase(),
         _ => String::new(),
@@ -76,13 +79,13 @@ fn suffix_lower(name: &str) -> String {
 }
 
 /// Sort key reproducing Python's `sorted(Path)` order: component by component, not by the joined string.
-fn components_key(relative: &Path) -> Vec<Vec<u8>> {
+pub(crate) fn components_key(relative: &Path) -> Vec<Vec<u8>> {
     relative.components().map(|c| c.as_os_str().as_encoded_bytes().to_vec()).collect()
 }
 
 /// Every regular file under `root` (symlinked files included, symlinked directories not entered,
 /// as `Path.rglob("*")` does), as paths relative to `root`.
-fn walk_files(root: &Path, relative: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+pub(crate) fn walk_files(root: &Path, relative: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in fs::read_dir(root.join(relative))? {
         let entry = entry?;
         let rel = relative.join(entry.file_name());
@@ -158,44 +161,49 @@ fn duplicate_aware_entries(raw: &[u8]) -> Result<Vec<(String, Vec<u8>)>, SourceE
     Ok(entries)
 }
 
+/// `(label, bytes)` for every `.fit` member of a zip held in memory, in the Python order
+/// (`sorted(infolist(), key=filename)`, stable). Labels are masked names.
+pub fn zip_fit_members(raw: &[u8]) -> Result<Vec<(String, Vec<u8>)>, SourceError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(raw))?;
+    // The zip crate keys entries by name, so of two same-named entries it keeps one; the
+    // oracle imports both. When the directory states more entries than the crate kept, read
+    // the directory directly.
+    if directory_entry_count(raw).is_some_and(|stated| stated > archive.len()) {
+        let mut out = Vec::new();
+        for (entry_name, bytes) in duplicate_aware_entries(raw)? {
+            if entry_name.ends_with('/') || !entry_name.to_lowercase().ends_with(".fit") {
+                continue;
+            }
+            out.push((mask_label(&entry_name), bytes));
+        }
+        return Ok(out);
+    }
+    // `sorted(infolist(), key=filename)` is stable, so equal names would keep archive order.
+    let mut entries: Vec<(String, usize)> = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        entries.push((archive.by_index_raw(index)?.name().to_string(), index));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    for (entry_name, index) in entries {
+        if entry_name.ends_with('/') || !entry_name.to_lowercase().ends_with(".fit") {
+            continue;
+        }
+        let mut entry = archive.by_index(index)?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        out.push((mask_label(&entry_name), bytes));
+    }
+    Ok(out)
+}
+
 /// `(label, bytes)` for every `.fit` under `path` (file, folder or zip), in the Python order.
 /// Labels are masked relative names: never a table value, only the run's failure report.
 pub fn iter_fit_files(path: &Path) -> Result<Vec<(String, Vec<u8>)>, SourceError> {
     let is_file = path.is_file();
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if is_file && suffix_lower(&name) == ".zip" {
-        let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
-        // The zip crate keys entries by name, so of two same-named entries it keeps one; the
-        // oracle imports both. When the directory states more entries than the crate kept, read
-        // the directory directly.
-        let raw = fs::read(path)?;
-        if directory_entry_count(&raw).is_some_and(|stated| stated > archive.len()) {
-            let mut out = Vec::new();
-            for (entry_name, bytes) in duplicate_aware_entries(&raw)? {
-                if entry_name.ends_with('/') || !entry_name.to_lowercase().ends_with(".fit") {
-                    continue;
-                }
-                out.push((mask_label(&entry_name), bytes));
-            }
-            return Ok(out);
-        }
-        // `sorted(infolist(), key=filename)` is stable, so equal names would keep archive order.
-        let mut entries: Vec<(String, usize)> = Vec::with_capacity(archive.len());
-        for index in 0..archive.len() {
-            entries.push((archive.by_index_raw(index)?.name().to_string(), index));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut out = Vec::new();
-        for (entry_name, index) in entries {
-            if entry_name.ends_with('/') || !entry_name.to_lowercase().ends_with(".fit") {
-                continue;
-            }
-            let mut entry = archive.by_index(index)?;
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            out.push((mask_label(&entry_name), bytes));
-        }
-        return Ok(out);
+        return zip_fit_members(&fs::read(path)?);
     }
     if is_file {
         return Ok(vec![(mask_label(&name), fs::read(path)?)]);
@@ -211,7 +219,7 @@ pub fn iter_fit_files(path: &Path) -> Result<Vec<(String, Vec<u8>)>, SourceError
     Ok(out)
 }
 
-fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>) -> Result<(), WriterError> {
+pub(crate) fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>) -> Result<(), WriterError> {
     for (_label, data) in files {
         writer.offsets.extend(fit::scan_clock_offsets(data));
     }
@@ -224,19 +232,23 @@ fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>) -> Result<
 }
 
 /// Import whatever `path` is into `conn` (a writable connection holding the write lock) and report.
-/// `transport` defaults to `drop`.
+/// `transport` defaults to `connect_export` for an account export and `drop` otherwise. An
+/// export's FIT members go first (one clock-offset pre-pass), then its JSON files, in one run.
 pub fn import_path(conn: &Connection, path: &Path, transport: Option<&str>) -> Result<ImportStats, SourceError> {
     if !path.exists() {
         return Err(SourceError::NotFound(path.display().to_string()));
     }
-    if looks_like_export(path) {
-        return Err(SourceError::ExportUnsupported);
-    }
-    let transport = transport.unwrap_or(TRANSPORT_DROP);
+    let is_export = looks_like_export(path);
+    let transport = transport.unwrap_or(if is_export { TRANSPORT_CONNECT_EXPORT } else { TRANSPORT_DROP });
     let mut writer = Writer::new(conn, ClockOffsets::load(conn)?, transport);
     writer.begin_run()?;
-    let outcome = iter_fit_files(path)
-        .and_then(|files| import_batch(&files, &mut writer).map_err(SourceError::from));
+    let outcome = if is_export {
+        export::collect_fit_members(path)
+            .and_then(|files| import_batch(&files, &mut writer).map_err(SourceError::from))
+            .and_then(|()| export::import_connect_export(path, &mut writer))
+    } else {
+        iter_fit_files(path).and_then(|files| import_batch(&files, &mut writer).map_err(SourceError::from))
+    };
     if let Err(error) = outcome {
         writer.finish_run(Some(&error.to_string()))?;
         return Err(error);
@@ -312,16 +324,6 @@ mod tests {
         let files = iter_fit_files(&path).expect("read zip");
         let bytes: Vec<&[u8]> = files.iter().map(|f| f.1.as_slice()).collect();
         assert_eq!(bytes, [b"first".as_slice(), b"again", b"second-name"]);
-    }
-
-    #[test]
-    fn importing_an_export_layout_is_refused_for_now() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(dir.path().join("DI_CONNECT")).expect("mkdir");
-        let conn = Connection::open_in_memory().expect("memory db");
-        let error = import_path(&conn, dir.path(), None).expect_err("export input is refused");
-        assert!(matches!(error, SourceError::ExportUnsupported));
-        assert!(!error.to_string().contains('\n'));
     }
 
     #[test]

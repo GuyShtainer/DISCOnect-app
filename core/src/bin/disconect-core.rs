@@ -89,7 +89,9 @@ fn status(db: &std::path::Path, source: PassphraseSource<'_>) -> Result<Value, S
 
 fn import_exit_code(err: &SourceError) -> u8 {
     match err {
-        SourceError::NotFound(_) | SourceError::ExportUnsupported => EXIT_USAGE,
+        SourceError::NotFound(_) => EXIT_USAGE,
+        // the oracle's uncaught Python exception: traceback, exit 1
+        SourceError::Abort(_) => 1,
         _ => EXIT_DATABASE,
     }
 }
