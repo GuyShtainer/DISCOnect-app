@@ -9,14 +9,17 @@ async function render(): Promise<void> {
   const note = document.getElementById("note") as HTMLParagraphElement;
   try {
     const rows = await invoke<DailySteps[]>("daily_steps");
-    const chart = echarts.init(host);
+    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const chart = echarts.init(host, dark ? "dark" : undefined, { renderer: "canvas" });
     chart.setOption({
+      backgroundColor: "transparent",
+      animation: false, // deterministic frames so a window capture is always the final state
       title: { text: "Daily steps", subtext: `${rows.length} days · source ${rows[0]?.source ?? "?"}` },
       tooltip: { trigger: "axis" },
       grid: { left: 56, right: 24, bottom: 64 },
       xAxis: { type: "category", data: rows.map((r) => r.date), axisLabel: { rotate: 45 } },
       yAxis: { type: "value", name: "steps" },
-      series: [{ type: "bar", data: rows.map((r) => r.steps) }],
+      series: [{ type: "bar", data: rows.map((r) => r.steps), itemStyle: { color: "#4f8cff" } }],
     });
     window.addEventListener("resize", () => chart.resize());
     note.textContent = "Tauri 2 · Rust command → WKWebView · ECharts 6 · data from the Python oracle's CSV export";
