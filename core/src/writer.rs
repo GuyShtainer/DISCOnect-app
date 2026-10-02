@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::ser::Formatter;
 use sha2::{Digest, Sha256};
 
+use crate::canon;
 use crate::clock::ClockOffsets;
 use crate::fit::{self, FitDecodeError};
 use crate::model::{Decoded, Instant, SleepSession};
@@ -39,6 +40,8 @@ pub enum WriteOutcome {
     Imported,
     Duplicate,
     Failed,
+    /// `rewrite_canonical` replaced a raw record's canonical rows.
+    Reparsed,
 }
 
 // ---- Python-faithful numerics ----
@@ -287,6 +290,36 @@ fn decode_summary_json(decoded: &Decoded) -> String {
     String::from_utf8(out).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The `decode_summary` of a JSON record: `{"dropped": ..., "warnings": warnings[:10]}`.
+pub fn json_summary(decoded: &Decoded) -> canon::Value {
+    canon::Value::Object(vec![
+        ("dropped".to_string(), counts_value(&decoded.dropped)),
+        ("warnings".to_string(), warnings_value(&decoded.warnings)),
+    ])
+}
+
+/// The `decode_summary` of a FIT file: `{"messages": ..., "dropped": ..., "warnings": warnings[:10]}`.
+pub fn fit_summary(decoded: &Decoded) -> canon::Value {
+    canon::Value::Object(vec![
+        ("messages".to_string(), counts_value(&decoded.message_counts)),
+        ("dropped".to_string(), counts_value(&decoded.dropped)),
+        ("warnings".to_string(), warnings_value(&decoded.warnings)),
+    ])
+}
+
+fn counts_value(counts: &BTreeMap<String, u64>) -> canon::Value {
+    canon::Value::Object(
+        counts
+            .iter()
+            .map(|(k, v)| (k.clone(), canon::Value::Int(i64::try_from(*v).unwrap_or(i64::MAX))))
+            .collect(),
+    )
+}
+
+fn warnings_value(warnings: &[String]) -> canon::Value {
+    canon::Value::Array(warnings.iter().take(10).map(|w| canon::Value::Str(w.clone())).collect())
+}
+
 fn iso_opt(moment: &Option<Instant>) -> Option<String> {
     moment.as_ref().map(iso_utc)
 }
@@ -307,6 +340,18 @@ fn device_key(device: &Option<String>) -> String {
 type IntervalRow = (String, String, Option<i64>, Option<f64>, i64);
 /// One activity type's running maxima for a day: (type, steps, distance).
 type TypeMax = (String, Option<i64>, Option<f64>);
+
+/// What `store_raw` needs besides the decoded facts.
+struct RawInput<'a> {
+    stream: &'a str,
+    source_key: &'a str,
+    kind: &'a str,
+    packed: &'a [u8],
+    payload_hash: &'a str,
+    data_len: usize,
+    summary: &'a str,
+    origin: Option<(&'a str, &'a str)>,
+}
 
 // ---- the writer ----
 
@@ -407,7 +452,10 @@ impl<'c> Writer<'c> {
         Ok(())
     }
 
-    /// Record that one record's bytes could not be decoded, without raising.
+    /// Record that one record's bytes could not be decoded, without raising. The span is whatever
+    /// was knowable (`start_utc`/`end_utc`, or the retained record's own via `raw_record_id`);
+    /// `payload_hash` makes re-importing the same broken bytes record it once; `placeable = false`
+    /// files the failure under no stream.
     #[allow(clippy::too_many_arguments)]
     pub fn record_parse_failure(
         &mut self,
@@ -417,6 +465,7 @@ impl<'c> Writer<'c> {
         message: &str,
         start_utc: Option<Instant>,
         end_utc: Option<Instant>,
+        raw_record_id: Option<i64>,
         payload_hash: Option<&str>,
         placeable: bool,
     ) -> rusqlite::Result<()> {
@@ -435,7 +484,7 @@ impl<'c> Writer<'c> {
                 if placeable { Some(stream) } else { None },
                 iso_opt(&start_utc),
                 iso_opt(&end_utc),
-                None::<i64>,
+                raw_record_id,
                 payload_hash,
                 kind,
                 utc_now_iso()
@@ -444,38 +493,76 @@ impl<'c> Writer<'c> {
         Ok(())
     }
 
+    /// Highest `raw_records` id right now (the relay marks what a run wrote).
+    pub fn last_raw_id(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row("SELECT COALESCE(MAX(id), 0) FROM raw_records", [], |r| r.get(0))
+    }
+
+    /// Note the local-date window (inclusive `YYYY-MM-DD`) a source file claims to cover for
+    /// `stream`; the first run to claim a window owns it.
+    pub fn record_export_range(&self, stream: &str, from_day: &str, to_day: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO export_ranges(run_id, stream, from_day, to_day) VALUES(?,?,?,?)",
+            params![self.run_id, stream, from_day, to_day],
+        )?;
+        Ok(())
+    }
+
     // ---- raw retention ----
 
     /// `INSERT OR IGNORE` of the raw record; its id, or None when the key was already there.
-    fn store_raw(
-        &self,
-        decoded: &Decoded,
-        source_key: &str,
-        packed: &[u8],
-        data_len: usize,
-        summary: &str,
-    ) -> rusqlite::Result<Option<i64>> {
+    /// `origin` = (transport, imported_at) of the record's first import, kept when the bytes
+    /// arrive through the relay.
+    fn store_raw(&self, decoded: &Decoded, raw: &RawInput) -> rusqlite::Result<Option<i64>> {
+        let now = utc_now_iso();
+        let (transport, imported_at) = raw.origin.unwrap_or((self.stats.transport.as_str(), now.as_str()));
         let changed = self.conn.execute(
             "INSERT OR IGNORE INTO raw_records(stream, source_key, source_scope, transport, \
              device_id, start_utc, end_utc, payload_kind, payload, payload_hash, payload_bytes, \
              decode_summary, imported_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                decoded.stream,
-                source_key,
+                raw.stream,
+                raw.source_key,
                 decoded.source_scope,
-                self.stats.transport,
+                transport,
                 decoded.device_id,
                 iso_opt(&decoded.start_utc),
                 iso_opt(&decoded.end_utc),
-                "fit",
-                packed,
-                source_key,
-                data_len as i64,
-                summary,
-                utc_now_iso()
+                raw.kind,
+                raw.packed,
+                raw.payload_hash,
+                raw.data_len as i64,
+                raw.summary,
+                imported_at
             ],
         )?;
         Ok(if changed == 1 { Some(self.conn.last_insert_rowid()) } else { None })
+    }
+
+    /// Remove every canonical row `raw_id` previously produced. Sleep stages carry no
+    /// `raw_record_id` of their own, so the sessions are looked up first and their stages deleted
+    /// before the session rows.
+    pub fn delete_canonical_for_raw(&self, raw_id: i64) -> rusqlite::Result<()> {
+        let sleep_ids: Vec<String> = {
+            let mut stmt = self.conn.prepare_cached("SELECT sleep_id FROM sleep_sessions WHERE raw_record_id=?")?;
+            let mapped = stmt.query_map(params![raw_id], |r| r.get(0))?;
+            mapped.collect::<Result<_, _>>()?
+        };
+        for sleep_id in &sleep_ids {
+            self.conn.execute("DELETE FROM sleep_stages WHERE sleep_id=?", params![sleep_id])?;
+        }
+        for table in [
+            "metric_samples",
+            "daily_metrics",
+            "daily_labels",
+            "monitoring_intervals",
+            "activities",
+            "clock_offsets",
+            "sleep_sessions",
+        ] {
+            self.conn.execute(&format!("DELETE FROM {table} WHERE raw_record_id=?"), params![raw_id])?;
+        }
+        Ok(())
     }
 
     // ---- canonical rows ----
@@ -718,7 +805,13 @@ impl<'c> Writer<'c> {
     // ---- entry points ----
 
     /// Retain and decode one FIT file. `label` is a PII-free name used only in failure reports.
-    pub fn write_fit(&mut self, data: &[u8], label: &str) -> Result<WriteOutcome, WriterError> {
+    /// `origin` = (transport, imported_at) is set when the bytes came through the relay.
+    pub fn write_fit(
+        &mut self,
+        data: &[u8],
+        label: &str,
+        origin: Option<(&str, &str)>,
+    ) -> Result<WriteOutcome, WriterError> {
         self.stats.files_seen += 1;
         let source_key = sha256_hex(data);
         let duplicate = self
@@ -734,14 +827,26 @@ impl<'c> Writer<'c> {
             Err(FitDecodeError { kind, message, stream, start_utc, end_utc }) => {
                 let placeable = stream.is_some();
                 let stream = stream.unwrap_or_else(|| "fit:undecodable".to_string());
-                self.record_parse_failure(&stream, label, &kind, &message, start_utc, end_utc, Some(&source_key), placeable)?;
+                self.record_parse_failure(
+                    &stream, label, &kind, &message, start_utc, end_utc, None, Some(&source_key), placeable,
+                )?;
                 return Ok(WriteOutcome::Failed);
             }
         };
         let summary = decode_summary_json(&decoded);
         self.provenance(&decoded.stream, "parse", true, None, None, 0)?;
         let packed = compress_verified(data)?;
-        match self.store_and_write(&decoded, &source_key, &packed, data.len(), &summary) {
+        let raw = RawInput {
+            stream: &decoded.stream,
+            source_key: &source_key,
+            kind: "fit",
+            packed: &packed,
+            payload_hash: &source_key,
+            data_len: data.len(),
+            summary: &summary,
+            origin,
+        };
+        match self.store_and_write(&decoded, &raw) {
             Ok(Some(written)) => {
                 self.provenance(&decoded.stream, "write", true, None, None, written)?;
                 self.account(&decoded, written);
@@ -752,31 +857,120 @@ impl<'c> Writer<'c> {
                 Ok(WriteOutcome::Duplicate)
             }
             Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                let message = error.to_string();
-                self.stats.files_failed += 1;
-                self.stats.failures.push(Failure {
-                    file: label.to_string(),
-                    kind: "storage".to_string(),
-                    error: redact_text(&message),
-                });
-                self.provenance(&decoded.stream, "write", false, Some("storage"), Some(&message), 0)?;
+                self.storage_failure(&decoded.stream, label, &error)?;
                 Ok(WriteOutcome::Failed)
             }
         }
     }
 
-    /// One transaction: raw record, then canonical rows. None = the raw key was already stored (rolled back).
-    fn store_and_write(
+    /// Retain one JSON record (a Connect export day or night) and its decoded facts. The stored
+    /// bytes are the record's canonical JSON; the duplicate test is by (stream, source_key).
+    pub fn write_json_record(
         &mut self,
-        decoded: &Decoded,
+        stream: &str,
         source_key: &str,
-        packed: &[u8],
-        data_len: usize,
-        summary: &str,
-    ) -> rusqlite::Result<Option<i64>> {
+        record: &canon::Value,
+        decoded: &Decoded,
+        label: &str,
+        origin: Option<(&str, &str)>,
+    ) -> Result<WriteOutcome, WriterError> {
+        self.stats.files_seen += 1;
+        let duplicate = self
+            .conn
+            .prepare_cached("SELECT 1 FROM raw_records WHERE stream=? AND source_key=?")?
+            .exists(params![stream, source_key])?;
+        if duplicate {
+            self.stats.files_duplicate += 1;
+            return Ok(WriteOutcome::Duplicate);
+        }
+        let data = canon::dumps(record);
+        let summary = canon::dumps_spaced(&json_summary(decoded));
+        let payload_hash = sha256_hex(&data);
+        let packed = compress_verified(&data)?;
+        let raw = RawInput {
+            stream,
+            source_key,
+            kind: "json",
+            packed: &packed,
+            payload_hash: &payload_hash,
+            data_len: data.len(),
+            summary: &summary,
+            origin,
+        };
+        match self.store_and_write(decoded, &raw) {
+            Ok(Some(written)) => {
+                self.provenance(stream, "parse", true, None, None, 0)?;
+                self.provenance(stream, "write", true, None, None, written)?;
+                self.account(decoded, written);
+                Ok(WriteOutcome::Imported)
+            }
+            Ok(None) => {
+                self.stats.files_duplicate += 1;
+                Ok(WriteOutcome::Duplicate)
+            }
+            Err(error) => {
+                self.storage_failure(stream, label, &error)?;
+                Ok(WriteOutcome::Failed)
+            }
+        }
+    }
+
+    /// Roll back the open transaction and book a `storage` failure for `stream`.
+    fn storage_failure(&mut self, stream: &str, label: &str, error: &rusqlite::Error) -> rusqlite::Result<()> {
+        let _ = self.conn.execute_batch("ROLLBACK");
+        let message = error.to_string();
+        self.stats.files_failed += 1;
+        self.stats.failures.push(Failure {
+            file: label.to_string(),
+            kind: "storage".to_string(),
+            error: redact_text(&message),
+        });
+        self.provenance(stream, "write", false, Some("storage"), Some(&message), 0)
+    }
+
+    /// Replace every canonical row `raw_id` produced with freshly decoded facts. The caller has
+    /// already decoded successfully: that is booked as a `parse` provenance event, then the
+    /// `write` side runs in one transaction (delete what `raw_id` wrote, write `decoded`, refresh
+    /// `decode_summary`), so a storage error leaves the previous rows intact and is recorded in
+    /// `stats.failures`. Returns `Reparsed` or `Failed`.
+    pub fn rewrite_canonical(
+        &mut self,
+        raw_id: i64,
+        stream: &str,
+        decoded: &Decoded,
+        summary: &canon::Value,
+    ) -> Result<WriteOutcome, WriterError> {
+        self.provenance(stream, "parse", true, None, None, 0)?;
+        let label = format!("raw_record:{raw_id}");
+        match self.rewrite_in_transaction(raw_id, decoded, summary) {
+            Ok(written) => {
+                self.provenance(stream, "write", true, None, None, written)?;
+                self.account(decoded, written);
+                Ok(WriteOutcome::Reparsed)
+            }
+            Err(error) => {
+                self.storage_failure(stream, &label, &error)?;
+                Ok(WriteOutcome::Failed)
+            }
+        }
+    }
+
+    fn rewrite_in_transaction(&mut self, raw_id: i64, decoded: &Decoded, summary: &canon::Value) -> rusqlite::Result<i64> {
         self.conn.execute_batch("BEGIN")?;
-        let Some(raw_id) = self.store_raw(decoded, source_key, packed, data_len, summary)? else {
+        self.delete_canonical_for_raw(raw_id)?;
+        let written = self.write_canonical(decoded, raw_id)?;
+        self.conn.execute(
+            "UPDATE raw_records SET decode_summary=? WHERE id=?",
+            params![canon::dumps_spaced(summary), raw_id],
+        )?;
+        self.conn.execute_batch("COMMIT")?;
+        Ok(written)
+    }
+
+    /// One transaction: raw record, then canonical rows. None = the raw key was already stored (rolled back).
+    fn store_and_write(&mut self, decoded: &Decoded, raw: &RawInput) -> rusqlite::Result<Option<i64>> {
+        self.conn.execute_batch("BEGIN")?;
+        let Some(raw_id) = self.store_raw(decoded, raw)? else {
             self.conn.execute_batch("ROLLBACK")?;
             return Ok(None);
         };

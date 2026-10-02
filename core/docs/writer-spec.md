@@ -37,6 +37,24 @@ else **`drop`** (verified in `sources.import_path`); `imported_at = now`. Duplic
    records_written += written, per-stream files/records, dropped reasons summed, first 3
    warnings kept up to 20) → IMPORTED.
 
+## Slice 2A surface (Bet 11b step 1)
+- `write_fit(bytes, label, origin)` and `write_json_record(stream, source_key, record, decoded,
+  label, origin)`: `origin = (transport, imported_at)` replaces the run's transport and now in
+  `raw_records` (relay hop keeps provenance). JSON: duplicate test is `(stream, source_key)`
+  (not the hash); stored bytes = `canon::dumps(record)`; `payload_kind = "json"`,
+  `payload_hash = sha256(those bytes)`; `decode_summary = json.dumps({"dropped", "warnings"[:10]},
+  sort_keys=True)` (`", "` / `": "` separators, ASCII-escaped); provenance parse-ok is booked
+  after the commit, write-ok with the rows written.
+- `rewrite_canonical(raw_id, stream, decoded, summary)`: provenance parse-ok, then one
+  transaction (`delete_canonical_for_raw`, `_write_canonical`, `UPDATE raw_records SET
+  decode_summary`); a storage error rolls back, books `raw_record:<id>` as a `storage` failure
+  and returns FAILED; else REPARSED and `_account`.
+- `delete_canonical_for_raw(raw_id)`: stages of the raw's sleep sessions first, then the rows of
+  the seven canonical tables with that `raw_record_id`.
+- `record_export_range` (`INSERT OR IGNORE INTO export_ranges`), `last_raw_id`
+  (`COALESCE(MAX(id), 0)`), and `record_parse_failure(..., start, end, raw_record_id,
+  payload_hash, placeable)` carrying every column the Python keyword arguments do.
+
 ## Provenance (`stream_provenance`)
 `INSERT OR IGNORE INTO stream_provenance(stream, updated_at)`; ok: `UPDATE … SET
 last_<stage>_ok_at=now, updated_at=now, files_ok = files_ok + (1 if stage == "write" else 0),

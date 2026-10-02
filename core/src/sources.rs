@@ -216,7 +216,7 @@ fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>) -> Result<
         writer.offsets.extend(fit::scan_clock_offsets(data));
     }
     for (label, data) in files {
-        writer.write_fit(data, label)?;
+        writer.write_fit(data, label, None)?;
     }
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
