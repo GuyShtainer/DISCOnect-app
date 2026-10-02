@@ -96,6 +96,7 @@ function locked(): boolean {
 }
 
 let generation = 0;
+const afterCommit: (() => void)[] = [];
 
 /** Render the current screen. Single-flight: a newer route() wins and an older one draws nothing. */
 async function route(): Promise<void> {
@@ -122,9 +123,10 @@ async function route(): Promise<void> {
     }
     out.append(el("div", "banner body error", core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e)));
   }
-  if (mine !== generation) return;
+  if (mine !== generation) { afterCommit.length = 0; return; }
   out.append(el("footer", "notice", NOTICE));
   main.replaceChildren(out);
+  for (const fn of afterCommit.splice(0)) fn();
 }
 
 function header(out: ParentNode, title: string, sub: string): void {
@@ -227,7 +229,7 @@ async function screenTrend(out: ParentNode): Promise<void> {
   card.append(el("span", "caption muted", (gapDays
     ? `Hatched bands: ${gapDays} days no import covered. Nothing is drawn there; a line never bridges a gap.`
     : "Every day in the window was covered by an import.") + ends));
-  drawTrend(chart, series, metricLabel(trendMetric));
+  afterCommit.push(() => drawTrend(chart, series, metricLabel(trendMetric)));
 }
 
 // ---- Data health ------------------------------------------------------------------------
@@ -380,6 +382,8 @@ void (async () => {
   const args = await core.launchArgs().catch(() => [] as string[]);
   const i = args.indexOf("--screen");
   const wanted = i >= 0 && SCREENS.some((s) => s.id === args[i + 1]) ? args[i + 1] : null;
+  const h = args.indexOf("--health-days");
+  if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
   if (wanted && current() !== wanted) {
     location.hash = `#/${wanted}`; // hashchange runs route()
   } else {
