@@ -199,7 +199,10 @@ async function screenTrend(out: ParentNode): Promise<void> {
   controls.append(select, range);
   out.append(controls);
 
-  const results = await Promise.all(SCOPES.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays })));
+  // The window ends on the latest day any metric has data, so an archive still draws.
+  const today = await core.call<Today>("data.today");
+  const lastDay = today.metrics.reduce<string>((acc, m) => (m.day && m.day > acc ? m.day : acc), "") || today.day;
+  const results = await Promise.all(SCOPES.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays, last_day: lastDay })));
   const series: Series[] = results
     .filter((m) => m.days.some((d) => d.value !== null))
     .map((m) => ({ scope: m.scope, unit: m.unit, days: m.days }));
@@ -220,17 +223,29 @@ async function screenTrend(out: ParentNode): Promise<void> {
     return;
   }
   const gapDays = series[0].days.filter((d) => d.status === "not_covered").length;
-  card.append(el("span", "caption muted", gapDays
+  const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
+  card.append(el("span", "caption muted", (gapDays
     ? `Hatched bands: ${gapDays} days no import covered. Nothing is drawn there; a line never bridges a gap.`
-    : "Every day in the window was covered by an import."));
+    : "Every day in the window was covered by an import.") + ends));
   drawTrend(chart, series, metricLabel(trendMetric));
 }
 
 // ---- Data health ------------------------------------------------------------------------
+let healthDays = 90;
+
 async function screenHealth(out: ParentNode): Promise<void> {
-  const health = await core.call<Health>("data.health", { window_days: 90 });
+  const health = await core.call<Health>("data.health", { window_days: healthDays });
   const cov = health.coverage;
   header(out, "Data health", `Why a day is missing · ${cov.window.from} → ${cov.window.to} · one row per metric and source`);
+  const range = el("select") as HTMLSelectElement;
+  for (const [d, label] of [[90, "last 90 days"], [365, "last year"], [1825, "last 5 years"]] as const) {
+    const o = el("option", "", label) as HTMLOptionElement;
+    o.value = String(d);
+    o.selected = d === healthDays;
+    range.append(o);
+  }
+  range.onchange = () => { healthDays = Number(range.value); void route(); };
+  out.append(range);
   const legend = el("div", "legend caption");
   for (const [status, word] of [["present", "present"], ["failed", "failed (striped, taller)"], ["source_empty", "source empty"], ["not_covered", "not covered"]]) {
     const item = el("span");
