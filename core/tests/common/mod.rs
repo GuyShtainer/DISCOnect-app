@@ -24,3 +24,5 @@ pub fn encrypted_copy() -> (tempfile::TempDir, PathBuf) {
     install_key(&db);
     (dir, db)
 }
+
+pub mod decoded_cmp;
