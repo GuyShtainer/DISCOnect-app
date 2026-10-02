@@ -1,0 +1,6 @@
+{
+ "q\"k": "say \"hi\"",
+ "b\\k": "C:\\dir\\file",
+ "slash": "a/b//c",
+ "mixed": "\\\"/"
+}

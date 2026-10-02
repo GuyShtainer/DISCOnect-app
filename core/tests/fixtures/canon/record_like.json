@@ -1,0 +1,16 @@
+{
+ "calendarDate": "2025-06-15",
+ "minHeartRate": 48,
+ "avgStress": 31.5,
+ "bodyBatteryChargedValue": 70.0,
+ "values": [
+  {
+   "timestamp": 1750000000000,
+   "level": 25.25
+  },
+  {
+   "level": 26,
+   "timestamp": 1750000060000
+  }
+ ]
+}

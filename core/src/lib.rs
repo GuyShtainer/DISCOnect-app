@@ -3,6 +3,7 @@
 //!
 //! The Python core is the oracle: this crate opens the same store with the same key file.
 
+pub mod canon;
 pub mod clock;
 pub mod fit;
 pub mod keys;
