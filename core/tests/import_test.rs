@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `import` end to end on the 11 synthetic FIT fixtures (no health data), into a plaintext store.
+//! `import` end to end on the synthetic FIT fixtures (no health data), into a plaintext store.
 
 mod common;
 
@@ -33,26 +33,28 @@ fn open(db: &Path) -> Store {
 }
 
 #[test]
-fn eleven_fixtures_import_ten_and_fail_one_then_rerun_is_all_duplicates() {
+fn every_fixture_but_garbage_imports_and_garbage_fails_then_rerun_is_all_duplicates() {
     let dir = tempfile::tempdir().expect("tempdir");
     let folder = synthetic_folder(dir.path());
-    assert_eq!(iter_fit_files(&folder).expect("walk").len(), 11);
+    // One file (garbage) is expected to fail; every other fixture imports.
+    let total = iter_fit_files(&folder).expect("walk").len() as i64;
+    assert!(total >= 11, "expected at least 11 fixtures");
     let store = open(&dir.path().join("plain.db"));
     let conn = store.conn();
 
     let first = import_path(conn, &folder, None).expect("first import");
-    assert_eq!((first.files_seen, first.files_imported, first.files_duplicate, first.files_failed), (11, 10, 0, 1));
+    assert_eq!((first.files_seen, first.files_imported, first.files_duplicate, first.files_failed), (total, total - 1, 0, 1));
     assert_eq!(first.status(), "partial");
     assert_eq!(first.transport, "drop");
     assert_eq!(first.failures.len(), 1);
     assert!(first.records_written > 0 && first.derived_days > 0);
-    assert_eq!(count(conn, "raw_records"), 10);
+    assert_eq!(count(conn, "raw_records"), total - 1);
     assert_eq!(count(conn, "import_failures"), 1);
     assert_eq!(count(conn, "import_runs"), 1);
     let (status, seen, failed): (String, i64, i64) = conn
         .query_row("SELECT status, files_seen, files_failed FROM import_runs", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .expect("run row");
-    assert_eq!((status.as_str(), seen, failed), ("partial", 11, 1));
+    assert_eq!((status.as_str(), seen, failed), ("partial", total, 1));
     let transport: String = conn.query_row("SELECT DISTINCT transport FROM raw_records", [], |r| r.get(0)).expect("transport");
     assert_eq!(transport, "drop");
     // the retained bytes are the file's bytes
@@ -66,11 +68,11 @@ fn eleven_fixtures_import_ten_and_fail_one_then_rerun_is_all_duplicates() {
 
     let rows_before: Vec<(String, i64)> = store::table_counts(conn).expect("counts");
     let second = import_path(conn, &folder, Some("usb")).expect("second import");
-    assert_eq!((second.files_seen, second.files_imported, second.files_duplicate), (11, 0, 10));
+    assert_eq!((second.files_seen, second.files_imported, second.files_duplicate), (total, 0, total - 1));
     // the undecodable file fails again (its failure row is unique by hash, so it is not duplicated)
     assert_eq!(second.files_failed, 1);
     assert_eq!(second.records_written, 0);
-    assert_eq!(count(conn, "raw_records"), 10);
+    assert_eq!(count(conn, "raw_records"), total - 1);
     assert_eq!(count(conn, "import_failures"), 1);
     assert_eq!(count(conn, "import_runs"), 2);
     let after: Vec<(String, i64)> = store::table_counts(conn).expect("counts");
@@ -129,6 +131,7 @@ fn cli_import_prints_counts_and_exits_1_on_partial() {
     let dir = tempfile::tempdir().expect("tempdir");
     let folder = synthetic_folder(dir.path());
     let db = dir.path().join("cli.db");
+    let imported = iter_fit_files(&folder).expect("walk").len() - 1;
     let run = |extra: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"))
             .arg("--db")
@@ -143,7 +146,7 @@ fn cli_import_prints_counts_and_exits_1_on_partial() {
     let out = run(&["--transport", "gadgetbridge"]);
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.starts_with("partial: 10 imported, 0 duplicate, 1 failed, "), "{text}");
+    assert!(text.starts_with(&format!("partial: {imported} imported, 0 duplicate, 1 failed, ")), "{text}");
     assert!(text.contains("derived daily steps/distance for 1 day(s)"));
     assert!(text.contains("  FAILED garbage.fit: [unrecognized_payload]"));
     let bad = run(&["--transport", "carrier-pigeon"]);

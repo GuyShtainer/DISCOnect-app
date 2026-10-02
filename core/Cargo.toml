@@ -29,7 +29,7 @@ thiserror = "2"
 fs2 = "0.4"
 hex = "0.4"
 chrono = "0.4"
-fitparser = "0.11"
+fitparser = "=0.11.0"
 flate2 = "1.1.10"
 fancy-regex = "0.19.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

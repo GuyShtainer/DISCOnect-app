@@ -17,6 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use fitparser::de::{DecodeOption, FitObject, FitStreamProcessor};
 use fitparser::profile::MesgNum;
+use fitparser::profile::field_types::{ActivityType, EventType, Spo2MeasurementType};
 use fitparser::{FitDataField, Value};
 
 use crate::model::{
@@ -47,8 +48,17 @@ const MIN_WALL_SECS: i64 = 0x1000_0000;
 /// `fit_wellness.py`.
 const ENERGY_FIELD_NUM: u8 = 3;
 
-/// `event.event` code that brackets a night in the sleep files (file type 49).
-const SLEEP_EVENT_CODE: &str = "74";
+/// `event.event` code that brackets a night in the sleep files. Not named in fitparser 0.11's
+/// profile, so a plain number; every enum below is compared by number, never by the name text.
+const SLEEP_EVENT_CODE: i64 = 74;
+/// `file_id.type` of a sleep file (unnamed in the profile).
+const FILE_TYPE_SLEEP: i64 = 49;
+/// `file_id.type` of an HRV file.
+const FILE_TYPE_HRV: i64 = 68;
+/// `file_id.type` of a skin-temperature file.
+const FILE_TYPE_SKIN_TEMP: i64 = 73;
+/// `file_id.type` of a metrics file.
+const FILE_TYPE_METRICS: i64 = 44;
 
 const MSG_FILE_ID: u16 = 0;
 const MSG_SESSION: u16 = 18;
@@ -241,11 +251,21 @@ struct Raw {
     /// `monitoring` field 3 as it came off the wire (the profile rescales it per activity type,
     /// and which way depends on field order inside fitparser, so the raw value is read instead).
     cycles: Option<i64>,
+    /// Every native integer field as it came off the wire, by field number: the enum fields are
+    /// compared here by number, so a profile that later names a value cannot change behaviour.
+    numbers: BTreeMap<u8, i64>,
+}
+
+impl Raw {
+    fn number(&self, field: u8) -> Option<i64> {
+        self.numbers.get(&field).copied()
+    }
 }
 
 struct State {
     out: Decoded,
     file_type: Option<String>,
+    file_type_number: Option<i64>,
     last_full: Option<Instant>,
     sleep_levels: Vec<(Instant, String)>,
     sleep_start: Option<Instant>,
@@ -260,6 +280,7 @@ impl State {
         State {
             out: Decoded::new("fit:unknown", "device"),
             file_type: None,
+            file_type_number: None,
             last_full: None,
             sleep_levels: Vec::new(),
             sleep_start: None,
@@ -317,12 +338,13 @@ impl State {
 
     // ---- per-message handlers ----
 
-    fn file_id(&mut self, v: &View) {
+    fn file_id(&mut self, v: &View, raw: &Raw) {
         self.file_type = v.text(0);
-        let label = self.file_type.as_deref().unwrap_or("None");
-        // `FILE_TYPE_STREAMS` maps these names; every other type is `fit:<type>`. A missing type
+        self.file_type_number = raw.number(0);
+        // `FILE_TYPE_STREAMS` maps these types; every other type is `fit:<type>`. A missing type
         // reads "None", exactly as the oracle's f-string does.
-        self.out.stream = format!("fit:{}", stream_label(label));
+        let label = stream_label(self.file_type_number, self.file_type.as_deref());
+        self.out.stream = format!("fit:{label}");
         self.out.device_id = v.text(3);
         if let Some(created) = v.instant(4) {
             self.touch(created);
@@ -366,7 +388,13 @@ impl State {
         // `monitoring.cycles` carries steps (scale 1) for walking and running and half-steps
         // (scale 2) otherwise; a record that resolves to steps reports it under both names.
         let (steps, cycles) = match raw.cycles {
-            Some(r) if matches!(activity_type.as_deref(), Some("walking" | "running")) => {
+            Some(r)
+                if matches!(
+                    activity_type.as_deref().and_then(activity_type_number),
+                    Some(n) if n == i64::from(ActivityType::Walking.as_u8())
+                        || n == i64::from(ActivityType::Running.as_u8())
+                ) =>
+            {
                 (Some(r), Some(r as f64))
             }
             Some(r) => (None, Some(r as f64 / 2.0)),
@@ -442,11 +470,12 @@ impl State {
         self.sample("respiration_rate", ts, value);
     }
 
-    fn spo2_data(&mut self, v: &View) {
+    fn spo2_data(&mut self, v: &View, raw: &Raw) {
         let (Some(ts), Some(value)) = (v.instant(FIELD_TIMESTAMP), v.number(0)) else {
             return;
         };
-        if v.text(2).as_deref() == Some("off_wrist") || value <= 0.0 {
+        let off_wrist = raw.number(2) == Some(i64::from(Spo2MeasurementType::OffWrist.as_u8()));
+        if off_wrist || value <= 0.0 {
             self.out.drop("spo2_off_wrist_or_zero");
             return;
         }
@@ -469,15 +498,14 @@ impl State {
         self.assessment = Some(values);
     }
 
-    fn event(&mut self, v: &View) {
+    fn event(&mut self, v: &View, raw: &Raw) {
         let Some(ts) = v.instant(FIELD_TIMESTAMP) else {
             return;
         };
-        if self.file_type.as_deref() == Some("49") && v.text(0).as_deref() == Some(SLEEP_EVENT_CODE)
-        {
-            match v.text(1).as_deref() {
-                Some("start") => self.sleep_start = Some(ts),
-                Some("stop") => self.sleep_end = Some(ts),
+        if self.file_type_number == Some(FILE_TYPE_SLEEP) && raw.number(0) == Some(SLEEP_EVENT_CODE) {
+            match raw.number(1) {
+                Some(n) if n == i64::from(EventType::Start.as_u8()) => self.sleep_start = Some(ts),
+                Some(n) if n == i64::from(EventType::Stop.as_u8()) => self.sleep_end = Some(ts),
                 _ => {}
             }
         }
@@ -570,16 +598,16 @@ impl State {
             self.last_full = Some(full);
         }
         match num {
-            MSG_FILE_ID => self.file_id(v),
+            MSG_FILE_ID => self.file_id(v, raw),
             MSG_MONITORING_INFO => self.monitoring_info(v),
             MSG_MONITORING => self.monitoring(v, raw),
             MSG_MONITORING_HR_DATA => self.monitoring_hr_data(v),
             MSG_STRESS_LEVEL => self.stress_level(v),
             MSG_RESPIRATION_RATE => self.respiration_rate(v),
-            MSG_SPO2_DATA => self.spo2_data(v),
+            MSG_SPO2_DATA => self.spo2_data(v, raw),
             MSG_SLEEP_LEVEL => self.sleep_level(v),
             MSG_SLEEP_ASSESSMENT => self.sleep_assessment(v),
-            MSG_EVENT => self.event(v),
+            MSG_EVENT => self.event(v, raw),
             MSG_HRV_STATUS_SUMMARY => self.hrv_status_summary(v),
             MSG_HRV_VALUE => self.hrv_value(v),
             MSG_SKIN_TEMP_OVERNIGHT => self.skin_temp_overnight(v),
@@ -698,13 +726,13 @@ fn apply_assessment(session: &mut SleepSession, values: &[Option<Num>; 14]) {
 }
 
 /// `FILE_TYPE_STREAMS`: the stream suffix for a `file_id.type` text.
-fn stream_label(file_type: &str) -> &str {
-    match file_type {
-        "49" => "sleep",
-        "68" => "hrv",
-        "73" => "skin_temp",
-        "44" => "metrics",
-        other => other,
+fn stream_label(number: Option<i64>, text: Option<&str>) -> &str {
+    match number {
+        Some(FILE_TYPE_SLEEP) => "sleep",
+        Some(FILE_TYPE_HRV) => "hrv",
+        Some(FILE_TYPE_SKIN_TEMP) => "skin_temp",
+        Some(FILE_TYPE_METRICS) => "metrics",
+        _ => text.unwrap_or("None"),
     }
 }
 
@@ -776,6 +804,41 @@ fn native_view(record: &fitparser::FitDataRecord, developer_fields: usize) -> Vi
     View { fields }
 }
 
+thread_local! {
+    static IN_PARSER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make a panic inside the FIT parser print nothing. The default hook names the source file of
+/// the panic, and for a panic inside the parser that is a path under the build machine's home
+/// directory. The decoder turns the panic into a per-file failure anyway. Panics anywhere else
+/// still reach the previous hook. Idempotent; called before the first decode and by the CLI at
+/// start-up.
+pub fn silence_parser_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !IN_PARSER.with(std::cell::Cell::get) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// The number of a decoded `activity_type` value. The field is often filled by component
+/// expansion from `current_activity_type_intensity`, so it is absent from the raw message and
+/// only the decoded text is available; fitparser's own enum maps that text back to its number
+/// (digit text, for values the profile does not name, is read as the number it is).
+fn activity_type_number(text: &str) -> Option<i64> {
+    if let Ok(number) = text.parse::<i64>() {
+        return Some(number);
+    }
+    match ActivityType::from(text) {
+        ActivityType::UnknownVariant(_) => None,
+        named => Some(i64::from(named.as_u8())),
+    }
+}
+
 fn processor() -> FitStreamProcessor {
     let mut processor = FitStreamProcessor::new();
     processor.add_option(DecodeOption::SkipHeaderCrcValidation);
@@ -790,11 +853,13 @@ fn run_stream<F>(bytes: &[u8], mut on_message: F) -> Result<(), String>
 where
     F: FnMut(u16, &fitparser::FitDataRecord, usize, Raw),
 {
+    silence_parser_panics();
     let mut processor = processor();
     let mut buffer = bytes;
     // Between a header and its CRC a file is open; the oracle fails a stream that ends there.
     let mut open = false;
     while !buffer.is_empty() {
+        IN_PARSER.with(|flag| flag.set(true));
         let step = catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
             let (rest, object) = processor
                 .deserialize_next(buffer)
@@ -815,6 +880,11 @@ where
                         cycles: (message.global_message_number() == MSG_MONITORING)
                             .then(|| message.fields().get(&3).and_then(integer_of))
                             .flatten(),
+                        numbers: message
+                            .fields()
+                            .iter()
+                            .filter_map(|(k, v)| integer_of(v).map(|n| (*k, n)))
+                            .collect(),
                     };
                     let developer_fields = message.developer_fields().len();
                     let record = processor
@@ -823,8 +893,9 @@ where
                     Ok((rest, Some((record, developer_fields, raw))))
                 }
             }
-        }))
-        .map_err(|_| "parser panicked on this input".to_string())??;
+        }));
+        IN_PARSER.with(|flag| flag.set(false));
+        let step = step.map_err(|_| "parser panicked on this input".to_string())??;
         let (rest, decoded) = step;
         if let Some((record, developer_fields, raw)) = decoded {
             let kind = record.kind();

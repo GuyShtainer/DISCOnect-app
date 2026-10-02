@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The `fit` module against the Python oracle's answers on the 11 synthetic fixtures.
+//! The `fit` module against the Python oracle's answers on the synthetic fixtures.
 
 mod common;
 
@@ -24,7 +24,7 @@ fn fixture_names() -> Vec<String> {
 fn synthetic_fixtures_match_the_oracle() {
     let dir = common::fixtures().join("synthetic");
     let names = fixture_names();
-    assert_eq!(names.len(), 11, "expected 11 synthetic fixtures");
+    assert!(names.len() >= 11, "expected at least 11 synthetic fixtures");
     let mut accepted = 0usize;
     let mut failures = Vec::new();
     for name in &names {

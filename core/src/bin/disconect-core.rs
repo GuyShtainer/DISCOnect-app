@@ -89,7 +89,7 @@ fn status(db: &std::path::Path, source: PassphraseSource<'_>) -> Result<Value, S
 
 fn import_exit_code(err: &SourceError) -> u8 {
     match err {
-        SourceError::NotFound(_) => EXIT_USAGE,
+        SourceError::NotFound(_) | SourceError::ExportUnsupported => EXIT_USAGE,
         _ => EXIT_DATABASE,
     }
 }
@@ -137,6 +137,7 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
 }
 
 fn main() -> ExitCode {
+    disconect_core::fit::silence_parser_panics();
     let args = match parse_args() {
         Ok(a) => a,
         Err(m) => {
