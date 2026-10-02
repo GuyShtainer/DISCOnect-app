@@ -110,6 +110,7 @@ async fn a_crash_fails_the_caller_and_restarts_once() {
 async fn unlock_goes_through_the_zeroized_path_only() {
     let (core, _) = start();
     assert_eq!(core.call("key.unlock", json!({"passphrase": "x"})).await.unwrap_err().code, "bad_params");
+    assert_eq!(core.call("key.unlock", json!({})).await.unwrap()["unlocked"], false); // keychain path is allowed
     let ok = core.unlock(zeroize::Zeroizing::new("correct horse".to_string())).await.unwrap();
     assert_eq!(ok["unlocked"], true);
     core.shutdown();

@@ -260,14 +260,15 @@ impl Sidecar {
         }
     }
 
-    /// Any method except `key.unlock`, whose passphrase must never travel as a plain `Value`.
+    /// Any method; `key.unlock` only without a passphrase (the keychain path), because a
+    /// passphrase must never travel as a plain `Value`.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, CoreError> {
         self.call_with_timeout(method, params, timeout_for(method)).await
     }
 
     /// [`Self::call`] with an explicit timeout (tests; long-running diagnostics).
     pub async fn call_with_timeout(&self, method: &str, params: Value, timeout: Option<Duration>) -> Result<Value, CoreError> {
-        if method == "key.unlock" {
+        if method == "key.unlock" && params.get("passphrase").is_some() {
             return Err(CoreError::new("bad_params", "use the unlock path for key.unlock"));
         }
         let (id, rx) = self.register();

@@ -40,6 +40,12 @@ async fn core_unlock(state: State<'_, Core>, passphrase: Zeroizing<String>) -> R
     core.unlock(passphrase).await
 }
 
+/// The app's own argv (after the executable), so the UI can honour `--screen <id>`.
+#[tauri::command]
+fn launch_args() -> Vec<String> {
+    std::env::args().skip(1).collect()
+}
+
 /// Last stderr lines of the core for a diagnostics panel (never key material: the core keeps
 /// that off stderr; this is for "why did it stop" questions).
 #[tauri::command]
@@ -83,9 +89,9 @@ pub fn run() {
             Ok(())
         });
     #[cfg(debug_assertions)]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, debug_unlock_from_file]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, debug_unlock_from_file]);
     #[cfg(not(debug_assertions))]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args]);
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

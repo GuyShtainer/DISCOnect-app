@@ -26,3 +26,17 @@ export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited", c
 export function coreStderr(): Promise<string[]> {
   return invoke<string[]>("core_stderr");
 }
+
+/** Try the keychain: key.unlock without a passphrase. Resolves to false when nothing is cached. */
+export async function unlockFromKeychain(): Promise<boolean> {
+  try {
+    const r = await invoke<{ unlocked: boolean }>("core_call", { method: "key.unlock", params: {} });
+    return !!r.unlocked;
+  } catch {
+    return false;
+  }
+}
+
+export function launchArgs(): Promise<string[]> {
+  return invoke<string[]>("launch_args");
+}

@@ -95,8 +95,14 @@ function locked(): boolean {
   return !!keyStatus && keyStatus.encrypted && !keyStatus.unlocked;
 }
 
+let triedKeychain = false;
+
 async function route(): Promise<void> {
   await refreshKey();
+  if (locked() && !triedKeychain) {
+    triedKeychain = true;
+    if (await core.unlockFromKeychain()) await refreshKey();
+  }
   renderNav();
   main.replaceChildren();
   if (banner) main.append(el("div", "banner body", banner));
@@ -352,4 +358,9 @@ window.addEventListener("hashchange", () => void route());
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 void core.onCoreEvent("restarted", () => { banner = "The core restarted after an error; the last request was lost."; void route(); });
 void core.onCoreEvent("exited", () => { banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
-void route();
+void (async () => {
+  const args = await core.launchArgs().catch(() => [] as string[]);
+  const i = args.indexOf("--screen");
+  if (i >= 0 && args[i + 1] && SCREENS.some((s) => s.id === args[i + 1])) location.hash = `#/${args[i + 1]}`;
+  await route();
+})();
