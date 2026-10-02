@@ -40,3 +40,7 @@ export async function unlockFromKeychain(): Promise<boolean> {
 export function launchArgs(): Promise<string[]> {
   return invoke<string[]>("launch_args");
 }
+
+export function mcpCommand(): Promise<string> {
+  return invoke<string>("mcp_command");
+}

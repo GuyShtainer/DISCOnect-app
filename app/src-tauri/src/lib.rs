@@ -40,6 +40,21 @@ async fn core_unlock(state: State<'_, Core>, passphrase: Zeroizing<String>) -> R
     core.unlock(passphrase).await
 }
 
+/// The command Claude Desktop should run to use this app's core as its MCP server.
+#[tauri::command]
+fn mcp_command(app: tauri::AppHandle) -> String {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|d| d.join("hearthbeat-core").join("hearthbeat-core"))
+        .filter(|p| p.is_file());
+    match bundled {
+        Some(p) => format!("\"{}\" mcp", p.display()),
+        None => "hearthbeat-mcp  (dev build: the core is not bundled; use the venv's script)".to_string(),
+    }
+}
+
 /// The app's own argv (after the executable), so the UI can honour `--screen <id>`.
 #[tauri::command]
 fn launch_args() -> Vec<String> {
@@ -89,9 +104,9 @@ pub fn run() {
             Ok(())
         });
     #[cfg(debug_assertions)]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, debug_unlock_from_file]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file]);
     #[cfg(not(debug_assertions))]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command]);
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

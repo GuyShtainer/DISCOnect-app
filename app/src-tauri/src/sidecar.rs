@@ -154,12 +154,23 @@ impl Sidecar {
     fn drain_stderr(&self, stderr: std::process::ChildStderr) {
         let inner = self.0.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let mut tail = inner.stderr_tail.lock().unwrap();
-                if tail.len() == STDERR_LINES_KEPT {
-                    tail.pop_front();
+            // read_until + lossy decoding: a non-UTF-8 byte must never stop the drain, or the
+            // child blocks once the pipe fills.
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                        let mut tail = inner.stderr_tail.lock().unwrap();
+                        if tail.len() == STDERR_LINES_KEPT {
+                            tail.pop_front();
+                        }
+                        tail.push_back(line);
+                    }
                 }
-                tail.push_back(line);
             }
         });
     }
@@ -274,7 +285,10 @@ impl Sidecar {
         let (id, rx) = self.register();
         let line = serde_json::to_vec(&serde_json::json!({ "id": id, "method": method, "params": params }))
             .map_err(|e| CoreError::new("bad_params", e.to_string()))?;
-        self.write_line(&line)?;
+        if let Err(e) = self.write_line(&line) {
+            self.0.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
         self.await_reply(id, rx, timeout).await
     }
 
@@ -296,9 +310,13 @@ impl Sidecar {
             let req = Req { id, method: "key.unlock", params: Params { passphrase: passphrase.as_str() } };
             Zeroizing::new(serde_json::to_vec(&req).map_err(|e| CoreError::new("bad_params", e.to_string()))?)
         };
-        self.write_line(&line)?;
+        let written = self.write_line(&line);
         drop(line);
         drop(passphrase);
+        if let Err(e) = written {
+            self.0.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
         self.await_reply(id, rx, timeout_for("key.unlock")).await
     }
 
@@ -321,9 +339,12 @@ impl Sidecar {
     }
 }
 
-/// Where the core lives: `DISCONECT_CORE` (an executable path) wins; then the bundled one-dir
-/// sidecar under the app's resources; in debug builds, finally the dev venv's `hearthbeat-serve`.
+/// Where the core lives: the bundled one-dir sidecar under the app's resources. Debug builds
+/// also honour `DISCONECT_CORE` (an executable path) and fall back to the dev venv's
+/// `hearthbeat-serve`; release builds never let an environment variable pick the executable
+/// that receives the passphrase.
 pub fn locate_core(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("DISCONECT_CORE") {
         return Some(PathBuf::from(p));
     }

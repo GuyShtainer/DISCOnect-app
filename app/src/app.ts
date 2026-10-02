@@ -3,9 +3,9 @@
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
 import { NOTICE, PRODUCT, metricLabel, scopeWord } from "./identity";
-import { drawTrend, type Series } from "./charts";
+import { disposeCharts, drawTrend, type Series } from "./charts";
 
-type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: boolean };
+type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
 type AppInfo = { product: string; core: string; db: string; encrypted: boolean };
 type Day = { day: string; value: number | null; status: string };
 type Metric = { metric: string; scope: string; unit: string | null; days: Day[] };
@@ -49,7 +49,7 @@ function scopeTag(scope: string): HTMLElement {
 
 function fmt(value: number | null, unit: string | null): string {
   if (value === null || value === undefined) return "no data";
-  const n = Math.abs(value) >= 100 ? Math.round(value).toLocaleString("en").replace(/,/g, " ") : (Math.round(value * 10) / 10).toString();
+  const n = Math.abs(value) >= 100 ? Math.round(value).toLocaleString("en").replace(/,/g, "\u202f") : (Math.round(value * 10) / 10).toString();
   return unit && unit !== "score" && unit !== "steps" ? `${n} ${unit}` : n;
 }
 
@@ -74,7 +74,7 @@ function renderNav(): void {
   const status = el("div", "status caption muted");
   status.textContent = keyStatus
     ? keyStatus.encrypted
-      ? keyStatus.unlocked ? `Encrypted · unlocked${keyStatus.keychain ? " · key in keychain" : ""}` : "Encrypted · locked"
+      ? keyStatus.unlocked ? `Encrypted · unlocked${keyStatus.keychain === "cached" ? " · key in keychain" : ""}` : "Encrypted · locked"
       : "Not encrypted"
     : "";
   nav.append(status);
@@ -96,7 +96,7 @@ function locked(): boolean {
 }
 
 let generation = 0;
-const afterCommit: (() => void)[] = [];
+type Later = (fn: () => void) => void;
 
 /** Render the current screen. Single-flight: a newer route() wins and an older one draws nothing. */
 async function route(): Promise<void> {
@@ -110,10 +110,15 @@ async function route(): Promise<void> {
     return;
   }
   const out = document.createDocumentFragment();
-  if (banner) out.append(el("div", "banner body", banner));
+  const queue: (() => void)[] = [];
+  const later: Later = (fn) => queue.push(fn);
+  if (banner) {
+    out.append(el("div", "banner body", banner));
+    banner = null; // shown once
+  }
   try {
     if (id === "today") await screenToday(out);
-    else if (id === "trend") await screenTrend(out);
+    else if (id === "trend") await screenTrend(out, later);
     else if (id === "health") await screenHealth(out);
     else await screenKey(out);
   } catch (e) {
@@ -123,10 +128,11 @@ async function route(): Promise<void> {
     }
     out.append(el("div", "banner body error", core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e)));
   }
-  if (mine !== generation) { afterCommit.length = 0; return; }
+  if (mine !== generation) return;
   out.append(el("footer", "notice", NOTICE));
+  disposeCharts();
   main.replaceChildren(out);
-  for (const fn of afterCommit.splice(0)) fn();
+  for (const fn of queue) fn();
 }
 
 function header(out: ParentNode, title: string, sub: string): void {
@@ -179,7 +185,7 @@ async function screenToday(out: ParentNode): Promise<void> {
 let trendMetric = TREND_METRICS[0];
 let trendDays = 90;
 
-async function screenTrend(out: ParentNode): Promise<void> {
+async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   const controls = el("div", "row");
   const select = el("select") as HTMLSelectElement;
   for (const m of TREND_METRICS) {
@@ -203,7 +209,7 @@ async function screenTrend(out: ParentNode): Promise<void> {
 
   // The window ends on the latest day any metric has data, so an archive still draws.
   const today = await core.call<Today>("data.today");
-  const lastDay = today.metrics.reduce<string>((acc, m) => (m.day && m.day > acc ? m.day : acc), "") || today.day;
+  const lastDay = today.metrics.reduce<string>((acc, m) => (m.value !== null && m.day && m.day > acc ? m.day : acc), "") || today.day;
   const results = await Promise.all(SCOPES.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays, last_day: lastDay })));
   const series: Series[] = results
     .filter((m) => m.days.some((d) => d.value !== null))
@@ -227,9 +233,9 @@ async function screenTrend(out: ParentNode): Promise<void> {
   const gapDays = series[0].days.filter((d) => d.status === "not_covered").length;
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
   card.append(el("span", "caption muted", (gapDays
-    ? `Hatched bands: ${gapDays} days no import covered. Nothing is drawn there; a line never bridges a gap.`
-    : "Every day in the window was covered by an import.") + ends));
-  afterCommit.push(() => drawTrend(chart, series, metricLabel(trendMetric)));
+    ? `Hatched bands: ${gapDays} days no import covered the ${scopeWord(series[0].scope)} source. Nothing is drawn there; a line never bridges a gap.`
+    : `Every day in the window was covered by an import of the ${scopeWord(series[0].scope)} source.`) + ends));
+  later(() => drawTrend(chart, series, metricLabel(trendMetric)));
 }
 
 // ---- Data health ------------------------------------------------------------------------
@@ -256,7 +262,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
   }
   out.append(legend);
   if (health.never_imported) {
-    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: hearthbeat import <export zip | GARMIN folder>."));
+    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: hearthbeat import <export zip | watch folder>."));
     return;
   }
   const card = el("div", "card ledger");
@@ -281,6 +287,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
       if (!n) continue;
       const seg = el("span", `seg ${k}`);
       seg.style.flexGrow = String(n);
+      seg.style.minWidth = "3px"; // one failed day out of 1825 must still be visible
       bar.append(seg);
     }
     block.append(bar);
@@ -345,36 +352,54 @@ async function screenKey(out: ParentNode): Promise<void> {
   card.append(el("h2", "heading", "Unlock on this device"));
   const label = el("label", "switch body") as HTMLLabelElement;
   label.append(el("span", "", "Keep the key in this device's keychain"));
-  const right = el("span", "caption muted", keyStatus.keychain ? "on" : "off");
+  const word = (state: KeyStatus["keychain"]) => (state === "cached" ? "on" : state === "stale" ? "stale" : "off");
+  const right = el("span", "caption muted", word(keyStatus.keychain));
   const box = el("input") as HTMLInputElement;
-  box.type = "checkbox"; box.checked = keyStatus.keychain; box.setAttribute("role", "switch");
+  box.type = "checkbox"; box.checked = keyStatus.keychain === "cached"; box.setAttribute("role", "switch");
+  const note = el("span", "caption error");
   box.onchange = async () => {
+    note.textContent = "";
     try {
-      const r = await core.call<{ keychain: boolean }>("key.cache", { enable: box.checked });
-      right.textContent = r.keychain ? "on" : "off";
+      const r = await core.call<{ keychain: KeyStatus["keychain"] }>("key.cache", { enable: box.checked });
+      right.textContent = word(r.keychain);
+      box.checked = r.keychain === "cached";
       await refreshKey(); renderNav();
     } catch (e) {
       box.checked = !box.checked;
-      out.append(el("div", "banner body error", core.isCoreError(e) ? e.message : String(e)));
+      note.textContent = core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e);
     }
   };
   const wrap = el("span"); wrap.style.display = "inline-flex"; wrap.style.alignItems = "center"; wrap.style.gap = "var(--space-2)";
   wrap.append(right, box);
   label.append(wrap);
-  card.append(label);
+  card.append(label, note);
+  if (keyStatus.keychain === "stale") card.append(el("p", "caption", "A key saved by an earlier build of this app is in the keychain and this build cannot read it. Turn the switch on again to replace it."));
   card.append(el("p", "caption muted", "Off by default: you are asked for your passphrase each time the app starts. On, it is convenient, but programs you approve can then read the key. The app and the terminal each keep their own copy, and an update of the app forgets its copy: cache again afterwards."));
   out.append(card);
   const about = el("div", "card body");
   about.append(el("h2", "heading", "About"));
   about.append(el("span", "muted", `core ${info.core}`));
   about.append(el("span", "muted", `database ${info.db}`));
+  const mcp = await core.mcpCommand().catch(() => "");
+  if (mcp) {
+    about.append(el("span", "", "Claude Desktop can use this app's core as its MCP server with this command:"));
+    about.append(el("pre", "mono caption", mcp));
+  }
+  about.append(el("span", "caption muted", "If macOS refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
   out.append(about);
 }
 
 // ---- Boot -------------------------------------------------------------------------------
 window.addEventListener("hashchange", () => void route());
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
-void core.onCoreEvent("restarted", () => { banner = "The core restarted after an error; the last request was lost."; void route(); });
+void core.onCoreEvent("restarted", () => {
+  banner = "The core restarted after an error; the last request was lost.";
+  void (async () => {
+    await refreshKey();
+    if (locked()) await core.unlockFromKeychain();
+    await route();
+  })();
+});
 void core.onCoreEvent("exited", () => { banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
 void (async () => {
   await refreshKey();

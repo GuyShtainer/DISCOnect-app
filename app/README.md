@@ -37,4 +37,8 @@ encrypted copy) and `DISCONECT_TEST_PASSPHRASE_FILE` set. Python-side lint for t
 
 Evidence captures: `tools/app-shot.sh` with `APP_ARGS`; PNGs go to `~/garmin-data/evidence/`.
 
+Gatekeeper: the bundle is ad-hoc signed (no paid Apple account). A locally built .app opens
+directly. A copy that arrived with a quarantine flag needs System Settings → Privacy & Security →
+"Open Anyway" once (Sequoia removed the right-click bypass).
+
 Not affiliated with or endorsed by any watch manufacturer.
