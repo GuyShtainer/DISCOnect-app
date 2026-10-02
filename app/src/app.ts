@@ -23,7 +23,7 @@ type LedgerRow = {
 type Health = { coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[] }; never_imported: boolean };
 
 const SCOPES = ["device", "vendor_cloud", "local"];
-const TREND_METRICS = ["resting_heart_rate", "steps", "sleep_score", "stress_avg", "hrv_last_night_average", "sleep_duration"];
+const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "steps", "sleep_score", "stress_avg", "hrv_last_night_average", "sleep_duration"];
 const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
   { id: "trend", title: "Trends" },
