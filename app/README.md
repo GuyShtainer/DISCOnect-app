@@ -1,7 +1,24 @@
 # disconect-app — the DISCOnect desktop shell (macOS first)
 
-Tauri 2 window over the core. Rust (the shell) holds no business logic: it supervises one `serve`
-child (the sidecar, ADR 0008) and relays JSON requests; the webview draws what the core answers.
+Tauri 2 window over the core. Rust (the shell) holds no business logic: it reaches one `serve`
+core and relays JSON requests; the webview draws what the core answers. The core is either a
+supervised child (the sidecar, ADR 0008) or `disconect-core` **in-process** on a thread of the app
+(Bet 12a):
+
+| build | default core | why |
+|---|---|---|
+| debug (`cargo run`, `tauri dev`, `tauri build --debug`) | in-process | no bundle to locate; the same code a phone runs |
+| macOS release | sidecar (`disconect-core`, then `hearthbeat-core`) | the keychain item the app shares with `disconect-core mcp` is bound to the program that made it; an in-process release app would own a different item (kb/23 class 5) |
+| iOS / Android (later) | in-process, the only choice | a phone cannot spawn a sidecar |
+
+`--core inproc` (argv) selects in-process in any desktop build; `DISCONECT_CORE=inproc` does in a
+debug build (a path there still names a sidecar executable). In-process the About card reads
+`core disconect-core/<v> (in-process)`. In-process the core sees the app's own environment (the
+sidecar gets an allowlist); the passphrase variable is still never read (`serve.rs` has no path to
+it; a core test scans for one), and `DISCONECT_NOW` / `DISCONECT_KEYCHAIN` are test switches a
+release `--core inproc` would honour. The release profile is `panic = "unwind"` so a panic in the
+FIT parser on a malformed file becomes a failed file (`catch_unwind` in `fit.rs` and
+`serve.rs::import_worker`), not a crashed app; `tests/inproc.rs` pins that.
 The release bundle carries two cores: `disconect-core` (the Rust port, `../disconect-core`, the
 default since Bet 11d) and `hearthbeat-core` (the PyInstaller Python core, kept as the rollback
 and as the MCP server for Claude Desktop). Protocol: `../disconect/docs/serve-protocol.md`.
@@ -14,6 +31,15 @@ and as the MCP server for Claude Desktop). Protocol: `../disconect/docs/serve-pr
   `--core disconect|hearthbeat` (parsed like `--db`) picks exactly one bundled core, an unknown
   name or a missing core is an error, never a fallback. No environment variable and no path can
   choose the executable in a release build (debug builds keep `DISCONECT_CORE` when no `--core`).
+- `src-tauri/src/inproc.rs` — the in-process core: a thread running `serve::Session`, request lines in
+  through `serve::serve_lines`, whole protocol lines out to the same router the child's stdout feeds.
+  The database path is passed in (desktop: `--db`, else `home::resolve_default_db`; a phone:
+  `app_data_dir()/disconect.db`). Never `isolate_stdout`, never `scrub_env_secrets`.
+  `examples/inproc_serve.rs` runs it over stdio for `tools/serve_diff.py --inproc`.
+- `src-tauri/tauri.ios.conf.json` — merged over `tauri.conf.json` on iOS only (JSON Merge Patch): no
+  bundled core (`"resources": []` replaces the map), display name `DISCOnect`, dev identifier
+  `org.disconect.app.dev`. Read by Tauri's own parser in `tests/mobile_config.rs`; never compiled
+  for iOS here (no toolchain).
 - `src-tauri/src/lib.rs` — Tauri commands `core_call`, `core_unlock`, `core_stderr`,
   `launch_args` (+ `debug_unlock_from_file` in debug builds only).
 - `src/app.ts` — hash router and the four screens: Today, Trends, Data health, Your key.
@@ -51,15 +77,24 @@ Both sidecars are **arm64-only** (built on this Apple-silicon Mac; no universal 
 Bundle size (`du -sh`): 60 MiB with the Python core alone, 72 MiB with both (Rust sidecar 11 MiB, Python
 sidecar 56 MiB); `tools/core-timing.py` prints the same in MB (1e6 bytes).
 Timing and size harness: `tools/core-timing.py`.
-Dev loop without the bundle: `npm run tauri dev` uses `DISCONECT_CORE=/path/to/disconect-core` (debug
-builds only), else `../disconect/.venv/bin/disconect-serve`.
+Dev loop without the bundle: `npm run tauri dev` runs the core in-process (debug default). To test a
+sidecar instead, `DISCONECT_CORE=/path/to/disconect-core` (debug builds only; a path, not `inproc`),
+else `--core hearthbeat` finds `../disconect/.venv/bin/disconect-serve`.
 
 Encryption: the app never shows recovery words or runs `key init`; do that in a terminal
 (`disconect key init`). The app unlocks with your passphrase, or from the keychain if you turn
 the switch on. Keychain items are per code identity: the app and the terminal each keep their
 own, and an app update forgets the app's copy (cache again).
 
-Tests: `cargo test` in `src-tauri` (bridge against a fake sidecar), and
+Debug evidence capture (in-process, scratch store): `npx tauri build --debug --bundles app`, then
+`APP_ENV="DISCONECT_DEBUG_PASSPHRASE_FILE=<file>" APP_ARGS="--db <scratch> --core inproc --screen key"
+tools/app-shot.sh <out.png> src-tauri/target/debug/bundle/macos/disconect-app.app` (the debug build
+unlocks from that file at start; the release bundle is never rebuilt for this).
+
+Tests: `cargo test` in `src-tauri` (bridge against a fake sidecar; `tests/inproc.rs`: in-process lines
+byte-equal to the sidecar's, a malformed `.fit`, a core-thread panic, the passphrase variable;
+`tests/mobile_config.rs`), `python tools/serve_diff.py --inproc --db <store>` after `cargo build
+--example inproc_serve`, and
 `cargo test --test real_core -- --ignored` with `DISCONECT_CORE`, `DISCONECT_TEST_DB` (a scratch
 encrypted copy) and `DISCONECT_TEST_PASSPHRASE_FILE` set. Python-side lint for this app lives in
 `../disconect/tests/test_lint_app.py` (no devtools, strict CSP, no colour literals).
