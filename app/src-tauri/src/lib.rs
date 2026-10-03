@@ -13,6 +13,7 @@ pub mod sidecar;
 use std::sync::Arc;
 
 use serde_json::Value;
+use tauri::webview::NewWindowResponse;
 use tauri::{Emitter, Manager, RunEvent, State};
 use zeroize::Zeroizing;
 
@@ -169,6 +170,24 @@ fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
     }
 }
 
+/// The main window is declared in `tauri.conf.json` with `"create": false` and built here, after the core
+/// is in state, so it can carry the egress hooks (ADR 0010): top-level navigation is limited to the app's
+/// own origin ([`coach::egress_guard::navigation_allowed`]) and `window.open` / `target=_blank` is denied.
+fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or("tauri.conf.json declares no window")?;
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+        .on_navigation(coach::egress_guard::navigation_allowed)
+        .on_new_window(|_url, _features| NewWindowResponse::Deny)
+        .build()?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -181,6 +200,7 @@ pub fn run() {
                 let _ = tauri::async_runtime::block_on(core.unlock(pass));
             }
             app.manage(Core(core));
+            build_main_window(app)?;
             Ok(())
         });
     #[cfg(debug_assertions)]
