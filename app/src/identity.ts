@@ -8,6 +8,7 @@ export const DATA_DIR = ".disconect";
 export const DB_FILENAME = "disconect.db";
 export const ENV_PREFIX = "DISCONECT_";
 export const CLI_KEYCHAIN_SERVICE = "disconect-cli";
+export const LEGACY_CLI_KEYCHAIN_SERVICES = ["hearthbeat"] as const;
 export const MCP_SERVER_NAME = "disconect";
 export const COMMAND = "disconect";
 export const LEGACY_HOMES = [".hearthbeat"] as const;
