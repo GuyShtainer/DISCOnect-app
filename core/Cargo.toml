@@ -36,7 +36,6 @@ fancy-regex = "0.19.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ryu = "1.0.23"
 getrandom = "0.4"
-tiny_http = "0.12"
 hmac = "0.13.0"
 ureq = { version = "3", default-features = false }
 

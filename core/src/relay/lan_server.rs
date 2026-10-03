@@ -13,30 +13,86 @@
 //!   a write is an atomic rename and replaces an existing object; a missing object is 404).
 //!
 //! Everything else answers 404 or 405; a bad token 401 with an empty body whatever the reason; a
-//! name outside the pattern 400; a name under another account 403; a body over one bundle 413.
-//! Nothing but the method and the status is ever logged.
+//! name outside the pattern 400; a name under another account 403; a body over one bundle 413; a
+//! body that stops arriving 408. Nothing but the method and the status is ever logged.
+//!
+//! **The HTTP layer is this file's own** (a deliberately small HTTP/1.1 subset, one request per
+//! connection, `Connection: close`), not a library's: the library tried first (`tiny_http`) has no
+//! time-outs, hides the socket, reads the rest of an unread body when a request is dropped, and
+//! lets one stalled peer cost a worker. Bet 12 review F1 is closed in four layers:
+//! 1. **The pre-tag** (`lan::verify_pre`, over the declared `Content-Length`) is checked before a
+//!    single body byte is read: a peer without the key is answered 401 on the head alone, whatever
+//!    it declares and whatever it then sends.
+//! 2. **Every socket read and write has a time-out** ([`Limits::idle`], 10 s): the head must arrive
+//!    within that budget in total, the body within `idle + declared / 256 KiB/s` (a 64 MiB bundle
+//!    gets about 4.5 minutes; one byte every nine seconds gets nothing), the response likewise.
+//! 3. **A connection is a thread, not a worker**: a stalled peer holds its own thread (at most
+//!    [`MAX_CONNECTIONS`]; one more is closed unanswered), never the ability to answer anyone else.
+//! 4. A refused request whose body was not read is answered, then drained by a short-lived thread
+//!    ([`MAX_LINGERS`]) for at most a second, so the client gets the answer rather than a reset.
+//!
+//! What remains, stated: an unauthenticated peer can occupy connection slots with half-sent heads
+//! for up to [`Limits::idle`] each (no per-address limits); a peer holding a captured header for
+//! the exact length can hold a slot until the body budget ends and can make the server buffer what
+//! it sends (one bundle at most per slot).
 
-use std::io::Read;
-use std::net::SocketAddr;
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tiny_http::{Header, Request, Response, Server};
 use zeroize::Zeroizing;
 
 use super::bundle::account_for;
 use super::folder::{FolderRelay, MAX_OBJECT, Relay, RelayError, is_object_name};
-use super::lan::{API_VERSION, HEALTH, OBJECTS, parse_auth, token_key, verify_tag, wall_clock};
+use super::lan::{
+    API_VERSION, HEALTH, OBJECTS, parse_auth, token_key, verify_pre, verify_tag, wall_clock,
+};
 use crate::identity::PRODUCT;
 
-/// Worker threads taking requests off the listener.
-const WORKERS: usize = 4;
-/// How often an idle worker looks at the stop flag.
-const POLL: Duration = Duration::from_millis(200);
+/// Connections served at once; one more is closed unanswered.
+const MAX_CONNECTIONS: usize = 32;
+/// The largest request head (request line and headers) accepted.
+const MAX_HEAD: usize = 16 * 1024;
+/// The most header lines in one request.
+const MAX_HEADERS: usize = 64;
+/// How often the accept loop looks at the stop flag when nothing is waiting.
+const POLL: Duration = Duration::from_millis(25);
+/// The slowest body rate the total read budget allows (bytes per second).
+const MIN_RATE: u64 = 256 * 1024;
+/// Threads at a time that drain a refused request's unread body.
+const MAX_LINGERS: usize = 64;
+/// How long, and how much, a drain thread reads before it lets go.
+const LINGER_TOTAL: Duration = Duration::from_secs(1);
+const LINGER_IDLE: Duration = Duration::from_millis(200);
+const LINGER_CAP: u64 = 4 * 1024 * 1024;
+
+/// How long the server waits on a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// No progress on a socket read or write for this long fails it (header, body, response); also
+    /// the base of the total body budget.
+    pub idle: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            idle: Duration::from_secs(10),
+        }
+    }
+}
+
+impl Limits {
+    /// The most time a body of `declared` bytes may take to arrive.
+    fn body_budget(&self, declared: u64) -> Duration {
+        self.idle + Duration::from_secs(declared / MIN_RATE)
+    }
+}
 
 /// What the server answers: a status and a body (empty on every error).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,14 +117,22 @@ pub struct Ctx {
     relay: FolderRelay,
     account: String,
     key: Zeroizing<[u8; 32]>,
+    limits: Limits,
+    lingers: Arc<AtomicUsize>,
 }
 
 impl Ctx {
     pub fn new(folder: impl Into<PathBuf>, master: &[u8]) -> Ctx {
+        Ctx::with_limits(folder, master, Limits::default())
+    }
+
+    pub fn with_limits(folder: impl Into<PathBuf>, master: &[u8], limits: Limits) -> Ctx {
         Ctx {
             relay: FolderRelay::new(folder),
             account: account_for(master),
             key: token_key(master),
+            limits,
+            lingers: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -82,17 +146,28 @@ fn relay_failure(error: &RelayError) -> Reply {
     }
 }
 
-/// Read at most one bundle (plus one byte to see an overflow). `None` when the body is too large
-/// or cannot be read.
-fn read_capped(body: &mut dyn Read) -> Option<Vec<u8>> {
+/// Why a body was not obtained.
+enum BodyError {
+    TooLarge,
+    /// A read failed, timed out or ended before the declared length.
+    Unreadable,
+}
+
+/// Read exactly the declared bytes (never more than one bundle).
+fn read_declared(body: &mut dyn Read, declared: u64) -> Result<Vec<u8>, BodyError> {
+    if declared > MAX_OBJECT {
+        return Err(BodyError::TooLarge);
+    }
     let mut bytes = Vec::new();
-    body.take(MAX_OBJECT + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= MAX_OBJECT).then_some(bytes)
+    match body.take(declared).read_to_end(&mut bytes) {
+        Ok(_) if bytes.len() as u64 == declared => Ok(bytes),
+        _ => Err(BodyError::Unreadable),
+    }
 }
 
 /// Answer one request. `now` is the server's clock in Unix seconds (a parameter so tests can move
-/// it); `body` is read only after the header's shape and timestamp pass, and the tag is checked
-/// before anything touches the folder.
+/// it); `body` is read only after the header's shape, its timestamp and its pre-tag (over the
+/// declared length) pass, and the tag is checked before anything touches the folder.
 pub fn handle(
     ctx: &Ctx,
     method: &str,
@@ -134,16 +209,21 @@ pub fn handle(
     let Some(header) = auth else {
         return Reply::status(401);
     };
-    let Ok((timestamp, tag)) = parse_auth(header, now) else {
+    let Ok(parsed) = parse_auth(header, now) else {
         return Reply::status(401);
     };
-    if declared_len.is_some_and(|len| len as u64 > MAX_OBJECT) {
-        return Reply::status(413);
+    // A request that declares no length (GET, DELETE) is read as an empty body, whatever follows;
+    // chunked uploads are not part of the protocol.
+    let declared = declared_len.map_or(0, |len| len as u64);
+    if verify_pre(&*ctx.key, method, url, parsed.timestamp, declared, &parsed.pre).is_err() {
+        return Reply::status(401);
     }
-    let Some(bytes) = read_capped(body) else {
-        return Reply::status(413);
+    let bytes = match read_declared(body, declared) {
+        Ok(bytes) => bytes,
+        Err(BodyError::TooLarge) => return Reply::status(413),
+        Err(BodyError::Unreadable) => return Reply::status(408),
     };
-    if verify_tag(&*ctx.key, method, url, timestamp, &tag, &bytes).is_err() {
+    if verify_tag(&*ctx.key, method, url, parsed.timestamp, &parsed.tag, &bytes).is_err() {
         return Reply::status(401);
     }
     let Some(name) = name else {
@@ -182,14 +262,16 @@ pub fn handle(
     }
 }
 
-/// Called once per request with the method and the status; nothing else is ever reported.
+/// Called once per answered request with the method and the status; nothing else is ever reported
+/// (`?` stands for a request whose method could not be read).
 pub type Logger = Arc<dyn Fn(&str, u16) + Send + Sync>;
 
-/// A running server: workers taking requests until [`LanServer::stop`] (or drop).
+/// A running server: an accept loop and one thread per connection, until [`LanServer::stop`] (or drop).
 pub struct LanServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    active: Arc<AtomicUsize>,
+    acceptor: Option<JoinHandle<()>>,
 }
 
 impl LanServer {
@@ -200,33 +282,38 @@ impl LanServer {
         master: &[u8],
         log: Logger,
     ) -> Result<LanServer, String> {
-        let server =
-            Server::http(listen).map_err(|_| "cannot listen on that address".to_string())?;
-        let addr = server
-            .server_addr()
-            .to_ip()
-            .ok_or_else(|| "the listener has no IP address".to_string())?;
-        let server = Arc::new(server);
-        let ctx = Arc::new(Ctx::new(folder, master));
+        LanServer::start_with(listen, folder, master, log, Limits::default())
+    }
+
+    /// [`LanServer::start`] with explicit [`Limits`] (tests shorten them).
+    pub fn start_with(
+        listen: &str,
+        folder: impl Into<PathBuf>,
+        master: &[u8],
+        log: Logger,
+        limits: Limits,
+    ) -> Result<LanServer, String> {
+        let listener =
+            TcpListener::bind(listen).map_err(|_| "cannot listen on that address".to_string())?;
+        let addr = listener
+            .local_addr()
+            .map_err(|_| "the listener has no address".to_string())?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "cannot configure the listener".to_string())?;
+        let ctx = Arc::new(Ctx::with_limits(folder, master, limits));
         let stop = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::new();
-        for index in 0..WORKERS {
-            let (server, ctx, stop, log) = (
-                Arc::clone(&server),
-                Arc::clone(&ctx),
-                Arc::clone(&stop),
-                Arc::clone(&log),
-            );
-            let worker = std::thread::Builder::new()
-                .name(format!("lan-relay-{index}"))
-                .spawn(move || work(&server, &ctx, &stop, &log))
-                .map_err(|_| "cannot start a worker thread".to_string())?;
-            workers.push(worker);
-        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let (loop_stop, loop_active) = (Arc::clone(&stop), Arc::clone(&active));
+        let acceptor = std::thread::Builder::new()
+            .name("lan-relay-accept".into())
+            .spawn(move || accept_loop(&listener, &ctx, &loop_stop, &loop_active, &log))
+            .map_err(|_| "cannot start the accept thread".to_string())?;
         Ok(LanServer {
             addr,
             stop,
-            workers,
+            active,
+            acceptor: Some(acceptor),
         })
     }
 
@@ -235,22 +322,26 @@ impl LanServer {
         self.addr
     }
 
-    /// Stop taking requests and wait for the workers (each finishes the request in hand).
+    /// Stop taking connections and give the requests in hand a few seconds to finish.
     pub fn stop(mut self) {
         self.shutdown();
     }
 
     /// Serve until the process ends.
     pub fn wait(mut self) {
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
         }
     }
 
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while self.active.load(Ordering::SeqCst) > 0 && Instant::now() < give_up {
+            std::thread::sleep(POLL);
         }
     }
 }
@@ -261,52 +352,313 @@ impl Drop for LanServer {
     }
 }
 
-fn work(server: &Server, ctx: &Ctx, stop: &AtomicBool, log: &Logger) {
-    while !stop.load(Ordering::SeqCst) {
-        let request = match server.recv_timeout(POLL) {
-            Ok(Some(request)) => request,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
-        answer(ctx, request, log);
+/// Counts a connection while its thread lives, whatever way the thread ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-fn answer(ctx: &Ctx, mut request: Request, log: &Logger) {
-    let method = request.method().as_str().to_string();
-    let url = request.url().to_string();
-    let auth = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv(super::lan::AUTH_HEADER))
-        .map(|h| h.value.as_str().to_string());
-    let declared = request.body_length();
-    let reply = handle(
-        ctx,
-        &method,
-        &url,
-        auth.as_deref(),
-        declared,
-        request.as_reader(),
-        wall_clock(),
-    );
-    log(&method, reply.status);
-    let content_type: &[u8] = if reply.json {
-        b"application/json"
-    } else {
-        b"application/octet-stream"
-    };
-    let mut response = Response::from_data(reply.body).with_status_code(reply.status);
-    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type) {
-        response = response.with_header(header);
+fn accept_loop(
+    listener: &TcpListener,
+    ctx: &Arc<Ctx>,
+    stop: &AtomicBool,
+    active: &Arc<AtomicUsize>,
+    log: &Logger,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(_) => {
+                std::thread::sleep(POLL);
+                continue;
+            }
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            continue; // over the limit: the stream is dropped, the peer sees a close
+        }
+        let slot = Slot(Arc::clone(active));
+        let (ctx, log) = (Arc::clone(ctx), Arc::clone(log));
+        let spawned = std::thread::Builder::new()
+            .name("lan-relay-conn".into())
+            .spawn(move || {
+                let _slot = slot;
+                serve_connection(&ctx, stream, &log);
+            });
+        drop(spawned); // on failure the closure, the stream and the slot are dropped with it
     }
-    let _ = request.respond(response);
+}
+
+/// A connection's bytes with a deadline: what arrived after the head first, then the socket.
+struct Conn<'a> {
+    stream: &'a TcpStream,
+    buffered: Vec<u8>,
+    position: usize,
+    deadline: Instant,
+    idle: Duration,
+    /// Body bytes handed out (the head is not counted).
+    taken: u64,
+}
+
+impl Conn<'_> {
+    /// One read from the socket, within the deadline and the idle limit.
+    fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| IoError::from(ErrorKind::TimedOut))?;
+        self.stream.set_read_timeout(Some(left.min(self.idle)))?;
+        match self.stream.read(buf) {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Err(IoError::from(ErrorKind::TimedOut)),
+            other => other,
+        }
+    }
+}
+
+impl Read for Conn<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = if let Some(rest) = self.buffered.get(self.position..).filter(|r| !r.is_empty())
+        {
+            let count = rest.len().min(buf.len());
+            buf[..count].copy_from_slice(&rest[..count]);
+            self.position += count;
+            count
+        } else {
+            self.fill(buf)?
+        };
+        self.taken += count as u64;
+        Ok(count)
+    }
+}
+
+/// A parsed request head.
+struct Head {
+    method: String,
+    target: String,
+    auth: Option<String>,
+    length: Option<usize>,
+}
+
+fn find_head_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Read the head within the connection's deadline. `Ok(None)`: the peer closed before sending a
+/// byte. `Err(status)`: refuse with that bare status.
+fn read_head(conn: &mut Conn<'_>) -> Result<Option<Head>, u16> {
+    let mut chunk = [0u8; 2048];
+    let end = loop {
+        if let Some(end) = find_head_end(&conn.buffered) {
+            break end;
+        }
+        if conn.buffered.len() > MAX_HEAD {
+            return Err(400);
+        }
+        match conn.fill(&mut chunk) {
+            Ok(0) if conn.buffered.is_empty() => return Ok(None),
+            Ok(0) => return Err(400),
+            Ok(count) => conn.buffered.extend_from_slice(&chunk[..count]),
+            Err(e) if e.kind() == ErrorKind::TimedOut && conn.buffered.is_empty() => {
+                return Ok(None);
+            }
+            Err(e) if e.kind() == ErrorKind::TimedOut => return Err(408),
+            Err(_) => return Ok(None),
+        }
+    };
+    if end > MAX_HEAD {
+        return Err(400);
+    }
+    conn.position = end + 4;
+    let text = std::str::from_utf8(&conn.buffered[..end]).map_err(|_| 400u16)?;
+    parse_head(text).map(Some)
+}
+
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn parse_head(text: &str) -> Result<Head, u16> {
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().ok_or(400u16)?;
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(400);
+    };
+    let method_ok = !method.is_empty()
+        && method.len() <= 16
+        && method.bytes().all(|b| b.is_ascii_uppercase());
+    let target_ok = target.starts_with('/')
+        && target.len() <= 2048
+        && target.bytes().all(|b| b.is_ascii_graphic());
+    if !method_ok || !target_ok || !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(400);
+    }
+    let (mut auth, mut length, mut count) = (None, None, 0usize);
+    for line in lines {
+        count += 1;
+        if count > MAX_HEADERS {
+            return Err(400);
+        }
+        let (name, value) = line.split_once(':').ok_or(400u16)?;
+        if !is_token(name) {
+            return Err(400); // also refuses an obsolete folded line (it starts with a space)
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case(super::lan::AUTH_HEADER) {
+            if auth.replace(value.to_string()).is_some() {
+                return Err(400);
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            let digits = !value.is_empty()
+                && value.len() <= 19
+                && value.bytes().all(|b| b.is_ascii_digit());
+            let parsed = value.parse::<u64>().ok().filter(|_| digits);
+            let parsed = parsed.and_then(|n| usize::try_from(n).ok()).ok_or(400u16)?;
+            if length.replace(parsed).is_some() {
+                return Err(400);
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(400); // no chunked uploads: the pre-tag covers a length
+        }
+    }
+    Ok(Head {
+        method: method.to_string(),
+        target: target.to_string(),
+        auth,
+        length,
+    })
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        _ => "Internal Server Error",
+    }
+}
+
+/// Write the answer, a chunk at a time, within the response budget.
+fn write_reply(mut stream: &TcpStream, reply: &Reply, limits: &Limits) -> std::io::Result<()> {
+    let content_type = if reply.json {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n",
+        reply.status,
+        reason(reply.status)
+    );
+    if reply.status != 204 {
+        head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
+    }
+    head.push_str("\r\n");
+    let deadline = Instant::now() + limits.body_budget(reply.body.len() as u64);
+    stream.write_all(head.as_bytes())?;
+    for chunk in reply.body.chunks(64 * 1024) {
+        if Instant::now() >= deadline {
+            return Err(IoError::from(ErrorKind::TimedOut));
+        }
+        stream.write_all(chunk)?;
+    }
+    stream.flush()
+}
+
+fn serve_connection(ctx: &Ctx, stream: TcpStream, log: &Logger) {
+    let idle = ctx.limits.idle;
+    // an accepted socket may inherit the listener's non-blocking mode
+    if stream.set_nonblocking(false).is_err()
+        || stream.set_write_timeout(Some(idle)).is_err()
+        || stream.set_nodelay(true).is_err()
+    {
+        return;
+    }
+    let mut conn = Conn {
+        stream: &stream,
+        buffered: Vec::new(),
+        position: 0,
+        deadline: Instant::now() + idle,
+        idle,
+        taken: 0,
+    };
+    let (method, reply, declared) = match read_head(&mut conn) {
+        Ok(None) => return,
+        Err(status) => ("?".to_string(), Reply::status(status), None),
+        Ok(Some(head)) => {
+            conn.deadline = Instant::now() + ctx.limits.body_budget(head.length.unwrap_or(0) as u64);
+            let reply = handle(
+                ctx,
+                &head.method,
+                &head.target,
+                head.auth.as_deref(),
+                head.length,
+                &mut conn,
+                wall_clock(),
+            );
+            (head.method, reply, head.length)
+        }
+    };
+    log(&method, reply.status);
+    let written = write_reply(&stream, &reply, &ctx.limits).is_ok();
+    let _ = stream.shutdown(Shutdown::Write);
+    let unread = declared.is_some_and(|len| len as u64 > conn.taken);
+    if written && unread {
+        linger(ctx, stream);
+    }
+}
+
+/// Let a refused client finish sending before the socket closes (closing with unread data resets
+/// the connection, and the client may lose the answer): a short drain on a thread of its own.
+fn linger(ctx: &Ctx, stream: TcpStream) {
+    if ctx.lingers.fetch_add(1, Ordering::SeqCst) >= MAX_LINGERS {
+        ctx.lingers.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    let lingers = Arc::clone(&ctx.lingers);
+    let spawned = std::thread::Builder::new()
+        .name("lan-relay-linger".into())
+        .spawn(move || {
+            let deadline = Instant::now() + LINGER_TOTAL;
+            let (mut drained, mut buf) = (0u64, [0u8; 8192]);
+            while drained < LINGER_CAP {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                if stream.set_read_timeout(Some(left.min(LINGER_IDLE).max(Duration::from_millis(1)))).is_err() {
+                    break;
+                }
+                match (&stream).read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => drained += count as u64,
+                }
+            }
+            lingers.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        ctx.lingers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::lan::{MAX_SKEW_SECS, auth_value};
+    use crate::relay::lan::{MAX_SKEW_SECS, auth_value, auth_value_declaring};
 
     fn master() -> Vec<u8> {
         (1u8..33).collect()
@@ -473,14 +825,15 @@ mod tests {
         assert_eq!(signed(&ctx, "PUT", OBJECTS, b"", 100, 100).status, 405);
         assert_eq!(signed(&ctx, "DELETE", OBJECTS, b"", 100, 100).status, 405);
         let path = object(&ctx, "c");
-        let big = auth_value(&*ctx.key, "PUT", &path, 100, b"").expect("header");
+        let big_len = MAX_OBJECT + 1;
+        let big = auth_value_declaring(&*ctx.key, "PUT", &path, 100, big_len, b"").expect("header");
         assert_eq!(
             handle(
                 &ctx,
                 "PUT",
                 &path,
                 Some(&big),
-                Some(MAX_OBJECT as usize + 1),
+                Some(big_len as usize),
                 &mut std::io::empty(),
                 100
             )
@@ -488,11 +841,65 @@ mod tests {
             413,
             "a declared body over one bundle is refused before it is read"
         );
-        let mut endless = std::io::repeat(7u8);
-        assert_eq!(
-            handle(&ctx, "PUT", &path, Some(&big), None, &mut endless, 100).status,
-            413,
-            "an undeclared body stops at the cap"
-        );
+    }
+
+    /// A body that must never be touched.
+    struct Untouchable;
+    impl Read for Untouchable {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the body was read"))
+        }
+    }
+
+    #[test]
+    fn nothing_is_read_before_the_pre_tag_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx(dir.path());
+        let path = object(&ctx, "d");
+        let other = Ctx::new(dir.path().join("relay"), &(2u8..34).collect::<Vec<_>>());
+        for (label, header, declared) in [
+            (
+                "forged pre-tag, 1 MB declared",
+                format!("v1.100.{}.{}", "00".repeat(32), "00".repeat(32)),
+                1_000_000usize,
+            ),
+            (
+                "another master's header",
+                auth_value_declaring(&*other.key, "PUT", &path, 100, 1_000_000, b"").expect("h"),
+                1_000_000,
+            ),
+            (
+                "a header for 4 bytes replayed with a longer length",
+                auth_value(&*ctx.key, "PUT", &path, 100, b"abcd").expect("h"),
+                1_000_000,
+            ),
+            (
+                "a header for 4 bytes replayed with a shorter length",
+                auth_value(&*ctx.key, "PUT", &path, 100, b"abcd").expect("h"),
+                3,
+            ),
+        ] {
+            let reply = handle(
+                &ctx,
+                "PUT",
+                &path,
+                Some(&header),
+                Some(declared),
+                &mut Untouchable,
+                100,
+            );
+            assert_eq!((reply.status, reply.body.is_empty()), (401, true), "{label}");
+        }
+        // an undeclared length is an empty body, and is never read either (no chunked uploads)
+        let header = auth_value(&*ctx.key, "GET", OBJECTS, 100, b"").expect("h");
+        let reply = handle(&ctx, "GET", OBJECTS, Some(&header), None, &mut Untouchable, 100);
+        assert_eq!(reply.status, 200);
+        // a body that stops arriving after a valid pre-tag is a 408, and nothing is written
+        let header = auth_value(&*ctx.key, "PUT", &path, 100, b"abcd").expect("h");
+        let reply = handle(&ctx, "PUT", &path, Some(&header), Some(4), &mut Untouchable, 100);
+        assert_eq!(reply.status, 408);
+        assert_eq!(signed(&ctx, "GET", &path, b"", 100, 100).status, 404);
+        let reply = handle(&ctx, "PUT", &path, Some(&header), Some(4), &mut &b"ab"[..], 100);
+        assert_eq!(reply.status, 408, "a body shorter than declared");
     }
 }

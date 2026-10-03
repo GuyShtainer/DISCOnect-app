@@ -4,8 +4,10 @@
 //!
 //! Bodies are AEAD output already (`bundle.rs`), so the transport is plain HTTP and its only job is
 //! to prove that the caller holds the master key: every request carries
-//! `X-Disconect-Auth: v1.<unix seconds>.<hex HMAC-SHA256(token_key, method LF path LF timestamp LF hex(sha256(body)))>`
-//! with `token_key = HKDF-SHA256(master, salt = account, info = "disconect/lan/v1/token")`. The
+//! `X-Disconect-Auth: v1.<unix seconds>.<pre>.<tag>` where `tag = hex HMAC-SHA256(token_key, method LF
+//! path LF timestamp LF hex(sha256(body)))` and `pre = hex HMAC-SHA256(token_key, "pre" LF method LF
+//! path LF timestamp LF content-length)`: the server checks `pre` before it reads a single body byte,
+//! so a peer without the key cannot make it wait for a body (Bet 12 review F1). `token_key = HKDF-SHA256(master, salt = account, info = "disconect/lan/v1/token")`. The
 //! server (`lan_server.rs`) never decrypts anything; it derives the same key from the same master.
 //!
 //! Wire format and what the server never does: `docs/relay-protocol.md`, "LAN relay".
@@ -47,8 +49,23 @@ fn mac_over(key: &[u8], method: &str, path: &str, timestamp: u64, body: &[u8]) -
     Some(mac.finalize().into_bytes().to_vec())
 }
 
+/// The MAC behind the pre-tag: `"pre" LF method LF path LF timestamp LF content-length` (decimal;
+/// `0` when the request declares no length, as for GET and DELETE).
+fn pre_mac(
+    key: &[u8],
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    content_length: u64,
+) -> Option<Hmac<Sha256>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(format!("pre\n{method}\n{path}\n{timestamp}\n{content_length}").as_bytes());
+    Some(mac)
+}
+
 /// The header value for one request. `method` is upper case, `path` the request path without a
-/// query (`/v1/objects/<account>/<name>`). `None` only if the key is unusable (it never is: 32 bytes).
+/// query (`/v1/objects/<account>/<name>`); the pre-tag covers `body.len()`. `None` only if the key
+/// is unusable (it never is: 32 bytes).
 pub fn auth_value(
     key: &[u8],
     method: &str,
@@ -56,8 +73,28 @@ pub fn auth_value(
     timestamp: u64,
     body: &[u8],
 ) -> Option<String> {
+    auth_value_declaring(key, method, path, timestamp, body.len() as u64, body)
+}
+
+/// [`auth_value`] with a `Content-Length` that need not match `body` (a client never does this;
+/// tests use it to sign a header for a length the body does not have).
+pub fn auth_value_declaring(
+    key: &[u8],
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    content_length: u64,
+    body: &[u8],
+) -> Option<String> {
     let tag = mac_over(key, method, path, timestamp, body)?;
-    Some(format!("v{API_VERSION}.{timestamp}.{}", hex::encode(tag)))
+    let pre = pre_mac(key, method, path, timestamp, content_length)?
+        .finalize()
+        .into_bytes();
+    Some(format!(
+        "v{API_VERSION}.{timestamp}.{}.{}",
+        hex::encode(pre),
+        hex::encode(tag)
+    ))
 }
 
 /// Why a header was refused. The server answers 401 with no detail whatever the reason.
@@ -68,12 +105,31 @@ pub enum AuthError {
     Mismatch,
 }
 
-/// A header's timestamp and tag, checked for shape and for clock skew only (cheap: no body needed).
-pub fn parse_auth(header: &str, now: u64) -> Result<(u64, Vec<u8>), AuthError> {
+/// A parsed header: the timestamp, the pre-tag (over the declared length) and the tag (over the body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedAuth {
+    pub timestamp: u64,
+    pub pre: Vec<u8>,
+    pub tag: Vec<u8>,
+}
+
+fn mac_bytes(text: &str) -> Result<Vec<u8>, AuthError> {
+    match hex::decode(text) {
+        Ok(bytes) if bytes.len() == 32 => Ok(bytes),
+        _ => Err(AuthError::Malformed),
+    }
+}
+
+/// A header's parts, checked for shape and for clock skew only (cheap: no key, no body needed).
+pub fn parse_auth(header: &str, now: u64) -> Result<ParsedAuth, AuthError> {
     let mut parts = header.split('.');
-    let (Some(version), Some(stamp), Some(tag), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(version), Some(stamp), Some(pre), Some(tag), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
         return Err(AuthError::Malformed);
     };
     if version != format!("v{API_VERSION}") || stamp.is_empty() || stamp.len() > 20 {
@@ -83,14 +139,31 @@ pub fn parse_auth(header: &str, now: u64) -> Result<(u64, Vec<u8>), AuthError> {
         return Err(AuthError::Malformed);
     }
     let timestamp: u64 = stamp.parse().map_err(|_| AuthError::Malformed)?;
-    let tag = hex::decode(tag).map_err(|_| AuthError::Malformed)?;
-    if tag.len() != 32 {
-        return Err(AuthError::Malformed);
-    }
+    let (pre, tag) = (mac_bytes(pre)?, mac_bytes(tag)?);
     if now.abs_diff(timestamp) > MAX_SKEW_SECS {
         return Err(AuthError::Stale);
     }
-    Ok((timestamp, tag))
+    Ok(ParsedAuth {
+        timestamp,
+        pre,
+        tag,
+    })
+}
+
+/// Verify the pre-tag in constant time: method, path, timestamp and the declared content length,
+/// before any body byte is read.
+pub fn verify_pre(
+    key: &[u8],
+    method: &str,
+    path: &str,
+    timestamp: u64,
+    content_length: u64,
+    pre: &[u8],
+) -> Result<(), AuthError> {
+    pre_mac(key, method, path, timestamp, content_length)
+        .ok_or(AuthError::Mismatch)?
+        .verify_slice(pre)
+        .map_err(|_| AuthError::Mismatch)
 }
 
 /// Verify a parsed header against the request, in constant time.
@@ -262,6 +335,12 @@ mod tests {
         (1u8..33).collect()
     }
 
+    // header = v1.<timestamp>.<pre>.<tag>; the `tag` parts are the vectors that were committed with
+    // slice 12-B and are unchanged, the `pre` parts were added by the review fix (F1); all four were
+    // computed independently in Python (kb/24)
+    const PUT_VECTOR: &str = "v1.1700000000.223c54881c588a7961c34cac621e4df08c54682e3501b340d3a8569f645895c7.2011a51d77be5327a5f5018eb22c266c5f137a1a3c4586f1f2617c8c51f6d060";
+    const GET_VECTOR: &str = "v1.1700000000.74a9b34685ff14e016cec487a0b4e3b25b0bf43b4f346479a1c52bf7679c9373.71e67dc1ec1cefcf4692eabba5cbd8f4940fa4e97f7c4a18479fc7d15b194d62";
+
     #[test]
     fn the_token_label_is_frozen_verbatim() {
         assert_eq!(INFO_TOKEN, b"disconect/lan/v1/token");
@@ -293,11 +372,11 @@ mod tests {
                 b"sealed bytes"
             )
             .as_deref(),
-            Some("v1.1700000000.2011a51d77be5327a5f5018eb22c266c5f137a1a3c4586f1f2617c8c51f6d060")
+            Some(PUT_VECTOR)
         );
         assert_eq!(
             auth_value(&*key, "GET", "/v1/objects", 1_700_000_000, b"").as_deref(),
-            Some("v1.1700000000.71e67dc1ec1cefcf4692eabba5cbd8f4940fa4e97f7c4a18479fc7d15b194d62")
+            Some(GET_VECTOR)
         );
     }
 
@@ -306,9 +385,11 @@ mod tests {
         let key = token_key(&master());
         let value = auth_value(&*key, "PUT", "/v1/objects/a/b", 1_000, b"body").expect("value");
         let now = 1_100;
-        let (stamp, tag) = parse_auth(&value, now).expect("parse");
+        let parsed = parse_auth(&value, now).expect("parse");
+        let (stamp, tag, pre) = (parsed.timestamp, parsed.tag, parsed.pre);
         assert_eq!(stamp, 1_000);
         assert!(verify_tag(&*key, "PUT", "/v1/objects/a/b", stamp, &tag, b"body").is_ok());
+        assert!(verify_pre(&*key, "PUT", "/v1/objects/a/b", stamp, 4, &pre).is_ok());
         for (method, path, body) in [
             ("GET", "/v1/objects/a/b", &b"body"[..]),
             ("PUT", "/v1/objects/a/c", &b"body"[..]),
@@ -332,6 +413,34 @@ mod tests {
     }
 
     #[test]
+    fn the_pre_tag_binds_method_path_timestamp_and_length_and_is_not_the_tag() {
+        let key = token_key(&master());
+        let value = auth_value(&*key, "PUT", "/v1/objects/a/b", 1_000, b"body").expect("value");
+        let parsed = parse_auth(&value, 1_000).expect("parse");
+        assert_ne!(parsed.pre, parsed.tag);
+        let pre = |method, path, stamp, len| verify_pre(&*key, method, path, stamp, len, &parsed.pre);
+        assert!(pre("PUT", "/v1/objects/a/b", 1_000, 4).is_ok());
+        assert_eq!(pre("GET", "/v1/objects/a/b", 1_000, 4), Err(AuthError::Mismatch));
+        assert_eq!(pre("PUT", "/v1/objects/a/c", 1_000, 4), Err(AuthError::Mismatch));
+        assert_eq!(pre("PUT", "/v1/objects/a/b", 1_001, 4), Err(AuthError::Mismatch));
+        assert_eq!(
+            pre("PUT", "/v1/objects/a/b", 1_000, 1_000_000),
+            Err(AuthError::Mismatch),
+            "a replayed header with another length is refused"
+        );
+        // the tag cannot stand in for the pre-tag
+        assert_eq!(
+            verify_pre(&*key, "PUT", "/v1/objects/a/b", 1_000, 4, &parsed.tag),
+            Err(AuthError::Mismatch)
+        );
+        let other = token_key(&(2u8..34).collect::<Vec<_>>());
+        assert_eq!(
+            verify_pre(&*other, "PUT", "/v1/objects/a/b", 1_000, 4, &parsed.pre),
+            Err(AuthError::Mismatch)
+        );
+    }
+
+    #[test]
     fn the_clock_window_and_the_shape_are_checked_before_the_body() {
         let key = token_key(&master());
         let at = |ts: u64| auth_value(&*key, "GET", "/v1/objects", ts, b"").expect("value");
@@ -346,19 +455,25 @@ mod tests {
             AuthError::Stale,
             "a timestamp from the future is as stale as one from the past"
         );
+        let mac = "00".repeat(32);
+        let short = "00".repeat(31);
         for bad in [
-            "",
-            "v1",
-            "v1.1000",
-            "v2.1000.00",
-            "v1.10x0.00",
-            "v1.1000.zz",
-            "v1.1000.00",
-            "v1.1000.00.00",
-            "v1..00",
+            String::new(),
+            "v1".into(),
+            "v1.1000".into(),
+            format!("v1.1000.{mac}"),
+            format!("v2.1000.{mac}.{mac}"),
+            format!("v1.10x0.{mac}.{mac}"),
+            format!("v1.1000.zz.{mac}"),
+            format!("v1.1000.{mac}.zz"),
+            format!("v1.1000.{short}.{mac}"),
+            format!("v1.1000.{mac}.{short}"),
+            format!("v1.1000.{mac}.{mac}.{mac}"),
+            format!("v1..{mac}.{mac}"),
+            format!("v1.1000..{mac}"),
         ] {
             assert_eq!(
-                parse_auth(bad, 1_000).unwrap_err(),
+                parse_auth(&bad, 1_000).unwrap_err(),
                 AuthError::Malformed,
                 "{bad}"
             );

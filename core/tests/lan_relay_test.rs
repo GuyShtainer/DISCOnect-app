@@ -7,17 +7,21 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use common::{PASSPHRASE, encrypted_copy, fixtures};
 use disconect_core::keys::{self, PassphraseSource};
 use disconect_core::relay::bundle::account_for;
 use disconect_core::relay::folder::{FolderRelay, Relay, RelayError};
-use disconect_core::relay::lan::{AUTH_HEADER, LanRelay, auth_value, token_key, wall_clock};
-use disconect_core::relay::lan_server::{LanServer, Logger};
+use disconect_core::relay::lan::{
+    AUTH_HEADER, LanRelay, auth_value, auth_value_declaring, token_key, wall_clock,
+};
+use disconect_core::relay::lan_server::{LanServer, Limits, Logger};
 use disconect_core::relay::sync::{self, SyncError};
 use disconect_core::sources::{self, import_path};
 use disconect_core::store::{self, Store};
@@ -781,4 +785,236 @@ fn relay_serve_needs_an_encrypted_store_and_a_folder() {
         ],
     );
     assert_eq!(code(&bad_listen), 1);
+}
+
+// ---- slow and forged peers (Bet 12 review F1): 127.0.0.1 only, nothing real ----
+
+/// One HTTP request head (no body sent) on a fresh connection; the connection stays open.
+fn open_with_head(addr: std::net::SocketAddr, head: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream
+}
+
+/// The status of the first answer on `stream`, and how long it took (None: nothing before `wait`).
+fn first_status(stream: &mut TcpStream, wait: Duration) -> Option<(u16, Duration)> {
+    stream.set_read_timeout(Some(wait)).expect("timeout");
+    let started = Instant::now();
+    let mut buf = [0u8; 256];
+    let count = stream.read(&mut buf).ok().filter(|n| *n > 0)?;
+    let text = String::from_utf8_lossy(&buf[..count]).to_string();
+    let status = text.split(' ').nth(1)?.parse().ok()?;
+    Some((status, started.elapsed()))
+}
+
+fn put_head(path: &str, header: &str, length: usize) -> String {
+    format!(
+        "PUT {path} HTTP/1.1\r\nHost: x\r\n{AUTH_HEADER}: {header}\r\nContent-Length: {length}\r\n\r\n"
+    )
+}
+
+fn health_millis(addr: std::net::SocketAddr) -> u128 {
+    let started = Instant::now();
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .write_all(b"GET /v1/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("write");
+    let answer = first_status(&mut stream, Duration::from_secs(20));
+    assert_eq!(answer.map(|a| a.0), Some(200), "health answers");
+    started.elapsed().as_millis()
+}
+
+#[test]
+fn forged_headers_declaring_a_big_body_never_stall_the_server() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    // the default limits: the 10 s time-out must not be what saves the workers
+    let lan = Lan::start(tmp.path(), master());
+    let addr = lan.server.local_addr();
+    let account = account_for(master());
+    let path = format!("/v1/objects/{account}/{}", "b".repeat(32));
+    let forged = format!("v1.{}.{}.{}", wall_clock(), "00".repeat(32), "00".repeat(32));
+    // more connections than workers (4), each declaring 1 MB and sending none of it, kept open
+    let mut held: Vec<TcpStream> = (0..8)
+        .map(|_| open_with_head(addr, &put_head(&path, &forged, 1_000_000)))
+        .collect();
+    for stream in &mut held {
+        let (status, took) = first_status(stream, Duration::from_secs(2)).expect("an answer");
+        assert_eq!(status, 401, "refused on the head alone");
+        assert!(took < Duration::from_secs(1), "answered at once, not after a read: {took:?}");
+    }
+    let millis = health_millis(addr);
+    println!("F1 forged stalls: 8 held connections, health answered in {millis} ms");
+    assert!(millis < 2_000, "health took {millis} ms");
+    drop(held);
+}
+
+#[test]
+fn a_replayed_header_with_another_length_is_refused_before_the_body() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lan = Lan::start(tmp.path(), master());
+    let addr = lan.server.local_addr();
+    let key = token_key(master());
+    let account = account_for(master());
+    let path = format!("/v1/objects/{account}/{}", "c".repeat(32));
+    let header = auth_value(&*key, "PUT", &path, wall_clock(), b"abcd").expect("header");
+    // the honest request works
+    let mut honest = open_with_head(addr, &put_head(&path, &header, 4));
+    honest.write_all(b"abcd").expect("body");
+    assert_eq!(first_status(&mut honest, Duration::from_secs(5)).map(|a| a.0), Some(204));
+    // the same header on a longer or shorter body is 401 at once, with no body sent at all
+    for length in [5usize, 3, 1_000_000, 0] {
+        let mut replay = open_with_head(addr, &put_head(&path, &header, length));
+        let (status, took) = first_status(&mut replay, Duration::from_secs(2)).expect("an answer");
+        assert_eq!(status, 401, "length {length}");
+        assert!(took < Duration::from_secs(1), "length {length}: {took:?}");
+    }
+    assert_eq!(lan.folder_relay().get(path.trim_start_matches("/v1/objects/")).expect("object"), b"abcd");
+}
+
+#[test]
+fn a_valid_header_whose_body_never_comes_times_out_and_never_blocks_others() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let folder = tmp.path().join("relay");
+    let limits = Limits { idle: Duration::from_secs(1) };
+    let server = LanServer::start_with("127.0.0.1:0", &folder, master(), silent(), limits).expect("serve");
+    let addr = server.local_addr();
+    let key = token_key(master());
+    let account = account_for(master());
+    let path = format!("/v1/objects/{account}/{}", "d".repeat(32));
+    // a captured, still valid header (the pre-tag passes), then silence
+    let header = auth_value_declaring(&*key, "PUT", &path, wall_clock(), 1_000_000, b"x");
+    let header = header.expect("header");
+    let started = Instant::now();
+    let mut held: Vec<TcpStream> = (0..4)
+        .map(|_| open_with_head(addr, &put_head(&path, &header, 1_000_000)))
+        .collect();
+    for stream in &mut held {
+        let (status, _) = first_status(stream, Duration::from_secs(5)).expect("an answer");
+        assert_eq!(status, 408);
+    }
+    let millis = health_millis(addr);
+    println!(
+        "F1 valid-pre stalls: 4 stalled connections, all answered 408 after {} ms, then health in {millis} ms",
+        started.elapsed().as_millis()
+    );
+    assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+    assert!(millis < 2_000);
+    assert!(!folder.join(&account).join("d".repeat(32)).exists(), "nothing was written");
+    server.stop();
+}
+
+#[test]
+fn a_trickled_body_runs_out_of_its_total_budget() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let folder = tmp.path().join("relay");
+    let limits = Limits { idle: Duration::from_secs(1) };
+    let server = LanServer::start_with("127.0.0.1:0", &folder, master(), silent(), limits).expect("serve");
+    let key = token_key(master());
+    let account = account_for(master());
+    let path = format!("/v1/objects/{account}/{}", "e".repeat(32));
+    let body = vec![7u8; 1000];
+    let header = auth_value(&*key, "PUT", &path, wall_clock(), &body).expect("header");
+    let mut stream = open_with_head(server.local_addr(), &put_head(&path, &header, 1000));
+    let started = Instant::now();
+    // one byte every 400 ms never trips the 1 s no-progress limit, only the total budget (1 s + 0)
+    let mut answer = None;
+    for byte in &body {
+        std::thread::sleep(Duration::from_millis(400));
+        if stream.write_all(&[*byte]).is_err() {
+            break;
+        }
+        stream.set_read_timeout(Some(Duration::from_millis(1))).expect("timeout");
+        let mut buf = [0u8; 64];
+        if let Ok(count) = stream.read(&mut buf) {
+            answer = String::from_utf8_lossy(&buf[..count]).split(' ').nth(1).map(str::to_string);
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(6), "never cut off");
+    }
+    println!("F1 trickle: answer {answer:?} after {:?}", started.elapsed());
+    assert_eq!(answer.as_deref(), Some("408"));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(!folder.join(&account).join("e".repeat(32)).exists());
+    server.stop();
+}
+
+/// Raw exchange on a fresh connection: the status and the body (empty when there is no answer).
+fn exchange(addr: std::net::SocketAddr, request: &[u8]) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let _ = stream.write_all(request);
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = text.find("\r\n\r\n").map(|i| out[i + 4..].to_vec()).unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn hostile_heads_and_paths_get_bare_refusals_and_a_slow_head_is_cut() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let folder = tmp.path().join("relay");
+    fs::create_dir_all(&folder).expect("folder");
+    fs::write(tmp.path().join("secret.txt"), b"outside").expect("secret");
+    let limits = Limits { idle: Duration::from_secs(1) };
+    let server = LanServer::start_with("127.0.0.1:0", &folder, master(), silent(), limits).expect("serve");
+    let addr = server.local_addr();
+    let key = token_key(master());
+    let account = account_for(master());
+    let now = wall_clock();
+    // signed GETs on traversal-shaped paths: 400 or 404, never a body
+    for path in [
+        "/v1/objects/../secret.txt".to_string(),
+        "/v1/objects/..%2fsecret.txt".to_string(),
+        "/v1/objects/%2e%2e/secret.txt".to_string(),
+        format!("/v1/objects/{account}/../../secret.txt"),
+        format!("/v1/objects/{account}/%2e%2e%2f%2e%2e%2fsecret.txt"),
+        format!("/v1/objects//{account}/{}", "a".repeat(32)),
+        format!("/v1/objects/{account}/{}/x", "a".repeat(32)),
+        format!("/v1/objects/{}/{}", account.to_uppercase(), "a".repeat(32)),
+        "//etc/passwd".to_string(),
+        "/v1/objects?x=1".to_string(),
+    ] {
+        let header = auth_value(&*key, "GET", &path, now, b"").expect("header");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n{AUTH_HEADER}: {header}\r\nConnection: close\r\n\r\n");
+        let (status, body) = exchange(addr, request.as_bytes());
+        assert!(matches!(status, 400 | 404), "{path}: {status}");
+        assert!(body.is_empty(), "{path}");
+    }
+    // heads this server does not accept: a bare 400 (the method is not logged, nothing is read)
+    let header = auth_value(&*key, "GET", "/v1/objects", now, b"").expect("header");
+    for (label, request) in [
+        ("absolute-form target", format!("GET http://evil/v1/objects HTTP/1.1\r\n{AUTH_HEADER}: {header}\r\n\r\n")),
+        ("chunked upload", format!("PUT /v1/objects/{account}/{} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n{AUTH_HEADER}: {header}\r\n\r\n", "a".repeat(32))),
+        ("two lengths", format!("PUT /v1/objects/{account}/{} HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n{AUTH_HEADER}: {header}\r\n\r\n", "a".repeat(32))),
+        ("a signed length", "PUT /v1/objects HTTP/1.1\r\nContent-Length: +5\r\n\r\n".to_string()),
+        ("a folded header", "GET /v1/health HTTP/1.1\r\nX-A: b\r\n  folded\r\n\r\n".to_string()),
+        ("two auth headers", format!("GET /v1/objects HTTP/1.1\r\n{AUTH_HEADER}: {header}\r\n{AUTH_HEADER}: {header}\r\n\r\n")),
+        ("an unknown version", "GET /v1/health HTTP/2.0\r\n\r\n".to_string()),
+        ("a lower-case method", "get /v1/health HTTP/1.1\r\n\r\n".to_string()),
+        ("an oversized head", format!("GET /v1/health HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(40_000))),
+    ] {
+        let (status, body) = exchange(addr, request.as_bytes());
+        assert_eq!((status, body.is_empty()), (400, true), "{label}");
+    }
+    // lower-case header names and a plain HTTP/1.0 request are fine
+    let lower = format!("GET /v1/objects HTTP/1.0\r\n{}: {header}\r\n\r\n", AUTH_HEADER.to_lowercase());
+    assert_eq!(exchange(addr, lower.as_bytes()).0, 200);
+    // health says nothing about the host
+    let (status, body) = exchange(addr, b"GET /v1/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!((status, body.as_slice()), (200, &br#"{"product":"DISCOnect","relay":"lan","v":1}"#[..]));
+    // half a head, then silence: the connection is cut after the idle limit, others are served meanwhile
+    let mut slow = TcpStream::connect(addr).expect("connect");
+    slow.write_all(b"GET /v1/health HTTP/1.1\r\nHost: ").expect("partial");
+    let started = Instant::now();
+    assert!(health_millis(addr) < 500, "health is served while a head is half sent");
+    let answer = first_status(&mut slow, Duration::from_secs(4));
+    println!("F1 half head: {answer:?} after {:?}", started.elapsed());
+    assert_eq!(answer.map(|a| a.0), Some(408));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // a client that connects and says nothing is closed without an answer
+    let mut mute = TcpStream::connect(addr).expect("connect");
+    assert_eq!(first_status(&mut mute, Duration::from_secs(4)), None);
+    server.stop();
 }
