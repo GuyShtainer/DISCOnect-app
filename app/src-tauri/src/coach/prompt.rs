@@ -85,7 +85,6 @@ mod tests {
             assert!(!lower.contains(banned), "{banned}");
         }
         // the vendor scrub is the check: it must leave the text unchanged (MANUFACTURER_PATTERN drives it)
-        assert_eq!(MANUFACTURER_PATTERN, "garmin(?: connect)?");
         assert_eq!(neutral_text(&prompt), prompt);
         assert!(!prompt.contains(VENDOR_PLACEHOLDER));
         assert!(!lower.contains(&MANUFACTURER_PATTERN[..6]));

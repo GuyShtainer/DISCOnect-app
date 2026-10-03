@@ -223,6 +223,25 @@ pub fn gate(settings: &Settings) -> Result<Endpoint, CoachError> {
     }
 }
 
+/// The order a question is set up in, with every effect injected so a test can count it: the settings gate
+/// first (off returns before anything else), then the egress is built, then the key is read, then the loop
+/// runs. Off therefore builds no egress, reads no key and sends nothing.
+pub fn ask_configured(
+    settings: &Settings,
+    make_egress: impl FnOnce(&Settings) -> Option<Box<dyn Egress>>,
+    resolve_key: impl FnOnce() -> Option<Zeroizing<String>>,
+    call_tool: &dyn Fn(&str, Value) -> Result<Value, ToolCallError>,
+    conv: &mut Conversation,
+    user_text: &str,
+) -> Result<String, CoachError> {
+    gate(settings)?;
+    let Some(egress) = make_egress(settings) else {
+        return Err(CoachError::Egress(EgressError::BadUrl));
+    };
+    let bearer = resolve_key();
+    Coach::new(egress.as_ref(), call_tool, settings, bearer).ask(conv, user_text)
+}
+
 /// Runs a question. Borrows everything: the egress (real or scripted), the tool runner (the core behind
 /// `tools.call`, or a fixture in tests), the settings and the key.
 pub struct Coach<'a> {
@@ -269,7 +288,9 @@ impl<'a> Coach<'a> {
 
     fn rounds(&self, conv: &mut Conversation, url: &url::Url) -> Result<String, CoachError> {
         let system = system_prompt();
-        let turn_budget = self.context_bytes.saturating_sub(system.len());
+        // the system message as it is serialised (JSON escapes and the role wrapper count), so the whole
+        // `messages` array stays inside `context_bytes`
+        let turn_budget = self.context_bytes.saturating_sub(wire::encoded_len(&[Message::System { content: system.clone() }]));
         for round in 0..=MAX_ROUNDS {
             let mut messages = vec![Message::System { content: system.clone() }];
             messages.extend(window(&conv.turns, turn_budget));

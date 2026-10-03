@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tauri::{Manager, State};
 use zeroize::Zeroizing;
 
-use super::chat_loop::{self, Coach, Conversation, ToolCallError, TraceEntry};
+use super::chat_loop::{self, Conversation, ToolCallError, TraceEntry};
 use super::egress::EgressError;
 use super::key::{self, KeyError, KeyHolder, KeyState};
 use super::settings::{self, Settings, SettingsError};
@@ -167,20 +167,22 @@ pub async fn coach_ask(app: tauri::AppHandle, text: String) -> Result<CoachReply
 }
 
 fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Result<CoachReply, CoachErrorDto> {
-    let Some(egress) = super::provider(settings) else {
-        return Err(chat_loop::gate(settings).err().unwrap_or(chat_loop::CoachError::Off).into());
-    };
-    let bearer = app.state::<KeyHolder>().resolve();
     let core = app.state::<crate::Core>().0.clone();
     let call_tool = move |name: &str, arguments: Value| -> Result<Value, ToolCallError> {
         let core = core.as_ref().map_err(|e| ToolCallError { code: e.code.clone() })?;
         let params = json!({"name": name, "arguments": arguments});
         tauri::async_runtime::block_on(core.call("tools.call", params)).map_err(|e| ToolCallError { code: e.code })
     };
-    let coach = Coach::new(egress.as_ref(), &call_tool, settings, bearer);
     let state = app.state::<CoachState>();
     let mut conversation = state.conversation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let answer = coach.ask(&mut conversation, text);
+    let answer = chat_loop::ask_configured(
+        settings,
+        super::provider,
+        || app.state::<KeyHolder>().resolve(),
+        &call_tool,
+        &mut conversation,
+        text,
+    );
     let trace = conversation.trace.clone();
     answer.map(|text| CoachReply { text, trace }).map_err(CoachError::from)
 }

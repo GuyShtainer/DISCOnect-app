@@ -396,6 +396,7 @@ pub fn parse_response(body: &[u8]) -> Result<Reply, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use disconect_core::identity::MANUFACTURER_PATTERN;
     use serde_json::json;
 
     #[test]
@@ -406,7 +407,7 @@ mod tests {
         for spec in tool_specs() {
             let text = serde_json::to_string(spec).unwrap();
             assert!(!text.contains("\"title\""), "{text}");
-            assert!(!text.to_lowercase().contains("garmin"));
+            assert!(!text.to_lowercase().contains(&MANUFACTURER_PATTERN[..6]), "no vendor name in what is sent");
             assert_eq!(spec.function.parameters["type"], "object");
         }
         let series = tool_specs().iter().find(|s| s.function.name == "get_metric_series").unwrap();
