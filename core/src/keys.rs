@@ -19,6 +19,8 @@ use sha2::Sha256;
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
+use crate::identity::COMMAND;
+
 pub const FORMAT_VERSION: u64 = 1;
 pub const PASSPHRASE_ENV: &str = "DISCONECT_PASSPHRASE";
 pub const KEYS_ENV: &str = "DISCONECT_KEYS";
@@ -51,13 +53,13 @@ pub type Secret32 = Zeroizing<[u8; 32]>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
-    #[error("no key file at {0}; run 'hearthbeat key init' (or set HEARTHBEAT_KEYS)")]
+    #[error("no key file at {0}; run '{cmd} key init' (or set {env})", cmd = COMMAND, env = KEYS_ENV)]
     KeyFileMissing(String),
     #[error("key file is corrupt: {0}")]
     KeyFileCorrupt(String),
     #[error("wrong passphrase")]
     WrongPassphrase,
-    #[error("the database is encrypted and no unlock path applies (set HEARTHBEAT_PASSPHRASE or pass a passphrase file)")]
+    #[error("the database is encrypted and no unlock path applies (set {env} or pass a passphrase file)", env = PASSPHRASE_ENV)]
     Locked,
 }
 

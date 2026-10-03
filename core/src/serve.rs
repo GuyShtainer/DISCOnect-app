@@ -160,14 +160,14 @@ fn store_parts(error: &StoreError) -> (&'static str, String) {
     match error {
         StoreError::NotConfigured(_) => (
             "not_found",
-            "no Hearthbeat database yet; run 'hearthbeat import' first".into(),
+            format!("no {PRODUCT} database yet; run '{} import' first", identity::COMMAND),
         ),
         StoreError::Encrypted(message) => ("locked", message.clone()),
         StoreError::NotEncrypted(_) => ("not_encrypted", error.to_string()),
         StoreError::SchemaTooNew { found } => (
             "database",
             format!(
-                "database schema is version {found}; this build understands up to {}. Upgrade Hearthbeat.",
+                "database schema is version {found}; this build understands up to {}. Upgrade {PRODUCT}.",
                 store::SCHEMA_VERSION
             ),
         ),

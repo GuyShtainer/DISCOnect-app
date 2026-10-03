@@ -309,7 +309,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             let Some(master) = master else {
                 return Err((
                     EXIT_LOCKED,
-                    "the relay needs an encrypted store: run 'hearthbeat key init' first".to_string(),
+                    format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
                 ));
             };
             let relay = relay_for(args)?;

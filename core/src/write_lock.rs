@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde_json::{Value, json};
 
+use crate::identity::PRODUCT;
 use crate::keys::sibling_with_suffix;
 use crate::time::utc_now_iso;
 
@@ -27,11 +28,11 @@ pub enum LockError {
 fn busy_message(holder: &Option<Value>) -> String {
     match holder {
         Some(h) => format!(
-            "another Hearthbeat process is writing the database ({}, pid {})",
+            "another {PRODUCT} process is writing the database ({}, pid {})",
             h.get("purpose").and_then(Value::as_str).unwrap_or("?"),
             h.get("pid").map(Value::to_string).unwrap_or_else(|| "?".into())
         ),
-        None => "another Hearthbeat process is writing the database".to_string(),
+        None => format!("another {PRODUCT} process is writing the database"),
     }
 }
 

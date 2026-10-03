@@ -310,7 +310,7 @@ fn an_import_is_busy_while_another_process_holds_the_write_lock() {
     assert_eq!(lines[0]["error"]["code"], "busy");
     let message = lines[0]["error"]["message"].as_str().expect("message");
     assert!(
-        message.starts_with("another Hearthbeat process is writing the database (cli import, pid "),
+        message.starts_with("another DISCOnect process is writing the database (cli import, pid "),
         "{message}"
     );
     drop(held);

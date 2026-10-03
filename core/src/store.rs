@@ -9,6 +9,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 use zeroize::Zeroizing;
 
+use crate::identity::{COMMAND, PRODUCT};
 use crate::keys::{self, KeyError, PassphraseSource, Secret32};
 use crate::time::utc_now_iso;
 use crate::write_lock::{self, LockError, WriteLock};
@@ -28,11 +29,11 @@ pub const MIGRATIONS: [(i64, &str); 3] = [
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("no Hearthbeat database yet at {0}")]
+    #[error("no {product} database yet at {0}", product = PRODUCT)]
     NotConfigured(String),
     #[error("{0}")]
     Encrypted(String),
-    #[error("{0} is plaintext but a key file exists; run 'hearthbeat encrypt' to convert it (or remove the key file if it is not yours)")]
+    #[error("{0} is plaintext but a key file exists; run '{cmd} encrypt' to convert it (or remove the key file if it is not yours)", cmd = COMMAND)]
     NotEncrypted(String),
     #[error("database schema is version {found}; this build understands up to {SCHEMA_VERSION}. Upgrade.")]
     SchemaTooNew { found: i64 },
