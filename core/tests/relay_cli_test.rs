@@ -281,3 +281,41 @@ fn reparse_on_a_busy_store_exits_four() {
     drop(held);
     assert_eq!(code(&cli.run(&db, &["reparse"])), 0);
 }
+
+#[test]
+fn reparse_json_failures_carry_the_records_stream() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_dir, db) = encrypted_copy();
+    let drop = drop_folder(tmp.path());
+    assert_eq!(code(&cli.run(&db, &["import", drop.to_str().expect("utf8")])), 0);
+    // one retained FIT record turns into bytes the decoder rejects; the dry run refuses the reparse
+    let key = disconect_core::keys::unlock(
+        &disconect_core::keys::key_path_for(&db),
+        disconect_core::keys::PassphraseSource::Explicit(PASSPHRASE),
+    )
+    .expect("unlock");
+    let store = disconect_core::store::open_for_write_with(&db, "test", 5.0, Some(&key)).expect("open");
+    let mut junk = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut junk, b"this is not a FIT file").expect("deflate");
+    store
+        .conn()
+        .execute(
+            "UPDATE raw_records SET payload=? WHERE id=(SELECT min(id) FROM raw_records WHERE payload_kind='fit')",
+            [junk.finish().expect("finish")],
+        )
+        .expect("corrupt");
+    let stream: String = store
+        .conn()
+        .query_row("SELECT stream FROM raw_records WHERE payload_kind='fit' ORDER BY id LIMIT 1", [], |r| r.get(0))
+        .expect("stream");
+    std::mem::drop(store);
+    let out = cli.run(&db, &["--json", "reparse"]);
+    assert_eq!(code(&out), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    let stats: Value = serde_json::from_slice(&out.stdout).expect("json");
+    let failures = stats["failures"].as_array().expect("failures");
+    assert_eq!(failures.len(), 1);
+    let keys: Vec<&str> = failures[0].as_object().expect("object").keys().map(String::as_str).collect();
+    assert_eq!(keys, ["error", "file", "kind", "stream"], "Python's `_dry_run` failure keys");
+    assert_eq!(failures[0]["stream"], stream.as_str());
+}
