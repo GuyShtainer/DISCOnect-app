@@ -109,7 +109,7 @@ answers, five evals, and one scenario replayed through the real egress against a
 
 ## Coach probe and screens
 
-Built and lint-tested, **not yet seen**: no app-shot has been taken of the Coach screens (the debug bundle build was refused in the building session); the HANDOFF holds the commands.
+Seen 2026-10-03: app-shots of Coach (off, and on against a local listener) and Coach settings read from the debug bundle on a synthetic store; the Provider key and Test cards below the fold, a reply bubble and the drawer are not yet seen (no question was typed).
 
 `coach_probe` (`src-tauri/src/coach/probe.rs`) asks the saved endpoint two made-up questions and runs no tool and no core
 call, so it works on a locked store. Round 1 offers the five tools and reads whether the model calls one; round 2 sends a
