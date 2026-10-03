@@ -48,6 +48,14 @@ fn bodies(fake: &Fake) -> Vec<Value> {
     fake.sent.lock().expect("lock").iter().map(|s| serde_json::from_slice(&s.body).expect("JSON body")).collect()
 }
 
+/// Round 2's user content is the nonce sentence (digits only) and the filler, and nothing else.
+fn assert_context_content(content: &str) {
+    assert!(content.len() >= FILLER_BYTES, "the filler is still its full size after the nonce");
+    assert!(content.ends_with(filler().as_str()));
+    let without_digits: String = content.chars().filter(|c| !c.is_ascii_digit()).collect();
+    assert_eq!(without_digits, format!("Probe  sent at second . {}", filler()), "constant sentences and digits only");
+}
+
 /// The capture checks over what the probe sent. `rounds` is how many requests are expected.
 fn assert_capture(requests: &[Value], rounds: usize) {
     assert_eq!(requests.len(), rounds);
@@ -74,8 +82,7 @@ fn assert_capture(requests: &[Value], rounds: usize) {
         } else {
             assert_eq!(keys, ["max_tokens", "messages", "model", "stream"], "no tools in the context round");
             assert_eq!(body["max_tokens"], 1);
-            assert_eq!(users[0]["content"], filler().as_str(), "the filler is the only user content");
-            assert_eq!(users[0]["content"].as_str().map(str::len), Some(FILLER_BYTES));
+            assert_context_content(users[0]["content"].as_str().expect("text"));
         }
     }
 }
@@ -93,6 +100,20 @@ fn tools_yes_and_context_ok() {
     assert_eq!((report.status, report.error), (None, None));
     assert!(report.measured_prompt_tokens.expect("usage") >= min_reported_tokens());
     assert_capture(&provider.requests(), 2);
+}
+
+#[test]
+fn two_probes_in_a_row_never_send_the_same_filler_so_a_cache_cannot_answer_for_it() {
+    let (_, first) = run_scripted(vec![Step::text("a"), Step::text("b")]);
+    let (_, second) = run_scripted(vec![Step::text("a"), Step::text("b")]);
+    let content = |p: &Scripted| p.requests()[1]["messages"][1]["content"].as_str().expect("text").to_string();
+    let (one, two) = (content(&first), content(&second));
+    assert_ne!(one, two, "the nonce differs between consecutive probes");
+    for text in [&one, &two] {
+        assert_context_content(text);
+    }
+    // the system prompt (the part a cache may serve) is the same in both; the user message is not
+    assert_eq!(first.requests()[1]["messages"][0], second.requests()[1]["messages"][0]);
 }
 
 #[test]

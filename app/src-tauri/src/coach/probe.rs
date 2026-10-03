@@ -9,6 +9,9 @@
 //! not offered), [`ToolsSupport::Unknown`] when the answer cannot be read.
 //!
 //! **Round 2, context.** The system prompt and a synthetic filler of known size, no tools, `max_tokens: 1`.
+//! The user message starts with a short sentence holding a per-call nonce (a counter and the unix seconds, as
+//! digits), so a provider's prompt cache can serve the system prompt but never the filler: a repeated test
+//! would otherwise report the cached part as a short read and say "too small" about a server that is fine.
 //! The filler is [`FILLER_TOKENS`] tokens at [`BYTES_PER_TOKEN`] bytes each, built from one short ASCII
 //! sentence (no data). `usage.prompt_tokens` is the tokens the server really read: at least
 //! [`MIN_REPORTED_PERCENT`] % of the filler means [`ContextVerdict::Ok`]; fewer means the server cut the
@@ -20,6 +23,9 @@
 //! **Errors.** A transport error is `reachable: false` with its code. A 401 or 403 is `reachable: true`,
 //! `error: "unauthorised"` and nothing else is tried. Any other error status is `reachable: true`,
 //! `error: "status"` with the number. Messages and codes are fixed strings, never the provider's text.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -109,6 +115,22 @@ pub fn filler() -> String {
     text
 }
 
+/// Counts probes in this process; one half of the nonce.
+static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The user message of round 2 for one probe: a sentence with the probe's number and the time in seconds (digits
+/// only, no data), then the [`filler`]. The nonce comes first so that no prefix of the message repeats between
+/// two probes; the filler after it is still [`FILLER_BYTES`] long, so the threshold is unchanged.
+pub fn context_content(counter: u64, unix_seconds: u64) -> String {
+    format!("Probe {counter} sent at second {unix_seconds}. {}", filler())
+}
+
+fn next_context_content() -> String {
+    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    context_content(counter, seconds)
+}
+
 /// The smallest reported prompt size that counts as "not truncated".
 pub fn min_reported_tokens() -> u64 {
     FILLER_TOKENS * MIN_REPORTED_PERCENT / 100
@@ -163,7 +185,7 @@ pub fn probe(egress: &dyn Egress, settings: &Settings, bearer: Option<&Zeroizing
     }
 
     // round 2: how much of a long prompt does the server read?
-    let context_request = ChatRequest::without_tools(&settings.model, vec![system, Message::User { content: filler() }], 1);
+    let context_request = ChatRequest::without_tools(&settings.model, vec![system, Message::User { content: next_context_content() }], 1);
     match send(egress, &endpoint, bearer, &context_request) {
         Ok(body) => {
             report.reachable = true;
@@ -190,5 +212,14 @@ mod tests {
         assert_eq!(FILLER_BYTES, 48_000);
         assert!(text.is_ascii());
         assert_eq!(min_reported_tokens(), 10_200);
+    }
+
+    #[test]
+    fn the_context_message_is_a_digit_nonce_sentence_then_the_filler() {
+        let a = context_content(7, 1_760_000_000);
+        assert_eq!(a, format!("Probe 7 sent at second 1760000000. {}", filler()));
+        assert_ne!(a, context_content(8, 1_760_000_000));
+        assert!(a.len() >= FILLER_BYTES + 20 && a.is_ascii());
+        assert!(next_context_content() != next_context_content(), "the counter moves on every call");
     }
 }
