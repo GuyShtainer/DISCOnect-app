@@ -11,7 +11,7 @@
 //! is `_clean`ed (`round(x, 3)`), `retro` is a `bool`. The caller scrubs the manufacturer's name
 //! (`identity::neutral_json`), as `mcp_server._neutral_result` does for Python.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
@@ -56,13 +56,8 @@ fn truthy(cell: ValueRef<'_>) -> bool {
 
 /// `dict.fromkeys(items)`: each distinct item once, in first-seen order.
 fn distinct(items: &[PyStr]) -> Vec<&PyStr> {
-    let mut seen: Vec<&PyStr> = Vec::new();
-    for item in items {
-        if !seen.contains(&item) {
-            seen.push(item);
-        }
-    }
-    seen
+    let mut seen: HashSet<&PyStr> = HashSet::new();
+    items.iter().filter(|item| seen.insert(item)).collect()
 }
 
 /// `{key: value, ...}` from a fixed list, in order.

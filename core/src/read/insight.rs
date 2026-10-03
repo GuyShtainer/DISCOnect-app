@@ -15,7 +15,7 @@
 //! variance with one correctly rounded square root ([`super::numerics`]); the builtin `sum` of
 //! `sample_day_aggregates` is Neumaier ([`crate::writer::py_sum`]); `round(x, 2)` is [`super::queries::round2`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::Connection;
 use serde_json::Value;
@@ -144,7 +144,9 @@ impl Fact {
         );
         out.set(
             "comparison",
-            self.comparison.as_ref().map_or(Json::Null, Comparison::to_json),
+            self.comparison
+                .as_ref()
+                .map_or(Json::Null, Comparison::to_json),
         );
         out.set("confidence", Json::text(&self.confidence));
         out.set("reason_code", Json::text(self.reason_code));
@@ -399,13 +401,12 @@ pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Jso
             .map(|item| PyStr::from_text(&item.metric))
             .collect()
     } else {
-        let mut once: Vec<PyStr> = Vec::new();
-        for name in requested {
-            if !once.contains(name) {
-                once.push(name.clone());
-            }
-        }
-        once
+        let mut seen: HashSet<&PyStr> = HashSet::new();
+        requested
+            .iter()
+            .filter(|name| seen.insert(name))
+            .cloned()
+            .collect()
     };
     let known: Vec<Option<&MetricContract>> = wanted
         .iter()
@@ -497,7 +498,10 @@ pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Jso
     out.set("as_of", Json::text(&as_of));
     out.set("window", window);
     out.set("baseline", baseline);
-    out.set("facts", Json::Array(facts.iter().map(Fact::to_json).collect()));
+    out.set(
+        "facts",
+        Json::Array(facts.iter().map(Fact::to_json).collect()),
+    );
     out.set("ignored_metrics", Json::Array(ignored));
     out.set("rules", rules());
     out.set(

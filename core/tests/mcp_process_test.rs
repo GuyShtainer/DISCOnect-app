@@ -212,10 +212,74 @@ fn a_locked_store_exits_9_before_reading_stdin_and_says_where_to_fix_it() {
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    for word in ["\"Your key\"", "Remember on this Mac", "keychain: absent"] {
+    for word in [
+        "\"Your key\"",
+        "\"Keep the key in this device's keychain\"",
+        "restart Claude Desktop",
+        "keychain: absent",
+    ] {
         assert!(stderr.contains(word), "{stderr}");
     }
     assert!(!stderr.contains(PASSPHRASE));
+}
+
+/// Write one request, read its one answer line.
+fn ask(stdin: &mut impl Write, stdout: &mut impl BufRead, request: &str) -> Value {
+    writeln!(stdin, "{request}").expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("an answer");
+    serde_json::from_str(&line).expect("an answer that is JSON")
+}
+
+/// The one way a call can meet an encrypted store: it was encrypted while the server ran (Guy's `key init`
+/// with Claude Desktop open). The server keeps serving and says what to do in the app's words, not Python's.
+#[test]
+fn a_store_encrypted_mid_session_is_answered_in_the_apps_words_and_the_server_keeps_going() {
+    let (dir, db) = plain_store();
+    let mut child = command(&db, dir.path()).spawn().expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let call = |id: u32| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"list_activities","arguments":{{"limit":1}}}}}}"#
+        )
+    };
+    ask(&mut stdin, &mut stdout, INIT);
+    let before = ask(&mut stdin, &mut stdout, &call(2));
+    assert_eq!(
+        before["result"]["isError"], false,
+        "the plain store answers"
+    );
+
+    std::fs::copy(common::fixtures().join("empty-v3.hbdb"), &db)
+        .expect("swap in the encrypted store");
+    common::install_key(&db);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let after = ask(&mut stdin, &mut stdout, &call(3));
+    assert_eq!(after["result"]["isError"], true);
+    let text = after["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text");
+    assert_eq!(
+        text,
+        "Error executing tool list_activities: The store is encrypted and this server has no working key for it: it changed after Claude Desktop started the server. Open DISCOnect, go to the \"Your key\" screen, switch \"Keep the key in this device's keychain\" on, then restart Claude Desktop."
+    );
+    assert!(
+        !text.contains("disconect key cache") && !text.contains("disconect-mcp"),
+        "{text}"
+    );
+    assert!(after["result"].get("structuredContent").is_none());
+    let alive = ask(
+        &mut stdin,
+        &mut stdout,
+        r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#,
+    );
+    assert_eq!(alive["result"], json!({}), "the server keeps serving");
+    drop(stdin);
+    assert_eq!(wait(child, Duration::from_secs(5)).status.code(), Some(0));
 }
 
 #[test]
@@ -314,4 +378,51 @@ fn stray_arguments_are_a_usage_error() {
     let (code, lines, stderr) = run(with_json, "");
     assert_eq!((code, lines.len()), (Some(2), 0));
     assert!(stderr.contains("mcp takes only"));
+}
+
+/// A model can send a long list: the de-duplication of names must not be quadratic (it was, over a `Vec`).
+#[test]
+fn fifty_thousand_metric_names_are_answered_in_two_seconds() {
+    let (dir, db) = plain_store();
+    let names: Vec<String> = (0..50_000)
+        .map(|n| format!("\"name-{}\"", n % 25_000))
+        .collect();
+    let list = names.join(",");
+    let input = format!(
+        "{INIT}\n{}\n{}\n",
+        format_args!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_metric_series","arguments":{{"metrics":[{list}]}}}}}}"#
+        ),
+        format_args!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"get_period_facts","arguments":{{"metrics":[{list}]}}}}}}"#
+        ),
+    );
+    let started = Instant::now();
+    // the answers are megabytes: a thread feeds stdin while this one drains stdout, or the pipes deadlock
+    let mut child = command(&db, dir.path()).spawn().expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output().expect("output");
+    let _ = feeder.join();
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(0));
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let out = parsed(&lines);
+    for answer in &out[1..] {
+        assert_eq!(answer["result"]["isError"], false);
+        let ignored = &answer["result"]["structuredContent"]["ignored_metrics"];
+        assert_eq!(
+            ignored.as_array().map(Vec::len),
+            Some(25_000),
+            "each name once, first-seen order"
+        );
+        assert_eq!(ignored[0], "name-0");
+        assert_eq!(ignored[24_999], "name-24999");
+    }
+    assert!(took < Duration::from_secs(2), "50k names took {took:?}");
 }
