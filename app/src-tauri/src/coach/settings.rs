@@ -42,7 +42,8 @@ pub struct Settings {
     pub model: String,
     /// True when the provider key was stored in the OS keychain (advisory: the keychain is the truth).
     pub key_in_keychain: bool,
-    /// Whether the data series the coach reads may include per-day points (otherwise facts only).
+    /// Whether `get_period_facts` may send each fact's `evidence.window_points`. Series points are always sent:
+    /// `get_metric_series` carries its per-day values whatever this is; the toggle covers that one field only.
     pub include_points: bool,
 }
 
