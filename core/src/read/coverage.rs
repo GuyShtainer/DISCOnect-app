@@ -13,12 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::NaiveDate;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::ReadError;
 use super::queries::{iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
+use crate::wirejson::Json;
 
 pub const PRESENT: &str = "present";
 pub const FAILED: &str = "failed";
@@ -344,18 +345,21 @@ fn statuses_for(
 }
 
 /// Runs of consecutive non-present days with one status, oldest first; the newest `MAX_GAPS` kept.
-fn gaps(window: &Window, statuses: &[&'static str]) -> Result<(Vec<Value>, bool), ReadError> {
-    let mut found: Vec<Value> = Vec::new();
+fn gaps(window: &Window, statuses: &[&'static str]) -> Result<(Vec<Json>, bool), ReadError> {
+    let mut found: Vec<Json> = Vec::new();
     let mut run_start: Option<usize> = None;
     for (position, status) in statuses.iter().copied().chain([PRESENT]).enumerate() {
         if let Some(start) = run_start
             && (status == PRESENT || Some(status) != statuses.get(start).copied())
         {
-            found.push(json!({
-                "from": window.day(start)?,
-                "to": window.day(position - 1)?,
-                "status": statuses.get(start).copied().unwrap_or(PRESENT),
-            }));
+            found.push(Json::object([
+                ("from", Json::text(&window.day(start)?)),
+                ("to", Json::text(&window.day(position - 1)?)),
+                (
+                    "status",
+                    Json::text(statuses.get(start).copied().unwrap_or(PRESENT)),
+                ),
+            ]));
             run_start = None;
         }
         if status != PRESENT && run_start.is_none() {
@@ -373,7 +377,7 @@ fn gaps(window: &Window, statuses: &[&'static str]) -> Result<(Vec<Value>, bool)
 struct Analysis {
     window: Window,
     streams_for: Declared,
-    drift: Vec<Value>,
+    drift: Vec<Json>,
     statuses: BTreeMap<Key, Vec<&'static str>>,
     undatable: i64,
     unattributed: i64,
@@ -384,7 +388,7 @@ struct Analysis {
 fn declared_and_drift(
     conn: &Connection,
     contract: &Contract,
-) -> Result<(Declared, Vec<Value>), ReadError> {
+) -> Result<(Declared, Vec<Json>), ReadError> {
     let mut streams_for: Declared = contract
         .streams_for
         .iter()
@@ -402,7 +406,11 @@ fn declared_and_drift(
             .or_default();
         if !declared.contains(&stream) {
             declared.insert(stream.clone());
-            drift.push(json!({"metric": metric, "source_scope": scope, "stream": stream}));
+            drift.push(Json::object([
+                ("metric", Json::text(&metric)),
+                ("source_scope", Json::text(&scope)),
+                ("stream", Json::text(&stream)),
+            ]));
         }
     }
     Ok((streams_for, drift))
@@ -482,13 +490,25 @@ pub fn statuses_on(
 
 /// The coverage block of `data_health`: per (metric, scope) counts and gaps over the window ending at
 /// `last_day` (inclusive); `window_days` is clipped to [`MAX_WINDOW_DAYS`]. Plain data: no values,
-/// no identifiers.
+/// no identifiers. Object keys are sorted (the `serve` wire form); [`ledger_ordered`] keeps Python's order.
 pub fn ledger(
     conn: &Connection,
     contract: &Contract,
     last_day: &str,
     window_days: i64,
 ) -> Result<Value, ReadError> {
+    ledger_ordered(conn, contract, last_day, window_days)?
+        .to_serde()
+        .ok_or(ReadError::Unexpected("TypeError"))
+}
+
+/// [`ledger`] with every object's keys in the order `coverage.ledger` inserts them.
+pub fn ledger_ordered(
+    conn: &Connection,
+    contract: &Contract,
+    last_day: &str,
+    window_days: i64,
+) -> Result<Json, ReadError> {
     let window_days = window_days.clamp(1, MAX_WINDOW_DAYS);
     let last = parse_date(last_day)?;
     let analysis = analyse(
@@ -506,30 +526,50 @@ pub fn ledger(
             .cloned()
             .unwrap_or_default();
         let (found, truncated) = gaps(window, &statuses)?;
-        let count = |wanted: &str| statuses.iter().filter(|s| **s == wanted).count();
-        rows.push(json!({
-            "metric": metric, "source_scope": scope, "streams": streams,
-            "sparse": contract.is_sparse(metric),
-            PRESENT: count(PRESENT), FAILED: count(FAILED),
-            SOURCE_EMPTY: count(SOURCE_EMPTY), NOT_COVERED: count(NOT_COVERED),
-            "gaps": found, "gaps_truncated": truncated,
-        }));
+        let count = |wanted: &str| Json::count(statuses.iter().filter(|s| **s == wanted).count());
+        rows.push(Json::object([
+            ("metric", Json::text(metric)),
+            ("source_scope", Json::text(scope)),
+            ("streams", Json::texts(streams)),
+            ("sparse", Json::flag(contract.is_sparse(metric))),
+            (PRESENT, count(PRESENT)),
+            (FAILED, count(FAILED)),
+            (SOURCE_EMPTY, count(SOURCE_EMPTY)),
+            (NOT_COVERED, count(NOT_COVERED)),
+            ("gaps", Json::Array(found)),
+            ("gaps_truncated", Json::flag(truncated)),
+        ]));
     }
     let refinements = if analysis.refinements {
         &contract.coverage_refinements.available
     } else {
         &contract.coverage_refinements.unavailable
     };
-    Ok(json!({
-        "window": {"from": iso(window.first), "to": iso(window.last), "days": window.days},
-        "statuses": [PRESENT, FAILED, SOURCE_EMPTY, NOT_COVERED],
-        "ledger": rows,
-        "map_drift": analysis.drift,
-        "unattributed_failures": analysis.unattributed,
-        "undatable_files": analysis.undatable,
-        "refinements": refinements,
-        "refinements_available": analysis.refinements,
-    }))
+    Ok(Json::object([
+        (
+            "window",
+            Json::object([
+                ("from", Json::text(&iso(window.first))),
+                ("to", Json::text(&iso(window.last))),
+                ("days", Json::count(window.days)),
+            ]),
+        ),
+        (
+            "statuses",
+            Json::Array(
+                [PRESENT, FAILED, SOURCE_EMPTY, NOT_COVERED]
+                    .into_iter()
+                    .map(Json::text)
+                    .collect(),
+            ),
+        ),
+        ("ledger", Json::Array(rows)),
+        ("map_drift", Json::Array(analysis.drift)),
+        ("unattributed_failures", Json::int(analysis.unattributed)),
+        ("undatable_files", Json::int(analysis.undatable)),
+        ("refinements", Json::text(refinements)),
+        ("refinements_available", Json::flag(analysis.refinements)),
+    ]))
 }
 
 #[cfg(test)]
@@ -537,6 +577,14 @@ mod tests {
     use super::*;
     use crate::model::ClockOffset;
     use chrono::{TimeZone, Utc};
+
+    /// A string member of a ledger object.
+    fn field(object: &Json, key: &str) -> String {
+        match object.get(key) {
+            Some(Json::Str(text)) => text.units_lossy(),
+            other => unreachable!("{key}: {other:?}"),
+        }
+    }
 
     fn window(first: &str, last: &str) -> Window {
         match Window::new(first, last) {
@@ -590,7 +638,7 @@ mod tests {
             .collect();
         let (found, truncated) = gaps(&w, &statuses).expect("gaps");
         assert!(truncated && found.len() == MAX_GAPS);
-        assert_eq!(found[MAX_GAPS - 1]["to"], "2025-03-31");
+        assert_eq!(field(&found[MAX_GAPS - 1], "to"), "2025-03-31");
         let small = [
             "present",
             "source_empty",
@@ -602,10 +650,10 @@ mod tests {
         let w = window("2025-06-01", "2025-06-06");
         let (found, truncated) = gaps(&w, &small).expect("gaps");
         assert!(!truncated);
-        assert_eq!(found[0]["from"], "2025-06-02");
-        assert_eq!(found[0]["to"], "2025-06-03");
-        assert_eq!(found[1]["status"], "failed");
-        assert_eq!(found[2]["from"], "2025-06-06");
+        assert_eq!(field(&found[0], "from"), "2025-06-02");
+        assert_eq!(field(&found[0], "to"), "2025-06-03");
+        assert_eq!(field(&found[1], "status"), "failed");
+        assert_eq!(field(&found[2], "from"), "2025-06-06");
     }
 
     #[test]

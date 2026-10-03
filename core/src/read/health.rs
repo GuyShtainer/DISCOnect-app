@@ -23,6 +23,7 @@ use super::queries::{self, iso, json_number, number, text};
 use crate::contract::Contract;
 use crate::model::Instant;
 use crate::redact::redact_text;
+use crate::wirejson::{self, Json, PyStr};
 use crate::writer::{py_round, py_sum};
 
 /// `serve.DEFAULT_HEALTH_DAYS`.
@@ -70,6 +71,11 @@ impl Late {
         Ok(self.cell(row.get_ref(index)?))
     }
 
+    /// [`Late::column`] as the ordered wire value.
+    fn json(&mut self, row: &Row<'_>, index: usize) -> Result<Json, ReadError> {
+        Ok(wirejson::from_serde(&self.column(row, index)?))
+    }
+
     fn finish(self) -> Result<(), ReadError> {
         self.0.map_or(Ok(()), Err)
     }
@@ -84,14 +90,17 @@ fn redacted(cell: ValueRef<'_>) -> Result<Value, ReadError> {
     }
 }
 
-/// `_rows`: every row of `sql` as an object keyed by the statement's own column names.
+/// One row as Python's `dict(zip(names, row))`: the statement's column order.
+type Row_ = Vec<(String, Value)>;
+
+/// `_rows`: every row of `sql` keyed by the statement's own column names, in the statement's order.
 fn rows_of(
     conn: &Connection,
     sql: &str,
     params: impl rusqlite::Params,
     late: &mut Late,
     redact: &[&str],
-) -> Result<Vec<Map<String, Value>>, ReadError> {
+) -> Result<Vec<Row_>, ReadError> {
     let mut statement = conn.prepare(sql)?;
     let names: Vec<String> = statement
         .column_names()
@@ -101,14 +110,14 @@ fn rows_of(
     let mut rows = statement.query(params)?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let mut object = Map::new();
+        let mut object = Row_::new();
         for (index, name) in names.iter().enumerate() {
             let value = if redact.contains(&name.as_str()) {
                 redacted(row.get_ref(index)?)?
             } else {
                 late.column(row, index)?
             };
-            object.insert(name.clone(), value);
+            object.push((name.clone(), value));
         }
         out.push(object);
     }
@@ -116,8 +125,17 @@ fn rows_of(
 }
 
 /// `round(value, 3)` as a JSON number (a non-finite one cannot be written: `ValueError`).
-fn round3(value: f64) -> Result<Value, ReadError> {
-    json_number(py_round(value, 3))
+fn round3(value: f64) -> Result<Json, ReadError> {
+    Ok(wirejson::from_serde(&json_number(py_round(value, 3))?))
+}
+
+/// A row as the ordered wire object.
+fn row_json(row: Row_) -> Json {
+    Json::Object(
+        row.into_iter()
+            .map(|(name, value)| (PyStr::from_text(&name), wirejson::from_serde(&value)))
+            .collect(),
+    )
 }
 
 type PairKey = (String, Option<String>, String, String);
@@ -127,6 +145,17 @@ type PairKey = (String, Option<String>, String, String);
 /// vendor's id for the same quantity). The first join is ordered (`ORDER BY a.date, ...`), because the
 /// mean is a floating-point sum whose result depends on order.
 pub fn source_agreement(conn: &Connection, contract: &Contract) -> Result<Vec<Value>, ReadError> {
+    source_agreement_ordered(conn, contract)?
+        .iter()
+        .map(|row| row.to_serde().ok_or(ReadError::Unexpected("TypeError")))
+        .collect()
+}
+
+/// [`source_agreement`] with each row's keys in the order `health.source_agreement` inserts them.
+pub fn source_agreement_ordered(
+    conn: &Connection,
+    contract: &Contract,
+) -> Result<Vec<Json>, ReadError> {
     let mut pairs: BTreeMap<PairKey, Vec<(f64, f64)>> = BTreeMap::new();
     {
         let mut statement = conn.prepare(
@@ -195,39 +224,62 @@ pub fn source_agreement(conn: &Connection, contract: &Contract) -> Result<Vec<Va
         else {
             continue; // unreachable: a pair exists only with at least one row
         };
-        report.push(json!({
-            "metric": metric,
-            "compared_with": compared_with,
-            "unit": contract.unit_for(&metric),
-            "scope_a": scope_a,
-            "scope_b": scope_b,
-            "days_compared": values.len(),
-            "days_matching": matching,
-            "median_abs_diff": round3(*median)?,
-            "max_abs_diff": round3(*largest)?,
-            "mean_diff_a_minus_b": round3(py_sum(diffs.iter().copied()) / diffs.len() as f64)?,
-        }));
+        report.push(Json::object([
+            ("metric", Json::text(&metric)),
+            (
+                "compared_with",
+                compared_with.as_deref().map_or(Json::Null, Json::text),
+            ),
+            (
+                "unit",
+                contract.unit_for(&metric).map_or(Json::Null, Json::text),
+            ),
+            ("scope_a", Json::text(&scope_a)),
+            ("scope_b", Json::text(&scope_b)),
+            ("days_compared", Json::count(values.len())),
+            ("days_matching", Json::count(matching)),
+            ("median_abs_diff", round3(*median)?),
+            ("max_abs_diff", round3(*largest)?),
+            (
+                "mean_diff_a_minus_b",
+                round3(py_sum(diffs.iter().copied()) / diffs.len() as f64)?,
+            ),
+        ]));
     }
     Ok(report)
 }
 
 /// `{days_with_data, first_day, last_day}` for one group of a stored-day aggregate.
-fn span(late: &mut Late, row: &Row<'_>, first: usize) -> Result<Value, ReadError> {
-    Ok(json!({
-        "days_with_data": late.column(row, first)?,
-        "first_day": late.column(row, first + 1)?,
-        "last_day": late.column(row, first + 2)?,
-    }))
+fn span(late: &mut Late, row: &Row<'_>, first: usize) -> Result<Json, ReadError> {
+    Ok(Json::object([
+        ("days_with_data", late.json(row, first)?),
+        ("first_day", late.json(row, first + 1)?),
+        ("last_day", late.json(row, first + 2)?),
+    ]))
 }
 
 /// `data_health(conn, window_days)`: coverage, provenance and recent imports as plain data (the
-/// oracle's `conventions` block is part of the result; `serve` drops it). `now` is the one clock.
+/// oracle's `conventions` block is part of the result; `serve` drops it). `now` is the one clock. Object keys
+/// are sorted (the `serve` wire form); [`data_health_ordered`] keeps Python's insertion order.
 pub fn data_health(
     conn: &Connection,
     contract: &Contract,
     window_days: i64,
     now: Instant,
 ) -> Result<Value, ReadError> {
+    data_health_ordered(conn, contract, window_days, now)?
+        .to_serde()
+        .ok_or(ReadError::Unexpected("TypeError"))
+}
+
+/// [`data_health`] with every object's keys in the order `health.data_health` inserts them, so the MCP's
+/// `text` is the oracle's byte for byte. Groups that Python builds from a query keep the query's row order.
+pub fn data_health_ordered(
+    conn: &Connection,
+    contract: &Contract,
+    window_days: i64,
+    now: Instant,
+) -> Result<Json, ReadError> {
     let window_days = window_days.clamp(1, MAX_HEALTH_DAYS);
     let today = iso(now.date_naive());
     let since = Duration::try_days(window_days)
@@ -236,7 +288,7 @@ pub fn data_health(
         .ok_or(ReadError::Overflow)?;
     let mut late = Late::default();
 
-    let mut streams = Map::new();
+    let mut streams = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT stream, COUNT(*), MIN(start_utc), MAX(end_utc) FROM raw_records GROUP BY stream",
@@ -244,18 +296,19 @@ pub fn data_health(
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let stream = text(row.get_ref(0)?)?.to_string();
-            streams.insert(
-                stream,
-                json!({
-                    "records": late.column(row, 1)?,
-                    "first": late.column(row, 2)?,
-                    "last": late.column(row, 3)?,
-                }),
+            streams.set(
+                &stream,
+                Json::object([
+                    ("records", late.json(row, 1)?),
+                    ("first", late.json(row, 2)?),
+                    ("last", late.json(row, 3)?),
+                ]),
             );
         }
     }
+    let never_imported = matches!(&streams, Json::Object(pairs) if pairs.is_empty());
 
-    let provenance: Vec<Value> = rows_of(
+    let provenance: Vec<Json> = rows_of(
         conn,
         "SELECT * FROM stream_provenance ORDER BY stream",
         [],
@@ -263,10 +316,10 @@ pub fn data_health(
         &["last_parse_error_message", "last_write_error_message"],
     )?
     .into_iter()
-    .map(Value::Object)
+    .map(row_json)
     .collect();
 
-    let mut samples_total: BTreeMap<String, Value> = BTreeMap::new();
+    let mut samples_total = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT metric, COUNT(DISTINCT substr(ts_utc,1,10)), MIN(substr(ts_utc,1,10)), \
@@ -275,10 +328,10 @@ pub fn data_health(
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let metric = text(row.get_ref(0)?)?.to_string();
-            samples_total.insert(metric, span(&mut late, row, 1)?);
+            samples_total.set(&metric, span(&mut late, row, 1)?);
         }
     }
-    let mut samples_window: BTreeMap<String, Value> = BTreeMap::new();
+    let mut samples_window = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT metric, COUNT(DISTINCT substr(ts_utc,1,10)) FROM metric_samples \
@@ -287,11 +340,11 @@ pub fn data_health(
         let mut rows = statement.query([&since])?;
         while let Some(row) = rows.next()? {
             let metric = text(row.get_ref(0)?)?.to_string();
-            samples_window.insert(metric, late.column(row, 1)?);
+            samples_window.set(&metric, late.json(row, 1)?);
         }
     }
 
-    let mut daily_total: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut daily_total = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT metric, source_scope, COUNT(*), MIN(date), MAX(date) FROM daily_metrics \
@@ -301,13 +354,11 @@ pub fn data_health(
         while let Some(row) = rows.next()? {
             let metric = text(row.get_ref(0)?)?.to_string();
             let scope = text(row.get_ref(1)?)?.to_string();
-            daily_total
-                .entry(metric)
-                .or_default()
-                .insert(scope, span(&mut late, row, 2)?);
+            let found = span(&mut late, row, 2)?;
+            set_nested(&mut daily_total, &metric, &scope, found);
         }
     }
-    let mut daily_window: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut daily_window = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT metric, source_scope, COUNT(*) FROM daily_metrics WHERE date >= ? \
@@ -317,14 +368,12 @@ pub fn data_health(
         while let Some(row) = rows.next()? {
             let metric = text(row.get_ref(0)?)?.to_string();
             let scope = text(row.get_ref(1)?)?.to_string();
-            daily_window
-                .entry(metric)
-                .or_default()
-                .insert(scope, late.column(row, 2)?);
+            let found = late.json(row, 2)?;
+            set_nested(&mut daily_window, &metric, &scope, found);
         }
     }
 
-    let mut sleep = Map::new();
+    let mut sleep = Json::dict();
     {
         let mut statement = conn.prepare(
             "SELECT source_scope, COUNT(*), MIN(date), MAX(date) FROM sleep_sessions GROUP BY source_scope",
@@ -332,13 +381,13 @@ pub fn data_health(
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let scope = text(row.get_ref(0)?)?.to_string();
-            sleep.insert(
-                scope,
-                json!({
-                    "nights": late.column(row, 1)?,
-                    "first_day": late.column(row, 2)?,
-                    "last_day": late.column(row, 3)?,
-                }),
+            sleep.set(
+                &scope,
+                Json::object([
+                    ("nights", late.json(row, 1)?),
+                    ("first_day", late.json(row, 2)?),
+                    ("last_day", late.json(row, 3)?),
+                ]),
             );
         }
     }
@@ -347,12 +396,12 @@ pub fn data_health(
     let offsets: i64 =
         conn.query_row("SELECT COUNT(*) FROM clock_offsets", [], |row| row.get(0))?;
 
-    let runs: Vec<Value> = recent_runs(conn, &mut late)?
+    let runs: Vec<Json> = recent_runs(conn, &mut late)?
         .into_iter()
-        .map(Value::Object)
+        .map(row_json)
         .collect();
 
-    let metrics: Vec<Value> = contract
+    let metrics: Vec<Json> = contract
         .metrics
         .iter()
         .map(|item| {
@@ -361,58 +410,85 @@ pub fn data_health(
                     samples_total
                         .get(&item.metric)
                         .cloned()
-                        .unwrap_or(Value::Null),
+                        .unwrap_or(Json::Null),
                     samples_window
                         .get(&item.metric)
                         .cloned()
-                        .unwrap_or(json!(0)),
+                        .unwrap_or(Json::int(0)),
                 )
             } else {
                 (
-                    daily_total
+                    daily_total.get(&item.metric).cloned().unwrap_or(Json::Null),
+                    daily_window
                         .get(&item.metric)
                         .cloned()
-                        .map_or(Value::Null, Value::Object),
-                    Value::Object(daily_window.get(&item.metric).cloned().unwrap_or_default()),
+                        .unwrap_or_else(Json::dict),
                 )
             };
-            json!({"metric": item.metric, "unit": item.unit, "cadence": item.cadence,
-                   "total": total, "days_in_window": days_in_window})
+            Json::object([
+                ("metric", Json::text(&item.metric)),
+                ("unit", Json::text(&item.unit)),
+                ("cadence", Json::text(&item.cadence)),
+                ("total", total),
+                ("days_in_window", days_in_window),
+            ])
         })
         .collect();
 
     let local_today = queries::local_today_at(conn, now)?;
-    let ledger = coverage::ledger(conn, contract, &local_today, window_days)?;
+    let ledger = coverage::ledger_ordered(conn, contract, &local_today, window_days)?;
     let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let agreement = source_agreement(conn, contract)?;
+    let agreement = source_agreement_ordered(conn, contract)?;
     late.finish()?;
     let conventions = &contract.conventions;
-    Ok(json!({
-        "contract_version": contract.contract_version,
-        "coverage": ledger,
-        "schema_version": schema_version,
-        "window": {"days": window_days, "from": since, "to": today},
-        "never_imported": streams.is_empty(),
-        "streams": streams,
-        "provenance": provenance,
-        "metrics": metrics,
-        "sleep": sleep,
-        "activities": activities,
-        "clock_offsets_known": offsets,
-        "source_agreement": agreement,
-        "recent_imports": runs,
-        "conventions": {
-            "time": conventions.time,
-            "missing_values": conventions.missing_values,
-            "sources": conventions.sources,
-            "coverage": conventions.coverage,
-        },
-    }))
+    Ok(Json::object([
+        ("contract_version", Json::text(&contract.contract_version)),
+        ("coverage", ledger),
+        ("schema_version", Json::int(schema_version)),
+        (
+            "window",
+            Json::object([
+                ("days", Json::int(window_days)),
+                ("from", Json::text(&since)),
+                ("to", Json::text(&today)),
+            ]),
+        ),
+        ("never_imported", Json::flag(never_imported)),
+        ("streams", streams),
+        ("provenance", Json::Array(provenance)),
+        ("metrics", Json::Array(metrics)),
+        ("sleep", sleep),
+        ("activities", Json::int(activities)),
+        ("clock_offsets_known", Json::int(offsets)),
+        ("source_agreement", Json::Array(agreement)),
+        ("recent_imports", Json::Array(runs)),
+        (
+            "conventions",
+            Json::object([
+                ("time", Json::text(&conventions.time)),
+                ("missing_values", Json::text(&conventions.missing_values)),
+                ("sources", Json::text(&conventions.sources)),
+                ("coverage", Json::text(&conventions.coverage)),
+            ]),
+        ),
+    ]))
+}
+
+/// `groups.setdefault(metric, {})[scope] = value`, in insertion order.
+fn set_nested(groups: &mut Json, metric: &str, scope: &str, value: Json) {
+    if groups.get(metric).is_none() {
+        groups.set(metric, Json::dict());
+    }
+    if let Json::Object(pairs) = groups
+        && let Some((_, inner)) = pairs.iter_mut().find(|(name, _)| name.equals(metric))
+    {
+        inner.set(scope, value);
+    }
 }
 
 /// The newest [`LAST_IMPORTS`] runs with their 11 columns, `error` redacted (`data_health`'s
 /// `recent_imports` and, with a `failures` count added, `import.last`).
-fn recent_runs(conn: &Connection, late: &mut Late) -> Result<Vec<Map<String, Value>>, ReadError> {
+fn recent_runs(conn: &Connection, late: &mut Late) -> Result<Vec<Row_>, ReadError> {
     let sql = format!(
         "SELECT {} FROM import_runs ORDER BY id DESC LIMIT ?",
         RUN_COLUMNS.join(", ")
@@ -425,7 +501,10 @@ fn recent_runs(conn: &Connection, late: &mut Late) -> Result<Vec<Map<String, Val
 pub fn import_last(conn: &Connection) -> Result<Value, ReadError> {
     let has_failures = has_table(conn, "import_failures")?;
     let mut late = Late::default();
-    let mut runs = recent_runs(conn, &mut late)?;
+    let mut runs: Vec<Map<String, Value>> = recent_runs(conn, &mut late)?
+        .into_iter()
+        .map(|row| row.into_iter().collect())
+        .collect();
     for run in &mut runs {
         let failures: i64 = if has_failures {
             // an id that is not an integer matches no failure row
