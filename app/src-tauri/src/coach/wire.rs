@@ -251,11 +251,17 @@ pub fn tool_specs() -> &'static [ToolSpec] {
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    /// Omitted from the body when empty (the probe's context round offers no tools).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
-    pub tool_choice: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<&'static str>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Only the probe sets it (`1`: the context round wants the prompt token count, not an answer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl ChatRequest {
@@ -265,10 +271,16 @@ impl ChatRequest {
             model: model.to_string(),
             messages,
             tools: tool_specs().to_vec(),
-            tool_choice: "auto",
+            tool_choice: Some("auto"),
             stream: false,
             temperature: None,
+            max_tokens: None,
         }
+    }
+
+    /// A request that offers no tools and caps the answer at `max_tokens`: the probe's context round.
+    pub fn without_tools(model: &str, messages: Vec<Message>, max_tokens: u32) -> ChatRequest {
+        ChatRequest { tools: Vec::new(), tool_choice: None, max_tokens: Some(max_tokens), ..ChatRequest::new(model, messages) }
     }
 
     /// The JSON bytes that go on the wire.

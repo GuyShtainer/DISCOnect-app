@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 use super::chat_loop::{self, Conversation, ToolCallError, TraceEntry};
 use super::egress::EgressError;
 use super::key::{self, KeyError, KeyHolder, KeyState};
-use super::settings::{self, Settings, SettingsError};
+use super::probe::{self, ProbeReport};
+use super::settings::{self, Mode, Settings, SettingsError};
 
 /// What a failed coach command tells the webview. Both strings come from closed enums.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -185,6 +186,25 @@ fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Resu
     );
     let trace = conversation.trace.clone();
     answer.map(|text| CoachReply { text, trace }).map_err(CoachError::from)
+}
+
+/// Test the endpoint (slice 6): two synthetic requests, no tool, no core call, so a locked store is fine. The
+/// settings gate runs first (off is [`CoachError`] `off`); a cloud endpoint without a key is `no_key`, the same
+/// answer a question gets.
+#[tauri::command]
+pub async fn coach_probe(app: tauri::AppHandle) -> Result<ProbeReport, CoachErrorDto> {
+    let settings = config_dir(&app).map(|dir| settings::load(&dir)).unwrap_or_default();
+    chat_loop::gate(&settings)?;
+    let bearer = app.state::<KeyHolder>().resolve();
+    if settings.mode == Mode::Cloud && bearer.is_none() {
+        return Err(chat_loop::CoachError::NoKey.into());
+    }
+    tauri::async_runtime::spawn_blocking(move || match super::provider(&settings) {
+        Some(egress) => Ok(probe::probe(egress.as_ref(), &settings, bearer.as_ref())),
+        None => Err(CoachError::from(EgressError::BadUrl)),
+    })
+    .await
+    .map_err(|_| CoachError::from(KeyError::Busy))?
 }
 
 /// Forget the conversation and its trace.

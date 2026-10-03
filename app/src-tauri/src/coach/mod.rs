@@ -9,6 +9,8 @@
 //! The loop (slice 5): [`prompt`] is the system prompt, [`wire`] the chat-completions format, [`chat_loop`] one
 //! question end to end with its window manager, [`commands::coach_ask`] the Tauri command over it.
 //!
+//! The probe (slice 6): [`probe`] asks an endpoint whether it calls tools and how much prompt it reads.
+//!
 //! Provider plumbing (slice 4): [`settings`] holds the non-secret provider settings (`Off` by default),
 //! [`key`] the user's key (OS keychain or session memory), [`egress`] the one choke point. [`provider`] is
 //! how a caller gets an egress: `None` means the coach is off and the caller must send nothing.
@@ -18,6 +20,7 @@ pub mod commands;
 pub mod egress;
 pub mod egress_guard;
 pub mod key;
+pub mod probe;
 pub mod prompt;
 pub mod schema;
 pub mod settings;
