@@ -186,10 +186,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct Sidecar(Arc<Inner>);
 
-/// Timeout per method family. Imports run as long as they need; key operations may wait on a
+/// Timeout per method family. Imports and `sync.run` (a pull over the LAN can be long) run as long as they need; key operations may wait on a
 /// keychain prompt; everything else is a read.
 pub fn timeout_for(method: &str) -> Option<Duration> {
-    if method.starts_with("import.") {
+    if method.starts_with("import.") || method == "sync.run" {
         None
     } else if method.starts_with("key.") {
         Some(Duration::from_secs(60))
@@ -565,6 +565,33 @@ pub fn plan(choice: Option<CoreChoice>, debug_build: bool, desktop: bool, env_co
     }
 }
 
+/// The test switches the core reads from its own environment (`DISCONECT_NOW` pins the clock,
+/// `DISCONECT_KEYCHAIN` redirects or disables the keychain). The sidecar's environment allowlist
+/// strips them; an in-process core would see the app's own.
+pub const INPROC_TEST_SWITCHES: [&str; 2] = ["DISCONECT_NOW", "DISCONECT_KEYCHAIN"];
+
+/// Whether the in-process core must refuse to start because a test switch is set: only in a
+/// **release** build on the **desktop**, where a user's shell can set them and `--core inproc` is
+/// an explicit choice. A debug build is the developer's own; a phone's environment cannot be set by
+/// a user shell, so in-process stays allowed there. The answer names the variable, never its value.
+/// Pure: the environment arrives through `getter` (`remove_var` is never used).
+pub fn inproc_env_refusal(
+    debug_build: bool,
+    desktop: bool,
+    getter: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<&'static str> {
+    if debug_build || !desktop {
+        return None;
+    }
+    if getter(INPROC_TEST_SWITCHES[0]).is_some() {
+        return Some("DISCONECT_NOW is set; a release app will not run the in-process core with a test switch (unset it, or use the bundled core)");
+    }
+    if getter(INPROC_TEST_SWITCHES[1]).is_some() {
+        return Some("DISCONECT_KEYCHAIN is set; a release app will not run the in-process core with a test switch (unset it, or use the bundled core)");
+    }
+    None
+}
+
 /// Where the core lives: a bundled sidecar under the app's resources, `disconect-core` first,
 /// `hearthbeat-core` as the fallback, or exactly the one `--core` names. Debug builds, when no
 /// `--core` is given, also honour `DISCONECT_CORE` (an executable path) first and fall back to
@@ -669,6 +696,34 @@ mod tests {
         assert_eq!(timeout_for("import.run"), None);
         assert_eq!(timeout_for("key.status"), Some(Duration::from_secs(60)));
         assert_eq!(timeout_for("data.metric"), Some(Duration::from_secs(30)));
+        assert_eq!(timeout_for("sync.run"), None);
+        assert_eq!(timeout_for("sync.status"), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn the_in_process_core_refuses_test_switches_only_in_a_release_desktop_build() {
+        use std::ffi::OsString;
+        let env = |set: &'static [&'static str]| {
+            move |name: &str| set.contains(&name).then(|| OsString::from("secret-value-xyz"))
+        };
+        for (debug, desktop, set, refused) in [
+            (true, true, &["DISCONECT_NOW"][..], false),
+            (true, true, &["DISCONECT_KEYCHAIN"][..], false),
+            (true, false, &["DISCONECT_NOW"][..], false),
+            (false, false, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN"][..], false),
+            (false, true, &[][..], false),
+            (false, true, &["DISCONECT_NOW"][..], true),
+            (false, true, &["DISCONECT_KEYCHAIN"][..], true),
+            (false, true, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN"][..], true),
+            (false, true, &["DISCONECT_CORE", "DISCONECT_DB"][..], false),
+        ] {
+            let answer = inproc_env_refusal(debug, desktop, env(set));
+            assert_eq!(answer.is_some(), refused, "debug={debug} desktop={desktop} set={set:?}");
+            if let Some(text) = answer {
+                assert!(set.iter().any(|name| text.starts_with(name)), "names the variable: {text}");
+                assert!(!text.contains("secret-value-xyz"), "never the value: {text}");
+            }
+        }
     }
 
     #[test]

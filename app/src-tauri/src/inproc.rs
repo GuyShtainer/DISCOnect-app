@@ -12,9 +12,10 @@
 //! `disconect-core`'s `serve_never_reaches_the_environment_passphrase` fails if one appears, so the
 //! sidecar's env allowlist has no in-process counterpart that is needed. What the core does see is
 //! the app's own environment: `HOME`, `DISCONECT_DB`/`DISCONECT_KEYS` (path resolution), and the
-//! test switches `DISCONECT_NOW` and `DISCONECT_KEYCHAIN`, which a release app launched from a
-//! shell would honour; the sidecar's allowlist stripped them. Release builds default to the
-//! sidecar for exactly that reason (and for the keychain binding, see the README).
+//! test switches `DISCONECT_NOW` and `DISCONECT_KEYCHAIN`, which the sidecar's allowlist strips.
+//! Release builds default to the sidecar for that reason (and for the keychain binding, see the
+//! README), and a release desktop app run with `--core inproc` refuses to start while either
+//! switch is set (`sidecar::inproc_env_refusal`, called from `start_core`; Bet 12 review F2).
 //!
 //! The database path is always passed in: the app resolves it (`home::resolve_default_db` on the
 //! desktop, `app_data_dir()` on a phone); the core is never left to look at `$HOME` itself.

@@ -152,7 +152,12 @@ fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
     let choice = None; // a phone's argv is not ours
     let env_core = std::env::var_os("DISCONECT_CORE");
     match sidecar::plan(choice, cfg!(debug_assertions), cfg!(desktop), env_core.as_deref()) {
-        Plan::InProcess => start_inproc(app),
+        Plan::InProcess => {
+            if let Some(reason) = sidecar::inproc_env_refusal(cfg!(debug_assertions), cfg!(desktop), |name| std::env::var_os(name)) {
+                return Err(CoreError { code: "core_unavailable".into(), message: reason.into() });
+            }
+            start_inproc(app)
+        }
         #[cfg(desktop)]
         Plan::Sidecar(choice) => start_sidecar(app, choice),
         #[cfg(not(desktop))]
