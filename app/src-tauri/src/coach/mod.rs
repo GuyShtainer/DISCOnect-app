@@ -6,6 +6,7 @@
 //! [`views::project`] (an allowlist projection), [`schema::validate`] (a fail-closed positive schema) and
 //! [`caps::fit`] (byte budgets).
 
+pub mod caps;
 pub mod egress;
 pub mod egress_guard;
 pub mod prompt;
