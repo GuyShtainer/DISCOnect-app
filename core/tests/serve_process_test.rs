@@ -310,3 +310,49 @@ fn serve_rejects_the_cli_only_flags() {
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("serve takes only --db"));
 }
+
+/// F1b of the Bet 02a review: `serve` resolved the legacy folder, `migrate-home` moved it underneath the
+/// idle process, and the next `import.run` used to re-create `~/.hearthbeat/hearthbeat.db` as a new
+/// store (split data). It must be refused, and the old folder must stay absent.
+#[test]
+fn a_moved_legacy_folder_is_never_recreated_by_a_later_import() {
+    let home = tempfile::tempdir().expect("home");
+    let legacy = home.path().join(".hearthbeat");
+    std::fs::create_dir(&legacy).expect("mkdir");
+    std::fs::write(legacy.join("hearthbeat.db"), b"").expect("empty store");
+    let source = home.path().join("export");
+    std::fs::create_dir(&source).expect("export dir");
+
+    let mut command = binary();
+    command.env("HOME", home.path());
+    let mut child = command.spawn().expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut ask = |id: i64, method: &str, params: Value| -> Value {
+        let line = serde_json::json!({"id": id, "method": method, "params": params});
+        stdin.write_all(format!("{line}\n").as_bytes()).expect("write");
+        loop {
+            let mut text = String::new();
+            reader.read_line(&mut text).expect("a line");
+            let reply: Value = serde_json::from_str(&text).expect("protocol json");
+            if reply["id"] == id {
+                return reply;
+            }
+        }
+    };
+    assert_eq!(ask(1, "app.info", serde_json::json!({}))["result"]["product"], "DISCOnect");
+
+    // what `migrate-home` does underneath an idle process
+    std::fs::rename(legacy.join("hearthbeat.db"), legacy.join("disconect.db")).expect("rename db");
+    std::fs::rename(&legacy, home.path().join(".disconect")).expect("move folder");
+
+    let reply = ask(2, "import.run", serde_json::json!({"path": source}));
+    assert_eq!(reply["error"]["code"], "not_found", "{reply}");
+    assert_eq!(
+        reply["error"]["message"],
+        "data folder ~/.hearthbeat has moved; restart DISCOnect"
+    );
+    assert!(!legacy.exists(), "the old folder must not come back");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+}

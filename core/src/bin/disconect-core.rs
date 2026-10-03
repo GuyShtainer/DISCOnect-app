@@ -35,6 +35,7 @@ use zeroize::Zeroizing;
 
 const EXIT_LOCKED: u8 = 9;
 const EXIT_USAGE: u8 = 2;
+const EXIT_NOT_CONFIGURED: u8 = 3;
 const EXIT_BUSY: u8 = 4;
 const EXIT_DATABASE: u8 = 6;
 const EXIT_SCHEMA: u8 = 7;
@@ -104,6 +105,8 @@ fn read_passphrase(path: &PathBuf) -> Result<Zeroizing<String>, String> {
 fn exit_code_for(err: &StoreError) -> u8 {
     match err {
         StoreError::Key(KeyError::Locked | KeyError::WrongPassphrase) | StoreError::Encrypted(_) => EXIT_LOCKED,
+        // the Python CLI's "not configured" code
+        StoreError::HomeMoved(_) | StoreError::Lock(LockError::HomeMoved(_)) => EXIT_NOT_CONFIGURED,
         _ => 1,
     }
 }
@@ -195,6 +198,9 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
             "folder".to_string(),
             disconect_core::canon::Value::Str(folder.clone()),
         )]));
+        if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
+            return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
+        }
         let write = || -> std::io::Result<()> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;

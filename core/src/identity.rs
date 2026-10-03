@@ -20,6 +20,8 @@ pub const DB_FILENAME: &str = "disconect.db";
 pub const ENV_PREFIX: &str = "DISCONECT_";
 /// The Python core's keychain service (never used by this crate; kept here for the drift pin).
 pub const CLI_KEYCHAIN_SERVICE: &str = "disconect-cli";
+/// Service names an earlier build's Python core used (never used by this crate; kept for the drift pin).
+pub const LEGACY_CLI_KEYCHAIN_SERVICES: &[&str] = &["hearthbeat"];
 pub const MCP_SERVER_NAME: &str = "disconect";
 pub const COMMAND: &str = "disconect";
 /// Earlier builds' folders and backup prefixes, read through and never written.

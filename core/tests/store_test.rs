@@ -152,3 +152,40 @@ fn cli_exits_9_when_locked_or_wrong() {
     let msg = String::from_utf8_lossy(&wrong.stderr);
     assert!(msg.starts_with("error: ") && msg.lines().count() == 1);
 }
+
+#[test]
+fn a_writer_never_recreates_a_moved_legacy_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".hearthbeat").join("hearthbeat.db");
+    match store::open_for_write(&db, "import", 0.1, PassphraseSource::Env) {
+        Err(StoreError::HomeMoved(moved)) => {
+            assert_eq!(moved.to_string(), "data folder ~/.hearthbeat has moved; restart DISCOnect");
+        }
+        other => panic!("expected HomeMoved, got {other:?}"),
+    }
+    match write_lock::acquire(&db, "x", Duration::from_millis(100)) {
+        Err(LockError::HomeMoved(_)) => {}
+        other => panic!("expected the lock to refuse too, got {:?}", other.map(|_| ())),
+    }
+    assert!(!dir.path().join(".hearthbeat").exists());
+    // any other missing folder is still created, the new data folder included
+    for folder in [".disconect", "fresh"] {
+        let ok = dir.path().join(folder).join("x.db");
+        assert!(store::open_for_write(&ok, "t", 1.0, PassphraseSource::Env).is_ok());
+        assert!(ok.is_file());
+    }
+}
+
+#[test]
+fn cli_import_into_a_moved_legacy_folder_exits_3_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join(".hearthbeat").join("hearthbeat.db");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"))
+        .env_clear()
+        .env("DISCONECT_KEYCHAIN", "fail")
+        .arg("--db").arg(&db).args(["import", "/nonexistent"])
+        .output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("data folder ~/.hearthbeat has moved; restart DISCOnect"));
+    assert!(!dir.path().join(".hearthbeat").exists());
+}

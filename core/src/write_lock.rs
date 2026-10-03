@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde_json::{Value, json};
 
+use crate::home::{self, HomeMoved};
 use crate::identity::PRODUCT;
 use crate::keys::sibling_with_suffix;
 use crate::time::utc_now_iso;
@@ -21,6 +22,8 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(120);
 pub enum LockError {
     #[error("{}", busy_message(.holder))]
     Busy { holder: Option<Value> },
+    #[error(transparent)]
+    HomeMoved(#[from] HomeMoved),
     #[error("write lock I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -59,6 +62,9 @@ pub struct WriteLock {
 pub fn acquire(db_path: &Path, purpose: &str, timeout: Duration) -> Result<WriteLock, LockError> {
     let lock_path = lock_path_for(db_path);
     let holder_path = holder_path_for(db_path);
+    if let Some(moved) = home::moved_legacy_home(&lock_path) {
+        return Err(moved.into());
+    }
     if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }

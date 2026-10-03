@@ -4,12 +4,15 @@
 //!
 //! Nothing here creates, renames or moves anything (it runs from `serve` start-up and every app
 //! launch). Moving the old folder is `disconect migrate-home` (Python only).
+//!
+//! A *writer* must never re-create an old folder that `migrate-home` moved away underneath a running
+//! process: [`moved_legacy_home`] is the check every writer makes before its `create_dir_all`.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::identity::{
-    COMMAND, DATA_DIR, DB_FILENAME, ENV_PREFIX, LEGACY_DB_FILENAME, LEGACY_ENV_PREFIX, LEGACY_HOMES,
+    COMMAND, DATA_DIR, DB_FILENAME, ENV_PREFIX, LEGACY_DB_FILENAME, LEGACY_ENV_PREFIX, LEGACY_HOMES, PRODUCT,
 };
 
 /// The variable that pins the database path.
@@ -47,12 +50,16 @@ pub fn resolve_in(home: Option<&Path>, db_env: Option<&OsStr>) -> Option<Default
     let current = home.join(DATA_DIR).join(DB_FILENAME);
     if !current.is_file() {
         for legacy in LEGACY_HOMES {
-            let candidate = home.join(legacy).join(LEGACY_DB_FILENAME);
-            if candidate.is_file() {
-                return Some(DefaultDb {
-                    path: candidate,
-                    legacy_home: Some(legacy),
-                });
+            // the database under its old name, or under its new one in a half-done `migrate-home`
+            // (siblings renamed, folder not yet)
+            for name in [LEGACY_DB_FILENAME, DB_FILENAME] {
+                let candidate = home.join(legacy).join(name);
+                if candidate.is_file() {
+                    return Some(DefaultDb {
+                        path: candidate,
+                        legacy_home: Some(legacy),
+                    });
+                }
             }
         }
     }
@@ -74,6 +81,29 @@ pub fn resolve_default_db() -> Option<DefaultDb> {
 /// The resolved default store's path.
 pub fn default_db_path() -> Option<PathBuf> {
     resolve_default_db().map(|d| d.path)
+}
+
+/// A writer was pointed into an old data folder that is gone: `migrate-home` moved it, and creating it
+/// again would start a second, empty store next to the moved one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("data folder ~/{folder} has moved; restart {PRODUCT}")]
+pub struct HomeMoved {
+    pub folder: &'static str,
+}
+
+/// `Some` when the folder of `path` is missing and is one of [`LEGACY_HOMES`]; callers refuse to
+/// `create_dir_all` it. Pure: looks, never creates.
+pub fn moved_legacy_home(path: &Path) -> Option<HomeMoved> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    if parent.is_dir() {
+        return None;
+    }
+    let name = parent.file_name()?.to_str()?;
+    LEGACY_HOMES
+        .iter()
+        .copied()
+        .find(|legacy| *legacy == name)
+        .map(|folder| HomeMoved { folder })
 }
 
 /// `relay.json` lives in the folder of the resolved database file.
@@ -226,5 +256,30 @@ mod tests {
             legacy_env_warning(|n| n == "HEARTHBEAT_DB" || n == "HEARTHBEAT_KEYS").as_deref(),
             Some("warning: HEARTHBEAT_DB, HEARTHBEAT_KEYS are no longer read; set DISCONECT_DB, DISCONECT_KEYS instead")
         );
+    }
+
+    #[test]
+    fn a_half_done_migrate_home_resolves_to_the_renamed_db_in_the_old_folder() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let half = touch(&dir.path().join(".hearthbeat"), "disconect.db");
+        let got = resolve_in(Some(dir.path()), None).expect("resolved");
+        assert_eq!(got, DefaultDb { path: half, legacy_home: Some(".hearthbeat") });
+        // the old name still wins when both are there
+        let old = touch(&dir.path().join(".hearthbeat"), "hearthbeat.db");
+        let got = resolve_in(Some(dir.path()), None).expect("resolved");
+        assert_eq!(got.path, old);
+    }
+
+    #[test]
+    fn only_a_missing_legacy_folder_counts_as_moved() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let legacy = dir.path().join(".hearthbeat").join("hearthbeat.db");
+        let moved = moved_legacy_home(&legacy).expect("moved");
+        assert_eq!(moved.to_string(), "data folder ~/.hearthbeat has moved; restart DISCOnect");
+        assert_eq!(moved_legacy_home(&dir.path().join(".disconect/disconect.db")), None);
+        assert_eq!(moved_legacy_home(&dir.path().join("elsewhere/x.db")), None);
+        assert_eq!(moved_legacy_home(Path::new("x.db")), None);
+        std::fs::create_dir(dir.path().join(".hearthbeat")).expect("mkdir");
+        assert_eq!(moved_legacy_home(&legacy), None, "a folder that exists is not moved");
     }
 }

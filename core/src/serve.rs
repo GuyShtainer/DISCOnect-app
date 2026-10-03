@@ -60,6 +60,7 @@ use crate::redact::redact_text;
 use crate::sources::{self, SourceError};
 use crate::store::{self, StoreError};
 use crate::time::now_instant;
+use crate::write_lock::LockError;
 use crate::wirejson::{self, Id, Json, PyStr};
 
 /// What `app.info.core` says: this implementation, not Python's version string.
@@ -162,6 +163,11 @@ fn store_parts(error: &StoreError) -> (&'static str, String) {
             "not_found",
             format!("no {PRODUCT} database yet; run '{} import' first", identity::COMMAND),
         ),
+        // the old folder was moved by `migrate-home`: the closest existing code is `not_found` (the
+        // store is not where this process thinks), the text tells the user to restart
+        StoreError::HomeMoved(_) | StoreError::Lock(LockError::HomeMoved(_)) => {
+            ("not_found", error.to_string())
+        }
         StoreError::Encrypted(message) => ("locked", message.clone()),
         StoreError::NotEncrypted(_) => ("not_encrypted", error.to_string()),
         StoreError::SchemaTooNew { found } => (

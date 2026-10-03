@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::identity::{COMMAND, PRODUCT};
 use crate::keys::{self, KeyError, PassphraseSource, Secret32};
 use crate::time::utc_now_iso;
+use crate::home::{self, HomeMoved};
 use crate::write_lock::{self, LockError, WriteLock};
 
 /// Same as Python's `BUSY_TIMEOUT_MS`.
@@ -31,6 +32,8 @@ pub const MIGRATIONS: [(i64, &str); 3] = [
 pub enum StoreError {
     #[error("no {product} database yet at {0}", product = PRODUCT)]
     NotConfigured(String),
+    #[error(transparent)]
+    HomeMoved(#[from] HomeMoved),
     #[error("{0}")]
     Encrypted(String),
     #[error("{0} is plaintext but a key file exists; run '{cmd} encrypt' to convert it (or remove the key file if it is not yours)", cmd = COMMAND)]
@@ -182,7 +185,7 @@ impl Store {
     }
 }
 
-/// Writer open: create parent dirs, take the write lock, pragmas, refuse too-new, migrate.
+/// Writer open: create parent dirs (never an old data folder that has moved: `HomeMoved`), take the write lock, pragmas, refuse too-new, migrate.
 pub fn open_for_write(
     path: &Path,
     purpose: &str,
@@ -200,6 +203,9 @@ pub fn open_for_write_with(
     timeout_s: f64,
     master: Option<&Secret32>,
 ) -> Result<Store, StoreError> {
+    if let Some(moved) = home::moved_legacy_home(path) {
+        return Err(moved.into());
+    }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
