@@ -57,8 +57,12 @@ use crate::read::health;
 use crate::read::insight::{self, FactsQuery};
 use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
+use crate::relay::config as relay_config;
+use crate::relay::folder::{Relay, RelayError};
+use crate::relay::sync::{self as relay_sync, SyncError};
 use crate::sources::{self, SourceError};
 use crate::store::{self, StoreError};
+use crate::home;
 use crate::time::now_instant;
 use crate::write_lock::LockError;
 use crate::wirejson::{self, Id, Json, PyStr};
@@ -82,6 +86,7 @@ pub enum Failure {
     Contract(ContractError),
     Read(ReadError),
     Source(SourceError),
+    Sync(SyncError),
     Io(io::Error),
 }
 
@@ -114,6 +119,7 @@ impl Failure {
             Failure::Contract(_) => ("internal", "unexpected ContractError".into()),
             Failure::Read(error) => read_parts(error),
             Failure::Source(error) => source_parts(error),
+            Failure::Sync(error) => sync_parts(error),
             Failure::Io(error) => io_parts(error),
         }
     }
@@ -144,6 +150,45 @@ fn source_parts(error: &SourceError) -> (&'static str, String) {
                 other => ("internal", format!("unexpected {other}")),
             }
         }
+    }
+}
+
+/// A sync failure under the oracle's class-to-code map. A folder relay's I/O errors map as every
+/// other I/O error does; a network relay (Rust only) says `not_found` when it cannot be reached
+/// (the text says "unreachable"), `relay_auth_failed` when it refuses the token, `internal` with
+/// the HTTP status for anything else.
+fn sync_parts(error: &SyncError) -> (&'static str, String) {
+    match error {
+        SyncError::Db(inner) | SyncError::Writer(crate::writer::WriterError::Db(inner)) => {
+            ("database", format!("database error: {inner}"))
+        }
+        SyncError::Writer(crate::writer::WriterError::Compress(_)) => {
+            ("internal", "unexpected error".into())
+        }
+        SyncError::Source(inner) => source_parts(inner),
+        SyncError::Bundle(_) => ("internal", "unexpected ValueError".into()),
+        SyncError::Relay(inner) => relay_parts(inner),
+        SyncError::Abort(text) => {
+            let (class, message) = text.split_once(": ").unwrap_or((text.as_str(), ""));
+            match class {
+                "ValueError" | "UnicodeDecodeError" | "UnicodeEncodeError" | "JSONDecodeError" => {
+                    ("bad_params", message.to_string())
+                }
+                "FileNotFoundError" => ("not_found", message.to_string()),
+                other => ("internal", format!("unexpected {other}")),
+            }
+        }
+        SyncError::WriteFailed(_) => ("internal", "unexpected RecordWriteFailed".into()),
+    }
+}
+
+fn relay_parts(error: &RelayError) -> (&'static str, String) {
+    match error {
+        RelayError::Io(inner) => io_parts(inner),
+        RelayError::TooLarge | RelayError::BadName => ("bad_params", error.to_string()),
+        RelayError::Unreachable => ("not_found", error.to_string()),
+        RelayError::Unauthorized => ("relay_auth_failed", error.to_string()),
+        RelayError::Status(_) => ("internal", error.to_string()),
     }
 }
 
@@ -227,6 +272,11 @@ impl From<ReadError> for Failure {
 impl From<SourceError> for Failure {
     fn from(error: SourceError) -> Failure {
         Failure::Source(error)
+    }
+}
+impl From<SyncError> for Failure {
+    fn from(error: SyncError) -> Failure {
+        Failure::Sync(error)
     }
 }
 impl From<ContractError> for Failure {
@@ -407,6 +457,8 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("data.facts", Handler::Reply(data_facts)),
     ("import.run", Handler::Spawn(import_run)),
     ("import.last", Handler::Reply(import_last)),
+    ("sync.status", Handler::Reply(sync_status)),
+    ("sync.run", Handler::Spawn(sync_run)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -875,6 +927,151 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     match std::thread::Builder::new()
         .name("import".into())
         .spawn(move || import_worker(job))
+    {
+        Ok(handle) => {
+            session.workers.push(handle);
+            Ok(())
+        }
+        Err(error) => {
+            slot.store(false, Ordering::SeqCst);
+            Err(Failure::Io(error))
+        }
+    }
+}
+
+// ---- sync ----
+
+/// `relay.json` beside the store this session serves (the CLI reads the one beside the *default*
+/// store; a session serves the store it was started on).
+fn relay_json_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+        .join(home::RELAY_CONFIG_NAME)
+}
+
+/// The relay counts of the store (`sync status`): read-only, so a store older than the relay
+/// tables answers what a fresh one would.
+fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let store = session.reader()?;
+    let report = relay_sync::status_or_fresh(store.conn())?;
+    Ok(relay_sync::status_value(&report))
+}
+
+/// One sync request: everything the worker needs.
+struct SyncJob {
+    id: Id,
+    db_path: PathBuf,
+    master: Secret32,
+    relay: Box<dyn Relay + Send>,
+    channel: Arc<Channel>,
+    slot: Arc<AtomicBool>,
+}
+
+/// A `progress` event of `op` `sync`: `phase` is `push` or `pull`, `state` `start` or `done`; a
+/// `done` event carries the phase's counts.
+fn sync_event(phase: &str, state: &str, counts: Option<&Value>) -> String {
+    let mut event = json!({"event": "progress", "op": "sync", "phase": phase, "state": state});
+    if let (Some(Value::Object(extra)), Some(object)) = (counts, event.as_object_mut()) {
+        for (key, value) in extra {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    let mut line = String::new();
+    wirejson::write_value(&mut line, &event);
+    line
+}
+
+/// `sync.run`: push, then pull, over one connection and one hold of the write lock (never waiting
+/// for it). Counts only: bundle names are random per push and nothing in a UI needs them.
+fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
+    let store = store::open_for_write_with(&job.db_path, "sync", 0.0, Some(&job.master))?;
+    let conn = store.conn();
+    let emit = |line: String| {
+        // the bridge being gone is not the sync's problem: EOF on stdin ends the process
+        let _ = job.channel.write_line(&line);
+    };
+    emit(sync_event("push", "start", None));
+    let pushed = relay_sync::push(conn, job.master.as_slice(), &*job.relay)?;
+    let push = json!({"bundles": pushed.bundles.len(), "records": pushed.records, "ranges": pushed.ranges});
+    emit(sync_event("push", "done", Some(&push)));
+    emit(sync_event("pull", "start", None));
+    let pulled = relay_sync::pull(conn, job.master.as_slice(), &*job.relay)?;
+    let pull = json!({
+        "applied": pulled.applied.len(),
+        "rejected": pulled.rejected.len(),
+        "records_new": pulled.records_new,
+        "records_duplicate": pulled.records_duplicate,
+        "records_invalid": pulled.records_invalid,
+        "conflicts": pulled.conflicts,
+        "ranges_new": pulled.ranges_new,
+        "gaps": pulled.gaps.len(),
+        "status": pulled.status,
+    });
+    emit(sync_event("pull", "done", Some(&pull)));
+    Ok(json!({"push": push, "pull": pull}))
+}
+
+fn sync_worker(job: SyncJob) {
+    // a panic must still free the slot and answer (see `import_worker`)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_sync(&job)));
+    let line = match outcome {
+        Ok(Ok(result)) => result_line(&job.id, &result),
+        Ok(Err(failure)) => failure_line(&job.id, &failure),
+        Err(_) => failure_line(
+            &job.id,
+            &Failure::serve("internal", "unexpected panic in the sync worker"),
+        ),
+    };
+    job.slot.store(false, Ordering::SeqCst);
+    let _ = job.channel.write_line(&line);
+}
+
+/// Start a push-then-pull over the relay `relay.json` names; the answer is sent when it finishes.
+/// Checked in this order: unlocked (`locked`), a relay configured (`not_found`), an encrypted store
+/// (`not_encrypted`), the slot shared with `import.run` (`busy`).
+fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
+    session.require_unlocked()?;
+    let config = relay_config::read(&relay_json_path(&session.db_path)).ok_or_else(|| {
+        Failure::serve(
+            "not_found",
+            "no relay is configured (relay.json in the data folder)",
+        )
+    })?;
+    let Some(master) = session.unlocked_master().cloned() else {
+        return Err(Failure::serve(
+            "not_encrypted",
+            format!(
+                "the relay needs an encrypted store: run '{} key init' first",
+                identity::COMMAND
+            ),
+        ));
+    };
+    let relay = relay_config::open(&config, master.as_slice())
+        .map_err(|rule| Failure::serve("bad_params", format!("relay.json: {rule}")))?;
+    if session
+        .import_slot
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(Failure::serve(
+            "busy",
+            "an import or a sync is already running",
+        ));
+    }
+    let job = SyncJob {
+        id: call.id.clone(),
+        db_path: session.db_path.clone(),
+        master,
+        relay,
+        channel: Arc::clone(&session.channel),
+        slot: Arc::clone(&session.import_slot),
+    };
+    let slot = Arc::clone(&session.import_slot);
+    match std::thread::Builder::new()
+        .name("sync".into())
+        .spawn(move || sync_worker(job))
     {
         Ok(handle) => {
             session.workers.push(handle);

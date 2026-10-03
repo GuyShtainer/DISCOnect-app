@@ -262,7 +262,9 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "data.today",
             "data.facts",
             "import.run",
-            "import.last"
+            "import.last",
+            "sync.status",
+            "sync.run"
         ]
     );
     assert!(DEFERRED_METHODS.is_empty(), "slice 3D ported the last deferred methods");
