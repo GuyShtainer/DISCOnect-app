@@ -4,7 +4,7 @@
 //! difference: it never lets macOS ask the user a question except on the explicit switch.
 //!
 //! Layout is Python `keyring`'s except for the service: generic password, service
-//! [`SERVICE`] (`identity::KEYCHAIN_SERVICE`, `disconect`; Python keeps `hearthbeat`), account = the
+//! [`SERVICE`] (`identity::KEYCHAIN_SERVICE`, `disconect`; Python uses `disconect-cli`), account = the
 //! key id in lowercase hex, password = the master key in lowercase hex. On macOS the item is read
 //! and written through the Security framework in-process (the `security-framework` crate), never
 //! through `security add-generic-password -w`, which would put the key in a child process's argv.
@@ -354,6 +354,6 @@ mod tests {
     #[test]
     fn the_service_is_this_cores_own_and_not_pythons() {
         assert_eq!(SERVICE, "disconect");
-        assert_ne!(SERVICE, "hearthbeat");
+        assert_ne!(SERVICE, "disconect-cli");
     }
 }

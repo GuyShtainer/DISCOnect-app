@@ -8,11 +8,24 @@
 pub const PRODUCT: &str = "DISCOnect";
 pub const NOTICE: &str = "Not affiliated with or endorsed by any watch manufacturer.";
 
-/// The keychain service this core stores its master-key item under. **Rust-only on purpose:** the
-/// Python core (and so the MCP server) keeps `hearthbeat`. A generic password is unique per
-/// (service, account) and macOS binds it to the program that made it, so two programs sharing one
-/// service would fight over the same item (the drift test pins that the two names differ).
+/// The keychain service this core stores its master-key item under. **Different from the Python
+/// core's [`CLI_KEYCHAIN_SERVICE`] on purpose:** a generic password is unique per (service, account)
+/// and macOS binds it to the program that made it, so two programs sharing one service would fight
+/// over the same item (the drift test pins that the two names differ).
 pub const KEYCHAIN_SERVICE: &str = "disconect";
+
+// Names mirrored from `identity.py` (the drift test pins them across the three files).
+pub const DATA_DIR: &str = ".disconect";
+pub const DB_FILENAME: &str = "disconect.db";
+pub const ENV_PREFIX: &str = "DISCONECT_";
+/// The Python core's keychain service (never used by this crate; kept here for the drift pin).
+pub const CLI_KEYCHAIN_SERVICE: &str = "disconect-cli";
+pub const MCP_SERVER_NAME: &str = "disconect";
+pub const COMMAND: &str = "disconect";
+/// Earlier builds' folders and backup prefixes, read through and never written.
+pub const LEGACY_HOMES: &[&str] = &[".hearthbeat"];
+pub const BACKUP_PREFIX: &str = "disconect";
+pub const LEGACY_BACKUP_PREFIXES: &[&str] = &["hearthbeat"];
 
 /// The scrub as Python spells it (`re.compile(..., re.IGNORECASE)`): the manufacturer's name, with
 /// an optional following " connect". [`neutral_text`] implements exactly this.

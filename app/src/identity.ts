@@ -3,6 +3,17 @@
 export const PRODUCT = "DISCOnect";
 export const NOTICE = "Not affiliated with or endorsed by any watch manufacturer.";
 
+// Names mirrored from identity.py (tests/test_identity_drift.py fails on drift).
+export const DATA_DIR = ".disconect";
+export const DB_FILENAME = "disconect.db";
+export const ENV_PREFIX = "DISCONECT_";
+export const CLI_KEYCHAIN_SERVICE = "disconect-cli";
+export const MCP_SERVER_NAME = "disconect";
+export const COMMAND = "disconect";
+export const LEGACY_HOMES = [".hearthbeat"] as const;
+export const BACKUP_PREFIX = "disconect";
+export const LEGACY_BACKUP_PREFIXES = ["hearthbeat"] as const;
+
 /** Source words as the design system spells them; the core's scope ids are the keys. */
 export const SCOPE_WORD: Record<string, string> = {
   device: "device",
