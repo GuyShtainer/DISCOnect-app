@@ -141,6 +141,9 @@ const DERIVED_FROM_SAMPLES: [(&str, &str, Reducer); 7] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     pub file: String,
+    /// The record's stream. Only a reparse dry run sets it (Python's `_dry_run` failures carry it,
+    /// the writer's own failures do not), and the `--json` output emits the key only then.
+    pub stream: Option<String>,
     pub kind: String,
     pub error: String,
 }
@@ -476,6 +479,7 @@ impl<'c> Writer<'c> {
         self.stats.files_failed += 1;
         self.stats.failures.push(Failure {
             file: label.to_string(),
+            stream: None,
             kind: kind.to_string(),
             error: redact_text(message),
         });
@@ -939,6 +943,14 @@ impl<'c> Writer<'c> {
         }
     }
 
+    /// The latest recorded failure is a storage error (the write was refused), as opposed to a
+    /// decode failure, which every device reaches identically. Call right after a write returned
+    /// `Failed`.
+    #[must_use]
+    pub fn last_failure_is_storage(&self) -> bool {
+        self.stats.failures.last().is_some_and(|f| f.kind == "storage")
+    }
+
     /// Roll back the open transaction and book a `storage` failure for `stream`.
     fn storage_failure(&mut self, stream: &str, label: &str, error: &rusqlite::Error) -> rusqlite::Result<()> {
         let _ = self.conn.execute_batch("ROLLBACK");
@@ -946,6 +958,7 @@ impl<'c> Writer<'c> {
         self.stats.files_failed += 1;
         self.stats.failures.push(Failure {
             file: label.to_string(),
+            stream: None,
             kind: "storage".to_string(),
             error: redact_text(&message),
         });

@@ -181,7 +181,10 @@ fn stats_json(stats: &ImportStats) -> Value {
     let failures: Vec<Value> = stats
         .failures
         .iter()
-        .map(|f| json!({"file": f.file, "kind": f.kind, "error": f.error}))
+        .map(|f| match &f.stream {
+            Some(stream) => json!({"file": f.file, "stream": stream, "kind": f.kind, "error": f.error}),
+            None => json!({"file": f.file, "kind": f.kind, "error": f.error}),
+        })
         .collect();
     json!({
         "transport": stats.transport,
@@ -271,7 +274,7 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
 
 fn sync_exit(error: &SyncError) -> u8 {
     match error {
-        SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) | SyncError::ConflictWriteFailed(_) => EXIT_DATABASE,
+        SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) | SyncError::WriteFailed(_) => EXIT_DATABASE,
         SyncError::Source(SourceError::Db(_)) => EXIT_DATABASE,
         SyncError::Relay(RelayError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => EXIT_USAGE,
         _ => 1,

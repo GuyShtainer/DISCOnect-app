@@ -55,10 +55,11 @@ pub enum SyncError {
     /// `OverflowError` on a huge epoch): the pull stops, its run is booked failed.
     #[error("{0}")]
     Abort(String),
-    /// A conflict's winner could not be stored: everything the decision wrote was rolled back and
-    /// the losing record is still in place. The bundle stays `applying`; the next pull reapplies it.
+    /// A pulled record could not be stored (a storage error, not a decode failure). Whatever the
+    /// write covered was rolled back -- for a conflict winner that includes the retirement of the
+    /// losing record, which is still in place. The bundle stays `applying`; the next pull reapplies it.
     #[error("{0}")]
-    ConflictWriteFailed(String),
+    WriteFailed(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -681,6 +682,12 @@ fn apply_pending(
             let before = writer.last_raw_id()?;
             let outcome =
                 writer.write_fit(data, &label, Some((&record.transport, &record.imported_at)))?;
+            if outcome == WriteOutcome::Failed && writer.last_failure_is_storage() {
+                return Err(SyncError::WriteFailed(format!(
+                    "{} file not stored ({outcome:?}); nothing it wrote is kept",
+                    record.stream
+                )));
+            }
             mark(conn, before, name, outcome, result)?;
             if outcome == WriteOutcome::Duplicate {
                 mark_existing(conn, record, name)?;
@@ -694,7 +701,10 @@ fn apply_pending(
             };
             let conflict = decide_conflict(conn, record, &facts)?;
             if let Some(conflict) = conflict.as_ref().filter(|c| !c.incoming_wins) {
-                record_incoming_loser(conn, record, conflict, name)?;
+                // a reapplied bundle decided this record already
+                if !conflict_recorded(conn, name, record)? {
+                    record_incoming_loser(conn, record, conflict, name)?;
+                }
                 result.conflicts += 1;
                 continue;
             }
@@ -705,7 +715,9 @@ fn apply_pending(
                 if stored {
                     // the same bytes are already here (a local import or an earlier bundle)
                     if conflict_recorded(conn, name, record)? {
+                        // a reapplied bundle: the winner is stored, its relay_seen row may not be
                         result.conflicts += 1;
+                        mark_existing(conn, record, name)?;
                     } else {
                         result.records_duplicate += 1;
                         mark_existing(conn, record, name)?;
@@ -736,16 +748,22 @@ fn apply_pending(
                     Some((&record.transport, &record.imported_at)),
                 )?,
             };
+            let storage_failure =
+                outcome == WriteOutcome::Failed && writer.last_failure_is_storage();
+            if storage_failure || (conflict.is_some() && outcome != WriteOutcome::Imported) {
+                return Err(SyncError::WriteFailed(format!(
+                    "{} record not stored ({outcome:?}); nothing it wrote is kept",
+                    record.stream
+                )));
+            }
             if conflict.is_some() {
-                if outcome != WriteOutcome::Imported {
-                    return Err(SyncError::ConflictWriteFailed(format!(
-                        "{} winner not stored ({outcome:?}); decision rolled back",
-                        record.stream
-                    )));
-                }
                 result.conflicts += 1;
             }
             mark(conn, before, name, outcome, result)?;
+            if conflict.is_some() {
+                // the winner may have reused the retired loser's rowid (`id > before` misses it)
+                mark_existing(conn, record, name)?;
+            }
         }
         for item in &ranges {
             let changes_before = conn.total_changes();

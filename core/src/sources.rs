@@ -646,7 +646,12 @@ fn dry_run(conn: &Connection, rows: &[(i64, String)]) -> Result<Vec<Failure>, So
             decode_raw(conn, *raw_id).err().map(|e| (e.kind(), e.message()))
         };
         if let Some((kind, error)) = failed {
-            failures.push(Failure { file: format!("raw_record:{raw_id}"), kind, error: redact_text(&error) });
+            failures.push(Failure {
+                file: format!("raw_record:{raw_id}"),
+                stream: Some(stream.clone()),
+                kind,
+                error: redact_text(&error),
+            });
         }
     }
     Ok(failures)

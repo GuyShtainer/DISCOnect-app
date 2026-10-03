@@ -900,7 +900,7 @@ fn a_failed_winner_write_rolls_the_whole_conflict_back_and_the_next_pull_converg
     let error =
         sync::pull(a.conn(), master(), &relay).expect_err("the pull reports the storage error");
     assert!(
-        matches!(error, SyncError::ConflictWriteFailed(_)),
+        matches!(error, SyncError::WriteFailed(_)),
         "{error:?}"
     );
     assert!(a.conn().is_autocommit(), "no transaction left open");
@@ -1222,6 +1222,175 @@ fn a_listed_object_that_vanishes_before_it_is_read_is_rejected_as_file_not_found
     let r = sync::pull(b.conn(), master(), &relay).expect("pull");
     assert_eq!(r.rejected, vec![(name, "FileNotFoundError".to_string())]);
     assert_eq!(r.status, "partial");
+}
+
+// ---------------------------------------------------------------- 12a review (F1-F4)
+
+/// One UDS record per day, each in its own file (the dated name keeps the days apart).
+fn export_with_days(dir: &Path, name: &str, records: &[(&str, i64, &str)]) -> PathBuf {
+    let root = dir.join(name);
+    for (day, steps, end) in records {
+        write(
+            &root,
+            &format!("DI_CONNECT/DI-Connect-Aggregator/UDSFile_{day}_{day}.json"),
+            &format!("[{}]", uds(day, *steps, &format!("{day}T{end}:00:00.0"))),
+        );
+    }
+    fs::create_dir_all(root.join("DI_CONNECT/DI-Connect-Uploaded-Files")).expect("mkdir");
+    root
+}
+
+fn seen_count(device: &Device, payload_hash: &str) -> i64 {
+    count(
+        device.conn(),
+        &format!(
+            "SELECT count(*) FROM relay_seen s JOIN raw_records r ON r.id=s.raw_record_id \
+             WHERE r.payload_hash='{payload_hash}'"
+        ),
+    )
+}
+
+fn unsent(device: &Device) -> i64 {
+    count(
+        device.conn(),
+        "SELECT count(*) FROM raw_records r LEFT JOIN relay_seen s ON s.raw_record_id=r.id \
+         WHERE s.raw_record_id IS NULL",
+    )
+}
+
+#[test]
+fn f1_the_winner_is_marked_seen_when_the_loser_held_the_max_rowid() {
+    let early = uds("2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let late = uds("2025-06-15", 8000, "2025-06-15T21:00:00.0");
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    import(&a, &export_with_uds(tmp.path(), "x", &early));
+    import(&b, &export_with_uds(tmp.path(), "y", &late));
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    push(&b, &relay);
+    let r = pull(&a, &relay);
+    assert_eq!((r.conflicts, r.status), (1, "ok"));
+    assert_eq!(seen_count(&a, &canonical_hash(&late)), 1, "the winner is relay_seen");
+    assert_eq!(unsent(&a), 0, "a clean conflict pull leaves nothing to push back");
+    assert_eq!(push(&a, &relay).records, 0, "the winner is not echoed");
+}
+
+#[test]
+fn f2_a_retried_pull_marks_the_already_stored_winner_seen() {
+    let early = uds("2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let late = uds("2025-06-15", 8000, "2025-06-15T21:00:00.0");
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    // the loser (06-15) is rowid 1, a second day takes rowid 2
+    import(
+        &a,
+        &export_with_days(tmp.path(), "x", &[("2025-06-15", 4000, "12"), ("2025-06-16", 3000, "21")]),
+    );
+    import(&b, &export_with_uds(tmp.path(), "y", &late));
+    let _ = early;
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    push(&b, &relay);
+    let incoming = canonical_hash(&late);
+    a.conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER inject BEFORE INSERT ON relay_seen WHEN \
+             (SELECT payload_hash FROM raw_records WHERE id=NEW.raw_record_id)='{incoming}' \
+             BEGIN SELECT RAISE(ABORT,'crash after commit'); END"
+        ))
+        .expect("trigger");
+    assert!(sync::pull(a.conn(), master(), &relay).is_err());
+    assert_eq!(pulled_statuses(&a), vec!["applying".to_string()]);
+    a.conn().execute_batch("DROP TRIGGER inject").expect("drop");
+    let retry = pull(&a, &relay);
+    assert_eq!((retry.status, retry.applied.len()), ("ok", 1));
+    assert_eq!(seen_count(&a, &incoming), 1, "the retry marked the winner seen");
+    assert_eq!(count(a.conn(), "SELECT count(*) FROM sync_conflicts"), 1);
+    assert_eq!(count(a.conn(), "SELECT count(*) FROM raw_superseded"), 1);
+    assert_eq!(unsent(&a), 0);
+}
+
+#[test]
+fn f3_a_plain_record_storage_failure_keeps_the_bundle_applying() {
+    let late = uds("2025-06-15", 8000, "2025-06-15T21:00:00.0");
+    for abort in ["ABORT", "ROLLBACK"] {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (feeder, puller) = (device(), device());
+        import(&feeder, &export_with_uds(tmp.path(), "y", &late));
+        let relay = relay_in(tmp.path());
+        push(&feeder, &relay);
+        let incoming = canonical_hash(&late);
+        puller
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER inject BEFORE INSERT ON raw_records WHEN NEW.payload_hash='{incoming}' \
+                 BEGIN SELECT RAISE({abort},'injected'); END"
+            ))
+            .expect("trigger");
+        let error = sync::pull(puller.conn(), master(), &relay).expect_err("a storage failure fails the pull");
+        assert!(matches!(error, SyncError::WriteFailed(_)), "{abort}: {error:?}");
+        assert!(puller.conn().is_autocommit(), "no transaction left open");
+        assert_eq!(pulled_statuses(&puller), vec!["applying".to_string()]);
+        assert_eq!(count(puller.conn(), "SELECT count(*) FROM raw_records"), 0);
+        puller.conn().execute_batch("DROP TRIGGER inject").expect("drop");
+        let retry = pull(&puller, &relay);
+        assert_eq!((retry.status, retry.records_new, retry.applied.len()), ("ok", 1, 1));
+        assert_eq!(daily_rows(&puller), daily_rows(&feeder), "{abort}: the daily rows converged");
+        assert_eq!(pulled_statuses(&puller), vec!["applied".to_string()]);
+    }
+}
+
+fn history(device: &Device) -> (i64, i64) {
+    (
+        count(device.conn(), "SELECT count(*) FROM sync_conflicts"),
+        count(device.conn(), "SELECT count(*) FROM raw_superseded"),
+    )
+}
+
+#[test]
+fn f4_a_reapplied_bundle_does_not_duplicate_its_incoming_loser_rows() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (feeder, puller, third) = (device(), device(), device());
+    // the feeder's 06-14 record loses at the puller, its 06-15 record wins there
+    import(
+        &feeder,
+        &export_with_days(tmp.path(), "f", &[("2025-06-14", 1000, "12"), ("2025-06-15", 8000, "21")]),
+    );
+    import(
+        &puller,
+        &export_with_days(tmp.path(), "p", &[("2025-06-14", 2000, "21"), ("2025-06-15", 4000, "12")]),
+    );
+    import(&third, &export_with_days(tmp.path(), "t", &[("2025-06-16", 3000, "21")]));
+    let relay = relay_in(tmp.path());
+    for d in [&feeder, &puller, &third] {
+        push(d, &relay);
+    }
+    let winner = canonical_hash(&uds("2025-06-15", 8000, "2025-06-15T21:00:00.0"));
+    puller
+        .conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER inject BEFORE INSERT ON raw_records WHEN NEW.payload_hash='{winner}' \
+             BEGIN SELECT RAISE(ABORT,'x'); END"
+        ))
+        .expect("trigger");
+    assert!(sync::pull(puller.conn(), master(), &relay).is_err());
+    puller.conn().execute_batch("DROP TRIGGER inject").expect("drop");
+    pull(&puller, &relay);
+    pull(&third, &relay);
+    for _ in 0..3 {
+        for d in [&feeder, &puller, &third] {
+            push(d, &relay);
+        }
+        for d in [&feeder, &puller, &third] {
+            pull(d, &relay);
+        }
+    }
+    let (p, f, t) = (history(&puller), history(&feeder), history(&third));
+    assert_eq!(p.0, p.1, "one superseded row per conflict row");
+    assert!(p == f && f == t, "puller {p:?} feeder {f:?} third {t:?}");
+    assert_eq!(daily_rows(&feeder), daily_rows(&puller));
+    assert_eq!(daily_rows(&feeder), daily_rows(&third));
 }
 
 // ---------------------------------------------------------------- reparse (the crash-recovery path)
