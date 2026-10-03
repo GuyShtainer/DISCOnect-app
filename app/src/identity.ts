@@ -15,6 +15,9 @@ export const LEGACY_HOMES = [".hearthbeat"] as const;
 export const LEGACY_DB_FILENAME = "hearthbeat.db";
 export const LEGACY_ENV_PREFIX = "HEARTHBEAT_";
 export const BACKUP_PREFIX = "disconect";
+// The key screen and its keychain switch, as app.ts shows them (the Rust MCP's messages quote both).
+export const KEY_SCREEN = "Your key";
+export const KEYCHAIN_SWITCH = "Keep the key in this device's keychain";
 export const LEGACY_BACKUP_PREFIXES = ["hearthbeat"] as const;
 
 /** Source words as the design system spells them; the core's scope ids are the keys. */

@@ -33,6 +33,11 @@ pub const LEGACY_ENV_PREFIX: &str = "HEARTHBEAT_";
 pub const BACKUP_PREFIX: &str = "disconect";
 pub const LEGACY_BACKUP_PREFIXES: &[&str] = &["hearthbeat"];
 
+/// The screen where the desktop app manages the key, and its switch that keeps the key in the OS keychain:
+/// the words the MCP's messages send a person to (the drift test pins both to `app.ts`).
+pub const KEY_SCREEN: &str = "Your key";
+pub const KEYCHAIN_SWITCH: &str = "Keep the key in this device's keychain";
+
 /// The scrub as Python spells it (`re.compile(..., re.IGNORECASE)`): the manufacturer's name, with
 /// an optional following " connect". [`neutral_text`] implements exactly this.
 pub const MANUFACTURER_PATTERN: &str = "garmin(?: connect)?";

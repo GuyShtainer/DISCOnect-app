@@ -171,8 +171,7 @@ fn list_at(args: &[Arg], at: usize) -> Option<Vec<PyStr>> {
 fn data_health(server: &Server, args: &[Arg]) -> Outcome {
     let window_days = int_at(args, 0);
     read(server, |conn| {
-        let report = health::data_health(conn, Contract::get()?, window_days, now_instant())?;
-        Ok(wirejson::from_serde(&report))
+        health::data_health_ordered(conn, Contract::get()?, window_days, now_instant())
     })
 }
 
@@ -295,11 +294,21 @@ fn open_failure(error: &StoreError) -> String {
         StoreError::SchemaTooNew { .. } => template("schema_too_new", &error.to_string()),
         StoreError::Encrypted(_)
         | StoreError::NotEncrypted(_)
-        | StoreError::Key(KeyError::Locked | KeyError::WrongPassphrase) => {
-            template("locked", &error.to_string())
-        }
+        | StoreError::Key(KeyError::Locked | KeyError::WrongPassphrase) => changed_store_text(),
         other => template("open_failed", &other.to_string()),
     }
+}
+
+/// A store that stopped opening after the server started (it was encrypted, or its key changed, while Claude
+/// Desktop kept the server running): the one way to reach the `locked` case, since a store that is locked at
+/// start exits 9 before any call. Rust-owned, not `mcp.json`'s Python template (kb/23 class 19): that one sends
+/// a person to `disconect key cache` and to a restart of `disconect-mcp`, neither of which exists in the app.
+pub(crate) fn changed_store_text() -> String {
+    format!(
+        "The store is encrypted and this server has no working key for it: it changed after Claude Desktop \
+         started the server. {}",
+        crate::mcp_start::fix_instruction("on")
+    )
 }
 
 pub(crate) fn rejection(tool: &Tool, rejected: &[(&str, &str)]) -> String {

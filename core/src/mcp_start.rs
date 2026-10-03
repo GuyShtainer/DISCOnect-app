@@ -74,6 +74,18 @@ fn unlock(db: &Path, passphrase: Option<&str>) -> Result<Option<Secret32>, Strin
     Err(locked_message(state))
 }
 
+/// The sentence that sends a person to the fix: the app's key screen and its keychain switch, worded as the
+/// app words them ([`identity::KEY_SCREEN`], [`identity::KEYCHAIN_SWITCH`], pinned to `app.ts` by the drift
+/// test), then a restart of the client that runs this server.
+pub(crate) fn fix_instruction(switch: &str) -> String {
+    format!(
+        "Open {}, go to the \"{}\" screen, switch \"{}\" {switch}, then restart Claude Desktop.",
+        identity::PRODUCT,
+        identity::KEY_SCREEN,
+        identity::KEYCHAIN_SWITCH,
+    )
+}
+
 /// The one stderr line of a locked start: why the key is not available and where to fix it.
 fn locked_message(state: KeychainState) -> String {
     let (cause, switch) = match state {
@@ -84,9 +96,9 @@ fn locked_message(state: KeychainState) -> String {
         _ => ("it is not remembered on this Mac", "on"),
     };
     format!(
-        "disconect-core mcp: this store is encrypted and its key is locked ({cause}; keychain: {}). Open {}, go to the \"Your key\" screen, switch \"Remember on this Mac\" {switch}, then restart Claude Desktop.",
+        "disconect-core mcp: this store is encrypted and its key is locked ({cause}; keychain: {}). {}",
         state.as_str(),
-        identity::PRODUCT,
+        fix_instruction(switch),
     )
 }
 
@@ -126,12 +138,12 @@ mod tests {
             (
                 KeychainState::Absent,
                 "keychain: absent",
-                "\"Remember on this Mac\" on,",
+                "\"Keep the key in this device's keychain\" on,",
             ),
             (
                 KeychainState::Stale,
                 "keychain: stale",
-                "\"Remember on this Mac\" off and on again,",
+                "\"Keep the key in this device's keychain\" off and on again,",
             ),
         ] {
             let line = locked_message(state);
