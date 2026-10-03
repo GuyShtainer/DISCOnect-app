@@ -75,6 +75,36 @@ only in memory for the session; it is never in a file. **The settings file** is 
 (never the data folder): mode, address, model name, whether a key is in the keychain, whether data points may be
 shared; nothing secret.
 
+## Coach loop
+
+`coach_ask(text)` in `src-tauri/src/coach/commands.rs` runs one question through `chat_loop::Coach::ask` (`coach/loop.rs`).
+It first reads the settings: **off returns before anything else** (no egress is built, the key is not read, nothing is
+sent). A turn is: push the user's words; send the request (the system prompt, the windowed turns and the five tools
+of `mcp.json`, `tool_choice: auto`, no streaming) to `<base>/chat/completions`; read the answer. If the model asks for
+tools (at most 4 per answer and 6 rounds per question, else the question fails), each call must name one of the five
+tools and carry a JSON object; the arguments are forced inside the coach defaults, the core runs the tool through
+`tools.call`, and the answer passes `views::project_with`, `caps::fit` and `schema::validated`. Only that validated
+value, as compact JSON, becomes a tool message (the type system allows nothing else), so what leaves is the projected
+day-level answer plus the user's own words. The model's reply is run through the vendor-name scrub before it is
+shown or kept.
+
+What the model hears about a call that did not run is one of a few fixed strings, never the core's message or a raw
+answer: `{"error":"unknown tool"}` (a name outside the five), `{"error":"bad arguments"}` (not a JSON object),
+`{"error":"withheld"}` (the projection or schema refused the answer), and the core's own code
+(`{"error":"locked"}`, `tool_error`, `invalid_params`, `unknown_tool`, `not_configured`). A locked store is
+therefore not a failed question: the model is told and answers in words.
+
+**The window.** Each request is kept under a byte budget (96 KiB of JSON by default): tool results from earlier
+questions become `{"omitted":"earlier tool result"}` (the call/answer pairing stays valid, which providers require); if
+the request is still too big the oldest whole questions are dropped, never the last two messages. An error ends the
+question and rolls the conversation back to where it was (a provider status, an unreadable answer, too many tool calls,
+a tool answer too large to send); every message of these errors is fixed text.
+
+**Nothing is persisted.** The conversation lives in memory for the session and `coach_reset` clears it; the trace
+returned with a reply (each tool call with the exact JSON that left, for the "what the model can see" drawer) replaces
+itself on the next question. `tests/coach_loop.rs` proves the bytes: a scripted provider over the serve oracle's
+answers, five evals, and one scenario replayed through the real egress against a `127.0.0.1` listener.
+
 ## Build and run
 ```sh
 tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build -> .app -> ad-hoc sign
