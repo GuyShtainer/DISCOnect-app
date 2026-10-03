@@ -292,8 +292,8 @@ pub fn import_path(
             })
             .and_then(|()| export::import_connect_export(path, &mut writer, reborrow(&mut progress)))
             .and_then(|()| {
-                let touched: Vec<String> = writer.stats.streams.keys().cloned().collect();
-                rederive_json(conn, &mut writer, &touched)
+                let stored = stored_json_streams(conn)?;
+                rederive_json(conn, &mut writer, &stored)
             })
     } else {
         iter_fit_files(path).and_then(|files| {
@@ -414,9 +414,20 @@ pub fn reparse_readiness(conn: &Connection, writer: &mut Writer<'_>) -> Result<(
     Ok(())
 }
 
+/// Every `json:*` stream that has a raw record in the store, sorted.
+fn stored_json_streams(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement =
+        conn.prepare("SELECT DISTINCT stream FROM raw_records WHERE stream LIKE 'json:%' ORDER BY stream")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
 /// `rederive_json`: make the daily rows of the JSON `streams` a pure function of the raw records
 /// stored now (bet 10b). Run at the end of every import and every pull, so devices that converged
-/// on the same raw set converge on the same days whatever order the records arrived in. In one
+/// on the same raw set converge on the same days whatever order the records arrived in. An export
+/// import passes every JSON stream in the store, not just the ones it wrote this run: each record
+/// commits on its own, so a retry of an interrupted import sees the finished streams as
+/// all-duplicate and would never re-derive them. In one
 /// transaction inside the caller's run (no `import_runs` row of its own, no import statistics or
 /// provenance bumped: the records were just counted when they were written) the canonical rows
 /// those streams' raw records produced are deleted and rebuilt record by record in the content
