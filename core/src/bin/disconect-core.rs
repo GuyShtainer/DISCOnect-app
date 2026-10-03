@@ -8,7 +8,10 @@
 //! not in the keychain. `--passphrase-file` is for the test harness; `DISCONECT_PASSPHRASE` is never read.
 //!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
-//!  | sync push|pull|status|forget [--relay <folder> [--remember]]`
+//!  | reparse [--stream S]... [--force] | sync push|pull|status|forget [--relay <folder> [--remember]]`
+//!
+//! `reparse` replays decoding over the retained raw records (`sources::reparse_all`, the Python `reparse`);
+//! `--json` prints the run's `ImportStats` plus `status`, the same keys as the Python CLI.
 //!
 //! `sync` talks to the blind relay (`docs/relay-protocol.md`); the folder comes from `--relay` or
 //! `relay.json` in the data folder (`{"folder": path}`, shared with the Python CLI; `--remember` writes
@@ -16,7 +19,7 @@
 //! `--passphrase-file` or `DISCONECT_PASSPHRASE`); `status` and `forget` need no relay and no key
 //! beyond opening the store.
 //!
-//! Exit codes (the Python CLI's table): 0 ok; 1 failed, partial (`import` with failures, `pull`
+//! Exit codes (the Python CLI's table): 0 ok; 1 failed, partial (`import`/`reparse` with failures, `pull`
 //! that rejected a bundle) or an error the oracle lets escape; 2 usage (no such path, no relay
 //! folder); 4 write lock busy; 6 database error; 7 schema newer than this build; 9 locked (wrong
 //! or missing passphrase, or `sync push|pull` on a store with no key file).
@@ -32,7 +35,7 @@ use disconect_core::serve;
 use disconect_core::relay::folder::{FolderRelay, RelayError};
 use disconect_core::relay::sync::{self, PullResult, StatusReport, SyncError};
 use disconect_core::sources::{self, SourceError, TRANSPORTS};
-use disconect_core::writer::WriterError;
+use disconect_core::writer::{ImportStats, WriterError};
 use disconect_core::store::{self, StoreError};
 use disconect_core::write_lock::LockError;
 use serde_json::{Map, Value, json};
@@ -56,6 +59,8 @@ struct Args {
     sync_action: Option<String>,
     relay: Option<String>,
     remember: bool,
+    streams: Vec<String>,
+    force: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -63,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut db, mut pass, mut command, mut json) = (None, None, None, false);
     let (mut import_path, mut transport) = (None, None);
     let (mut sync_action, mut relay, mut remember) = (None, None, false);
+    let (mut streams, mut force) = (Vec::new(), false);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(it.next().ok_or("--db needs a path")?)),
@@ -77,7 +83,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--relay" => relay = Some(it.next().ok_or("--relay needs a folder")?),
             "--remember" => remember = true,
-            "status" | "init" | "import" | "sync" | "serve" | "mcp" if command.is_none() => command = Some(arg),
+            "--stream" => streams.push(it.next().ok_or("--stream needs a value")?),
+            "--force" => force = true,
+            "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" if command.is_none() => command = Some(arg),
             "push" | "pull" | "status" | "forget"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
@@ -99,6 +107,8 @@ fn parse_args() -> Result<Args, String> {
         sync_action,
         relay,
         remember,
+        streams,
+        force,
     })
 }
 
@@ -161,6 +171,48 @@ fn run_import(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, Stri
     if stats.status() == "ok" { Ok(()) } else { Err((1, String::new())) }
 }
 
+/// The Python `reparse --json` payload: the run's `ImportStats` fields plus `status`.
+fn stats_json(stats: &ImportStats) -> Value {
+    let streams: Map<String, Value> = stats
+        .streams
+        .iter()
+        .map(|(stream, counts)| (stream.clone(), json!(counts)))
+        .collect();
+    let failures: Vec<Value> = stats
+        .failures
+        .iter()
+        .map(|f| json!({"file": f.file, "kind": f.kind, "error": f.error}))
+        .collect();
+    json!({
+        "transport": stats.transport,
+        "files_seen": stats.files_seen,
+        "files_imported": stats.files_imported,
+        "files_duplicate": stats.files_duplicate,
+        "files_failed": stats.files_failed,
+        "records_written": stats.records_written,
+        "ignored": stats.ignored,
+        "streams": streams,
+        "dropped": stats.dropped,
+        "failures": failures,
+        "warnings": stats.warnings,
+        "dates_assumed_utc": stats.dates_assumed_utc,
+        "derived_days": stats.derived_days,
+        "status": stats.status(),
+    })
+}
+
+/// `reparse [--stream S]... [--force]`: replay decoding over the retained raw records. Exit 0 on ok,
+/// 1 on partial/failed (some record failed to decode; unless `--force`, nothing was changed).
+fn run_reparse(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String)> {
+    let opened = store::open_for_write(db_of(args)?, "reparse", 10.0, source)
+        .map_err(|e| (open_error_code(&e), e.to_string()))?;
+    let streams = (!args.streams.is_empty()).then_some(args.streams.as_slice());
+    let stats = sources::reparse_all(opened.conn(), streams, args.force)
+        .map_err(|e| (import_exit_code(&e), e.to_string()))?;
+    emit(args.json, stats_json(&stats), stats.summary_lines().join("\n"));
+    if stats.status() == "ok" { Ok(()) } else { Err((1, String::new())) }
+}
+
 /// `Path.expanduser()` for a leading `~`.
 fn expand_user(folder: &str) -> PathBuf {
     match (folder.strip_prefix("~/"), std::env::var_os("HOME")) {
@@ -219,7 +271,7 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
 
 fn sync_exit(error: &SyncError) -> u8 {
     match error {
-        SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) => EXIT_DATABASE,
+        SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) | SyncError::ConflictWriteFailed(_) => EXIT_DATABASE,
         SyncError::Source(SourceError::Db(_)) => EXIT_DATABASE,
         SyncError::Relay(RelayError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => EXIT_USAGE,
         _ => 1,
@@ -378,6 +430,7 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
     let fail = |e: StoreError| (exit_code_for(&e), e.to_string());
     match args.command.as_deref().unwrap_or_default() {
         "import" => run_import(args, source),
+        "reparse" => run_reparse(args, source),
         "sync" => run_sync(args, source),
         "status" if args.json => {
             let value = status(db_of(args)?, source).map_err(fail)?;
@@ -397,7 +450,9 @@ fn run_serve(args: &Args) -> ExitCode {
         || args.transport.is_some()
         || args.sync_action.is_some()
         || args.relay.is_some()
-        || args.remember;
+        || args.remember
+        || !args.streams.is_empty()
+        || args.force;
     if unexpected {
         eprintln!("error: serve takes only --db <path>");
         return ExitCode::from(EXIT_USAGE);
@@ -432,7 +487,9 @@ fn run_mcp(args: &Args) -> ExitCode {
         || args.transport.is_some()
         || args.sync_action.is_some()
         || args.relay.is_some()
-        || args.remember;
+        || args.remember
+        || !args.streams.is_empty()
+        || args.force;
     if unexpected {
         eprintln!("error: mcp takes only --db <path> and --passphrase-file <file>");
         return ExitCode::from(EXIT_USAGE);

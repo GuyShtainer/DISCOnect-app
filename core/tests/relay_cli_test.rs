@@ -185,3 +185,99 @@ fn a_store_with_no_key_file_cannot_sync_and_a_missing_passphrase_is_locked() {
     let bad = cli.run(&db, &["sync", "sideways"]);
     assert_eq!(code(&bad), 1);
 }
+
+fn table_count(status: &Output, table: &str) -> i64 {
+    let value: Value = serde_json::from_slice(&status.stdout).expect("status json");
+    value["tables"][table].as_i64().expect("table count")
+}
+
+#[test]
+fn reparse_through_the_binary_changes_no_row_and_books_a_reparse_run() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_dir, db) = encrypted_copy();
+    let drop = drop_folder(tmp.path());
+    assert_eq!(
+        code(&cli.run(&db, &["import", drop.to_str().expect("utf8")])),
+        0
+    );
+    let before = cli.run(&db, &["--json", "status"]);
+    let (daily, samples, intervals) = (
+        table_count(&before, "daily_metrics"),
+        table_count(&before, "metric_samples"),
+        table_count(&before, "monitoring_intervals"),
+    );
+    assert!(daily + samples + intervals > 0, "something to replay");
+    let runs = table_count(&before, "import_runs");
+
+    let out = cli.run(&db, &["--json", "reparse"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stats: Value = serde_json::from_slice(&out.stdout).expect("reparse json");
+    assert_eq!(stats["status"], "ok");
+    assert_eq!(stats["transport"], "reparse");
+    assert_eq!(stats["files_seen"], 2);
+    assert_eq!(stats["files_failed"], 0);
+    let keys: Vec<&str> = stats
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "dates_assumed_utc",
+            "derived_days",
+            "dropped",
+            "failures",
+            "files_duplicate",
+            "files_failed",
+            "files_imported",
+            "files_seen",
+            "ignored",
+            "records_written",
+            "status",
+            "streams",
+            "transport",
+            "warnings"
+        ],
+        "the Python `reparse --json` keys"
+    );
+    let after = cli.run(&db, &["--json", "status"]);
+    assert_eq!(table_count(&after, "daily_metrics"), daily);
+    assert_eq!(table_count(&after, "metric_samples"), samples);
+    assert_eq!(table_count(&after, "monitoring_intervals"), intervals);
+    assert_eq!(
+        table_count(&after, "import_runs"),
+        runs + 1,
+        "one reparse run row"
+    );
+
+    // --stream limits the replay; an unknown stream replays nothing and is still ok
+    let none = cli.run(&db, &["--json", "reparse", "--stream", "fit:nothing"]);
+    assert_eq!(code(&none), 0);
+    let none: Value = serde_json::from_slice(&none.stdout).expect("json");
+    assert_eq!(none["files_seen"], 0);
+    // the text form is the import summary
+    let text = cli.run(&db, &["reparse", "--force"]);
+    assert_eq!(code(&text), 0);
+    assert!(stdout(&text).starts_with("ok: "), "{}", stdout(&text));
+}
+
+#[test]
+fn reparse_on_a_busy_store_exits_four() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_dir, db) = encrypted_copy();
+    let secret = disconect_core::keys::unlock(
+        &disconect_core::keys::key_path_for(&db),
+        disconect_core::keys::PassphraseSource::Explicit(PASSPHRASE),
+    )
+    .expect("unlock");
+    let held = disconect_core::store::open_for_write_with(&db, "hold", 1.0, Some(&secret))
+        .expect("hold the write lock");
+    let busy = cli.run(&db, &["reparse"]);
+    assert_eq!(code(&busy), 4, "{}", String::from_utf8_lossy(&busy.stderr));
+    drop(held);
+    assert_eq!(code(&cli.run(&db, &["reparse"])), 0);
+}
