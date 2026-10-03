@@ -4,3 +4,4 @@
 
 pub mod fake_provider;
 pub mod fixtures;
+pub mod socket;
