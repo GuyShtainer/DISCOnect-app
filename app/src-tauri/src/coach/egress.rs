@@ -48,6 +48,8 @@ pub enum EgressError {
     Off,
     BadUrl,
     PlainHttpNeedsLocalIp,
+    /// `Mode::Local` with a host that is not `localhost` or a literal loopback/private IP.
+    LocalNeedsLocalAddress,
     UserinfoRefused,
     Unreachable,
     Timeout,
@@ -67,6 +69,9 @@ impl EgressError {
             EgressError::PlainHttpNeedsLocalIp => {
                 "plain http is only allowed for localhost or a local network address given as numbers"
             }
+            EgressError::LocalNeedsLocalAddress => {
+                "a local endpoint must be localhost or a local network address given as numbers; use cloud for any other host"
+            }
             EgressError::UserinfoRefused => "the endpoint address must not contain a user name or password",
             EgressError::Unreachable => "the endpoint could not be reached",
             EgressError::Timeout => "the endpoint did not answer in time",
@@ -84,6 +89,7 @@ impl EgressError {
             EgressError::Off => "off",
             EgressError::BadUrl => "bad_url",
             EgressError::PlainHttpNeedsLocalIp => "plain_http_needs_local_ip",
+            EgressError::LocalNeedsLocalAddress => "local_needs_local_address",
             EgressError::UserinfoRefused => "userinfo_refused",
             EgressError::Unreachable => "unreachable",
             EgressError::Timeout => "timeout",
@@ -201,7 +207,11 @@ impl Endpoint {
     pub fn from_settings(settings: &Settings) -> Result<Endpoint, EgressError> {
         match settings.mode {
             Mode::Off => Err(EgressError::Off),
-            Mode::Local | Mode::Cloud => Endpoint::parse(&settings.base_url),
+            // Local promises "on this computer or your network": the host must be one plain http may name,
+            // whatever the scheme, so a cloud address cannot ride under the local tier (and skip the key rule).
+            Mode::Local => Endpoint::parse(&settings.base_url)
+                .and_then(|e| if e.base.host().is_some_and(|h| host_allowed_plain(&h)) { Ok(e) } else { Err(EgressError::LocalNeedsLocalAddress) }),
+            Mode::Cloud => Endpoint::parse(&settings.base_url),
         }
     }
 
@@ -462,6 +472,7 @@ mod tests {
             EgressError::Off,
             EgressError::BadUrl,
             EgressError::PlainHttpNeedsLocalIp,
+            EgressError::LocalNeedsLocalAddress,
             EgressError::UserinfoRefused,
             EgressError::Unreachable,
             EgressError::Timeout,
@@ -518,6 +529,12 @@ mod tests {
         assert!(Real::from_settings(&settings(Mode::Cloud, "https://api.example/v1")).is_ok());
         assert!(Real::from_settings(&settings(Mode::Local, "http://127.0.0.1:11434/v1")).is_ok());
         assert_eq!(Real::from_settings(&settings(Mode::Cloud, "http://example.com")).err(), Some(EgressError::PlainHttpNeedsLocalIp));
+        // the local tier names local hosts only, over either scheme
+        for url in ["https://api.example/v1", "https://ollama.lan/v1", "https://169.254.169.254", "https://localhost.:1/v1"] {
+            assert_eq!(Real::from_settings(&settings(Mode::Local, url)).err(), Some(EgressError::LocalNeedsLocalAddress), "{url}");
+        }
+        assert!(Real::from_settings(&settings(Mode::Local, "https://localhost:8443/v1")).is_ok());
+        assert!(Real::from_settings(&settings(Mode::Local, "https://192.168.1.2/v1")).is_ok());
     }
 
     fn outbound(url: &str, body: Vec<u8>, key: Option<&str>) -> Outbound {

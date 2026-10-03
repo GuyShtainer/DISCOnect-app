@@ -64,7 +64,9 @@ goes through one function, `egress::send` in `src-tauri/src/coach/egress.rs` (so
 `tests/egress_guards.rs` fail the build if anything else names a network type). The rules: `https://` to any host;
 plain `http://` only to `localhost` or a literal loopback or private IP (127/8, ::1, 10/8, 172.16/12, 192.168/16,
 fc00::/7, fe80::/10), so a DNS name over plain http is refused, which closes DNS rebinding without pinning an
-address; a URL with a user name or password is refused; no proxy (`HTTP_PROXY` is never read); no redirects (a
+address; **local** mode is held to those same hosts over either scheme (any other host is refused as
+`local_needs_local_address`, so the "stays on your network" sentence is true and no cloud host skips the key rule); a
+URL with a user name or password is refused; no proxy (`HTTP_PROXY` is never read); no redirects (a
 3xx is an error); 10 s to connect, 120 s overall; requests up to 1 MiB, answers up to 4 MiB; the request carries
 `Content-Type`, the bearer key when there is one, and ureq's `Host`, `User-Agent` (`disconect-coach/<version>`) and
 `Accept`, nothing else (`tests/coach_egress.rs` reads them off a real loopback socket). TLS is `rustls` with the

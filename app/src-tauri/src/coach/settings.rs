@@ -85,7 +85,9 @@ impl Settings {
     /// The rules a save enforces. `Off` may keep a half-typed address, but a non-empty one must still pass.
     pub fn validate(&self) -> Result<(), SettingsError> {
         let on = self.mode != Mode::Off;
-        if on || !self.base_url.trim().is_empty() {
+        if on {
+            Endpoint::from_settings(self).map_err(SettingsError::Url)?;
+        } else if !self.base_url.trim().is_empty() {
             Endpoint::parse(&self.base_url).map_err(SettingsError::Url)?;
         }
         let model_ok = self.model.len() <= MAX_MODEL_LEN && !self.model.chars().any(char::is_control);
@@ -220,6 +222,8 @@ mod tests {
             s.base_url = url.into();
             assert_eq!(save(&dir, &s), Err(SettingsError::Url(want)), "{url}");
         }
+        let local = Settings { mode: Mode::Local, base_url: "https://api.example/v1".into(), ..cloud() };
+        assert_eq!(save(&dir, &local), Err(SettingsError::Url(EgressError::LocalNeedsLocalAddress)));
         assert!(!dir.join(FILE_NAME).exists());
         // off keeps a blank address, but a typed one is still checked
         let mut off = Settings::default();
