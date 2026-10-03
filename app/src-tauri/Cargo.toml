@@ -48,3 +48,8 @@ strip = true
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+
+[dev-dependencies]
+# Reads `tauri.conf.json` + the platform file exactly as `tauri-build` does (tests/mobile_config.rs);
+# already in the tree through `tauri-build`, so no new crate is compiled.
+tauri-utils = { version = "2", features = ["config-json5"] }
