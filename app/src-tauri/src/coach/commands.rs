@@ -4,7 +4,7 @@
 //! enums and, for an error status only, its number.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -235,10 +235,24 @@ pub async fn coach_probe(app: tauri::AppHandle) -> Result<ProbeReport, CoachErro
     .map_err(|_| CoachError::from(KeyError::Busy))?
 }
 
-/// Forget the conversation and its trace.
+/// Forget the conversation and its trace, unless a question is running: the loop holds the conversation for its
+/// whole network round, so this never waits for it (a sync command waiting there would freeze the app's
+/// command thread). A busy conversation is the closed error `busy` and nothing is cleared.
+pub fn reset_conversation(state: &CoachState) -> Result<(), CoachErrorDto> {
+    match state.conversation.try_lock() {
+        Ok(mut conversation) => conversation.clear(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clear(),
+        Err(TryLockError::WouldBlock) => return Err(CoachError::plain("busy", BUSY_MESSAGE, None)),
+    }
+    Ok(())
+}
+
+/// The fixed message of the `busy` error.
+pub const BUSY_MESSAGE: &str = "a question is still being answered; try again when it has finished";
+
 #[tauri::command]
-pub fn coach_reset(state: State<'_, CoachState>) {
-    state.conversation.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+pub async fn coach_reset(state: State<'_, CoachState>) -> Result<(), CoachErrorDto> {
+    reset_conversation(&state)
 }
 
 #[cfg(test)]
@@ -257,6 +271,29 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"status\":null"));
         assert!(json.contains("\"trace\":[]") && json.contains("\"sends\":0"), "{json}");
+    }
+
+    #[test]
+    fn reset_never_waits_for_a_running_question() {
+        let state = CoachState::default();
+        state.conversation.lock().unwrap().question_sends = 2;
+        // idle: cleared
+        assert_eq!(reset_conversation(&state), Ok(()));
+        assert_eq!(state.conversation.lock().unwrap().question_sends, 0);
+        // a question holds the conversation: busy, at once, nothing cleared
+        let mut held = state.conversation.lock().unwrap();
+        held.question_sends = 5;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| tx.send(reset_conversation(&state)).unwrap());
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("reset returned without waiting for the lock");
+            let error = answer.expect_err("busy");
+            assert_eq!((error.code, error.message, error.status), ("busy", BUSY_MESSAGE, None));
+            assert!(error.trace.is_empty() && error.sends == 0);
+        });
+        assert_eq!(held.question_sends, 5, "nothing was cleared");
+        drop(held);
+        assert_eq!(reset_conversation(&state), Ok(()));
     }
 
     #[test]

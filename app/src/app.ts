@@ -579,8 +579,13 @@ function screenCoach(out: ParentNode, later: Later): void {
   fresh.disabled = !!coachSending;
   fresh.onclick = async () => {
     fresh.disabled = true;
-    try { await core.coachReset(); } catch { /* the in-memory turns below are dropped either way */ }
-    conversation = [];
+    try {
+      await core.coachReset();
+      conversation = [];
+    } catch (e) {
+      // busy: a question is still running on the shell side, so the turns stay and the reason is shown
+      conversation.push({ role: "error", text: core.coachErrorText(e), trace: [], host: "" });
+    }
     void route();
   };
   actions.append(ask, fresh, el("span", "caption muted", "Enter sends, Shift+Enter starts a new line."));
