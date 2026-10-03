@@ -20,6 +20,9 @@
 //! (pitch 15, B3): Ollama's default context is 4k tokens unless `num_ctx` is raised, the OpenAI-compatible
 //! endpoint cannot set it, and a server that silently truncates would drop the system prompt first.
 //!
+//! A provider that rejects `max_tokens: 1` with a 400 (some refuse a cap below their minimum) gets the same
+//! round once more without the cap: the filler is the measurement, the cap only kept the answer short.
+//!
 //! **Errors.** A transport error is `reachable: false` with its code. A 401 or 403 is `reachable: true`,
 //! `error: "unauthorised"` and nothing else is tried. Any other error status is `reachable: true`,
 //! `error: "status"` with the number. Messages and codes are fixed strings, never the provider's text.
@@ -186,7 +189,12 @@ pub fn probe(egress: &dyn Egress, settings: &Settings, bearer: Option<&Zeroizing
 
     // round 2: how much of a long prompt does the server read?
     let context_request = ChatRequest::without_tools(&settings.model, vec![system, Message::User { content: next_context_content() }], 1);
-    match send(egress, &endpoint, bearer, &context_request) {
+    let answer = match send(egress, &endpoint, bearer, &context_request) {
+        // the cap below the provider's minimum, not the prompt, was refused: once more without it
+        Err(EgressError::Status(400)) => send(egress, &endpoint, bearer, &ChatRequest { max_tokens: None, ..context_request }),
+        other => other,
+    };
+    match answer {
         Ok(body) => {
             report.reachable = true;
             report.measured_prompt_tokens = reported_prompt_tokens(&body);

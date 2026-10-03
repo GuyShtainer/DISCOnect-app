@@ -152,6 +152,28 @@ fn context_too_small_when_the_server_reports_a_cut_prompt() {
     assert_eq!((under.context, at.context), (ContextVerdict::TooSmall, ContextVerdict::Ok));
 }
 
+/// A provider that refuses `max_tokens: 1` with a 400 is asked the same round once more without the cap; the
+/// verdict comes from that answer and the report shows no error.
+#[test]
+fn a_400_on_the_capped_context_round_is_retried_once_without_the_cap() {
+    let fake = fake_with(vec![tool_reply("get_metric_series"), Err(EgressError::Status(400)), completion(Some(13_000))]);
+    let report = probe(&fake, &local(), None);
+    assert_eq!(report.context, ContextVerdict::Ok);
+    assert_eq!((report.reachable, report.status, report.error), (true, None, None));
+    let requests = bodies(&fake);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["max_tokens"], 1);
+    assert!(requests[2].get("max_tokens").is_none(), "the retry carries no cap");
+    assert_eq!(requests[2]["messages"], requests[1]["messages"], "the same prompt and filler, measured once");
+    assert!(requests[2].get("tools").is_none());
+
+    // a second 400 is reported as the status it is, and nothing else is tried
+    let fake = fake_with(vec![tool_reply("get_metric_series"), Err(EgressError::Status(400)), Err(EgressError::Status(400))]);
+    let report = probe(&fake, &local(), None);
+    assert_eq!((report.context, report.status, report.error), (ContextVerdict::Unknown, Some(400), Some("status")));
+    assert_eq!(bodies(&fake).len(), 3);
+}
+
 #[test]
 fn context_unknown_when_usage_is_absent() {
     let fake = fake_with(vec![tool_reply("get_metric_series"), completion(None)]);
