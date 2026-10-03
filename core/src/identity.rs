@@ -26,6 +26,9 @@ pub const ENV_PREFIX: &str = "DISCONECT_";
 pub const CLI_KEYCHAIN_SERVICE: &str = "disconect-cli";
 /// Service names an earlier build's Python core used (never used by this crate; kept for the drift pin).
 pub const LEGACY_CLI_KEYCHAIN_SERVICES: &[&str] = &["hearthbeat"];
+/// The desktop app's coach stores the user's model-provider key under this service (Bet 15); a third
+/// name so it never shares an item with [`KEYCHAIN_SERVICE`] or [`CLI_KEYCHAIN_SERVICE`] (drift-pinned).
+pub const COACH_KEYCHAIN_SERVICE: &str = "disconect-coach";
 pub const MCP_SERVER_NAME: &str = "disconect";
 pub const COMMAND: &str = "disconect";
 /// Earlier builds' folders and backup prefixes, read through and never written.

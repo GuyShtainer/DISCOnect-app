@@ -11,6 +11,8 @@ export const DB_FILENAME = "disconect.db";
 export const ENV_PREFIX = "DISCONECT_";
 export const CLI_KEYCHAIN_SERVICE = "disconect-cli";
 export const LEGACY_CLI_KEYCHAIN_SERVICES = ["hearthbeat"] as const;
+// The in-app coach's provider-key keychain item (Bet 15); a third service, never shared with either core's.
+export const COACH_KEYCHAIN_SERVICE = "disconect-coach";
 export const MCP_SERVER_NAME = "disconect";
 export const COMMAND = "disconect";
 export const LEGACY_HOMES = [".hearthbeat"] as const;
