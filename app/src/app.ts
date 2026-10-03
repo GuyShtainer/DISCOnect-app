@@ -669,7 +669,7 @@ async function screenCoachSettings(out: ParentNode): Promise<void> {
   pointsBox.type = "checkbox"; pointsBox.checked = s.include_points; pointsBox.setAttribute("role", "switch");
   points.append(pointsBox);
   card.append(points);
-  card.append(el("p", "caption muted", "Off: the coach receives facts and daily summaries. On: it also receives the value for each day."));
+  card.append(el("p", "caption muted", "Off: a fact carries its window and baseline figures only. On: a fact also carries its day-by-day points. Daily series are sent as days either way."));
   const save = el("button", "", "Save") as HTMLButtonElement;
   const saved = el("span", "caption");
   save.onclick = async () => {
