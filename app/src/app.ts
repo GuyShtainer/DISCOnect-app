@@ -344,7 +344,7 @@ async function screenKey(out: ParentNode): Promise<void> {
       }
     };
     card.append(form, err);
-    card.append(el("p", "caption muted", "Lost the passphrase? Recovery with the 24 words is done in a terminal: disconect key recover."));
+    card.append(el("p", "caption muted", "Lost the passphrase? Use your 24 words in a terminal: disconect key recover."));
     out.append(card);
     setTimeout(() => input.focus(), 0);
     return;

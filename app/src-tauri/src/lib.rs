@@ -1,8 +1,12 @@
-//! DISCOnect app shell (Bet 7, Bet 12). Rust holds no business logic: every command is a thin
-//! relay to the core through [`sidecar`], and the webview draws what the core answers. The core is
+//! DISCOnect app shell (Bet 7, Bet 12). The shell is thin: every command is a relay to the core
+//! through [`sidecar`], and the webview draws what the core answers. The one exception is the
+//! [`coach`] module (Bet 15, ADR 0010), which owns the product's single internet egress point
+//! (`coach/egress.rs`) and is guarded by tests (`tests/egress_guards.rs`). The core is
 //! the Rust port as a sidecar child (macOS release), in this process ([`inproc`]; debug builds and
 //! phones), or the Python one via `--core hearthbeat`.
 
+#[allow(dead_code)] // slices 2-5 fill it
+pub mod coach;
 pub mod inproc;
 pub mod sidecar;
 

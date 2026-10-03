@@ -9,6 +9,8 @@ use crate::wirejson::{Json, PyStr};
 
 pub const PRODUCT: &str = "DISCOnect";
 pub const NOTICE: &str = "Not affiliated with or endorsed by any watch manufacturer.";
+/// The one sentence every coaching session shows (`CLAIMS-POLICY.md`); drift-pinned against `identity.py`.
+pub const DISCLAIMER: &str = "This describes patterns in your own data. It is not medical advice, a diagnosis or a treatment plan.";
 
 /// The keychain service this core stores its master-key item under. **Different from the Python
 /// core's [`CLI_KEYCHAIN_SERVICE`] on purpose:** a generic password is unique per (service, account)

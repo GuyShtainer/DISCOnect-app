@@ -2,6 +2,8 @@
 // rename, no manufacturer marks). The Python core carries the same two in disconect/identity.py.
 export const PRODUCT = "DISCOnect";
 export const NOTICE = "Not affiliated with or endorsed by any watch manufacturer.";
+// The one sentence every coaching session shows (CLAIMS-POLICY.md); drift-pinned against identity.py.
+export const DISCLAIMER = "This describes patterns in your own data. It is not medical advice, a diagnosis or a treatment plan.";
 
 // Names mirrored from identity.py (tests/test_identity_drift.py fails on drift).
 export const DATA_DIR = ".disconect";

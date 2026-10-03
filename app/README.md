@@ -1,6 +1,6 @@
 # disconect-app — the DISCOnect desktop shell (macOS first)
 
-Tauri 2 window over the core. Rust (the shell) holds no business logic: it reaches one `serve`
+Tauri 2 window over the core. Rust (the shell) is thin, except the `coach` module (Bet 15, ADR 0010; the only internet egress): it reaches one `serve`
 core and relays JSON requests; the webview draws what the core answers. The core is either a
 supervised child (the sidecar, ADR 0008) or `disconect-core` **in-process** on a thread of the app
 (Bet 12a):
