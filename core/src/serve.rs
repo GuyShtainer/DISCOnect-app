@@ -1028,18 +1028,6 @@ pub fn isolate_stdout() -> io::Result<std::fs::File> {
     ))
 }
 
-/// `$DISCONECT_DB` (with `~` expanded) if set and non-empty, else `~/.hearthbeat/hearthbeat.db`.
-pub fn default_db_path() -> Option<PathBuf> {
-    match std::env::var_os("DISCONECT_DB") {
-        Some(path) if !path.is_empty() => Some(keys::expand_user(Path::new(&path))),
-        _ => std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join(".hearthbeat")
-                .join("hearthbeat.db")
-        }),
-    }
-}
-
 /// Serve the protocol on stdio until stdin closes. `warnings` are `log` events written first (the
 /// binary reports there that it removed a passphrase variable). Returns the exit code.
 pub fn run(db_path: PathBuf, warnings: &[String]) -> i32 {

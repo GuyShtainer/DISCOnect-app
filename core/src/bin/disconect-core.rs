@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `disconect-core [--db <path>]` (no subcommand, or `serve`) runs the JSON-lines sidecar protocol on
-//! stdio; the default store is `$DISCONECT_DB`, else `~/.hearthbeat/hearthbeat.db`.
+//! stdio; the default store is `$DISCONECT_DB`, else `~/.disconect/disconect.db` (or the old
+//! `~/.hearthbeat/hearthbeat.db` while only that exists; see `disconect_core::home`).
 //!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
 //!  | sync push|pull|status|forget [--relay <folder> [--remember]]`
 //!
 //! `sync` talks to the blind relay (`docs/relay-protocol.md`); the folder comes from `--relay` or
-//! `~/.hearthbeat/relay.json` (`{"folder": path}`, shared with the Python CLI; `--remember` writes
+//! `relay.json` in the data folder (`{"folder": path}`, shared with the Python CLI; `--remember` writes
 //! it). `push` and `pull` need the store's master key (a key file beside the db, unlocked with
 //! `--passphrase-file` or `DISCONECT_PASSPHRASE`); `status` and `forget` need no relay and no key
 //! beyond opening the store.
@@ -20,6 +21,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use disconect_core::keys::{self, KeyError, PassphraseSource};
+use disconect_core::home;
+use disconect_core::identity;
 use disconect_core::serve;
 use disconect_core::relay::folder::{FolderRelay, RelayError};
 use disconect_core::relay::sync::{self, PullResult, StatusReport, SyncError};
@@ -159,9 +162,9 @@ fn expand_user(folder: &str) -> PathBuf {
     }
 }
 
-/// `~/.hearthbeat/relay.json`, shared with the Python CLI.
+/// `relay.json` in the folder of the resolved database, shared with the Python CLI.
 fn relay_config() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hearthbeat/relay.json"))
+    home::relay_config_path()
 }
 
 /// `_relay_for`: the folder from `--relay` or the config file; no secrets live there.
@@ -177,9 +180,13 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
             .and_then(|value| value.get("folder").and_then(Value::as_str).map(str::to_string));
     }
     let Some(folder) = folder.filter(|f| !f.is_empty()) else {
+        let shown = config.as_ref().map_or_else(
+            || format!("~/{}/{}", identity::DATA_DIR, home::RELAY_CONFIG_NAME),
+            |p| p.display().to_string(),
+        );
         return Err((
             EXIT_USAGE,
-            "usage: no relay folder: pass --relay <folder> or write {\"folder\": ...} to ~/.hearthbeat/relay.json".to_string(),
+            format!("usage: no relay folder: pass --relay <folder> or write {{\"folder\": ...}} to {shown}"),
         ));
     };
     if args.relay.is_some() && args.remember {
@@ -385,9 +392,18 @@ fn run_serve(args: &Args) -> ExitCode {
         return ExitCode::from(EXIT_USAGE);
     }
     // `--db` is taken literally (the oracle's argparse default is the only place `~` is expanded)
-    let Some(db) = args.db.clone().or_else(serve::default_db_path) else {
-        eprintln!("error: no store: pass --db <path> or set HEARTHBEAT_DB (HOME is not set)");
-        return ExitCode::from(1);
+    let db = match args.db.clone() {
+        Some(db) => db,
+        None => {
+            let Some(default) = home::resolve_default_db() else {
+                eprintln!("error: no store: pass --db <path> or set DISCONECT_DB (HOME is not set)");
+                return ExitCode::from(1);
+            };
+            if let Some(legacy) = default.legacy_home {
+                eprintln!("{}", home::legacy_home_hint(legacy));
+            }
+            default.path
+        }
     };
     let removed = keys::scrub_env_secrets();
     let warnings: Vec<String> = removed
@@ -406,6 +422,9 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if let Some(warning) = home::legacy_env_warning_now() {
+        eprintln!("{warning}");
+    }
     if args.command.is_none() {
         return run_serve(&args);
     }

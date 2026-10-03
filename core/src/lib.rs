@@ -12,6 +12,7 @@ pub mod clock;
 pub mod contract;
 pub mod export;
 pub mod fit;
+pub mod home;
 pub mod identity;
 pub mod keychain;
 pub mod keys;

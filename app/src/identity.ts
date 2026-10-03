@@ -11,6 +11,8 @@ export const CLI_KEYCHAIN_SERVICE = "disconect-cli";
 export const MCP_SERVER_NAME = "disconect";
 export const COMMAND = "disconect";
 export const LEGACY_HOMES = [".hearthbeat"] as const;
+export const LEGACY_DB_FILENAME = "hearthbeat.db";
+export const LEGACY_ENV_PREFIX = "HEARTHBEAT_";
 export const BACKUP_PREFIX = "disconect";
 export const LEGACY_BACKUP_PREFIXES = ["hearthbeat"] as const;
 

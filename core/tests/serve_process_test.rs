@@ -220,14 +220,68 @@ fn no_subcommand_serves_and_default_db_comes_from_the_environment() {
         "no file and no key file: not encrypted"
     );
 
-    // with neither --db nor DISCONECT_DB it is ~/.hearthbeat/hearthbeat.db under HOME
+    // with neither --db nor DISCONECT_DB it is ~/.disconect/disconect.db under HOME (nothing created)
     let mut command = binary();
-    command.env("HOME", dir.path());
-    let (_, stdout, _) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
-    let expected = dir.path().join(".hearthbeat").join("hearthbeat.db");
+    command.env("HOME", dir.path()).env_remove("DISCONECT_DB");
+    let (_, stdout, stderr) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
+    let expected = dir.path().join(".disconect").join("disconect.db");
     assert_eq!(
         parsed(&stdout)[0]["result"]["db"],
         expected.to_string_lossy().as_ref()
+    );
+    assert!(!stderr.contains("legacy"), "no hint for the new path: {stderr}");
+}
+
+#[test]
+fn the_legacy_folder_is_read_through_with_one_stderr_hint_and_nothing_moves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let legacy = dir.path().join(".hearthbeat");
+    std::fs::create_dir(&legacy).expect("mkdir");
+    std::fs::copy(common::fixtures().join("empty-v3.hbdb"), legacy.join("hearthbeat.db")).expect("copy");
+    let mut command = binary();
+    command.env("HOME", dir.path()).env_remove("DISCONECT_DB");
+    let (status, stdout, stderr) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
+    assert!(status.success());
+    assert_eq!(
+        parsed(&stdout)[0]["result"]["db"],
+        legacy.join("hearthbeat.db").to_string_lossy().as_ref()
+    );
+    let hint = "using legacy data folder ~/.hearthbeat; run 'disconect migrate-home' to move it";
+    assert_eq!(stderr.matches(hint).count(), 1, "{stderr}");
+    assert!(!stdout.contains("legacy"), "the hint never enters the protocol stream");
+    assert!(!dir.path().join(".disconect").exists(), "resolution creates nothing");
+
+    // once the new file exists it wins and the hint stops
+    let new = dir.path().join(".disconect");
+    std::fs::create_dir(&new).expect("mkdir");
+    std::fs::copy(legacy.join("hearthbeat.db"), new.join("disconect.db")).expect("copy");
+    let mut command = binary();
+    command.env("HOME", dir.path()).env_remove("DISCONECT_DB");
+    let (_, stdout, stderr) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
+    assert_eq!(
+        parsed(&stdout)[0]["result"]["db"],
+        new.join("disconect.db").to_string_lossy().as_ref()
+    );
+    assert!(!stderr.contains("legacy"), "{stderr}");
+}
+
+#[test]
+fn old_env_names_warn_once_on_stderr_and_are_not_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut command = binary();
+    command
+        .env("HOME", dir.path())
+        .env_remove("DISCONECT_DB")
+        .env("HEARTHBEAT_DB", dir.path().join("ignored.db"));
+    let (_, stdout, stderr) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
+    assert_eq!(
+        stderr.matches("warning: HEARTHBEAT_DB is no longer read; set DISCONECT_DB instead").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        parsed(&stdout)[0]["result"]["db"],
+        dir.path().join(".disconect/disconect.db").to_string_lossy().as_ref()
     );
 }
 

@@ -89,7 +89,7 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
     );
     // the config is Python's shape: {"folder": path}
     let config =
-        std::fs::read_to_string(cli.home.join(".hearthbeat/relay.json")).expect("config written");
+        std::fs::read_to_string(cli.home.join(".disconect/relay.json")).expect("config written");
     assert_eq!(config, format!("{{\"folder\": \"{relay_arg}\"}}\n"));
 
     // B pulls through the remembered folder

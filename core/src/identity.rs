@@ -24,6 +24,8 @@ pub const MCP_SERVER_NAME: &str = "disconect";
 pub const COMMAND: &str = "disconect";
 /// Earlier builds' folders and backup prefixes, read through and never written.
 pub const LEGACY_HOMES: &[&str] = &[".hearthbeat"];
+pub const LEGACY_DB_FILENAME: &str = "hearthbeat.db";
+pub const LEGACY_ENV_PREFIX: &str = "HEARTHBEAT_";
 pub const BACKUP_PREFIX: &str = "disconect";
 pub const LEGACY_BACKUP_PREFIXES: &[&str] = &["hearthbeat"];
 
