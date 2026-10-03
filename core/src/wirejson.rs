@@ -68,6 +68,20 @@ impl PyInt {
         PyInt(value.to_string())
     }
 
+    /// An integer of any size from its sign and its ASCII digits (leading zeros dropped, `-0` is `0`);
+    /// `None` for no digits or a character that is not an ASCII digit.
+    pub fn from_decimal(negative: bool, digits: &str) -> Option<PyInt> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let trimmed = digits.trim_start_matches('0');
+        Some(PyInt(match (trimmed.is_empty(), negative) {
+            (true, _) => "0".to_string(),
+            (false, true) => format!("-{trimmed}"),
+            (false, false) => trimmed.to_string(),
+        }))
+    }
+
     /// The value when it fits an `i64`.
     pub fn to_i64(&self) -> Option<i64> {
         self.0.parse().ok()
@@ -478,6 +492,71 @@ pub fn write_value(out: &mut String, value: &Value) {
     }
 }
 
+/// Append `json` as `json.dumps` writes it with `ensure_ascii=True`: compact (`,` and `:`) when `indent` is
+/// `None`, else one item per line indented by `indent` spaces per level (`indent=2`). Objects keep the order
+/// they hold; a float is its `repr` and a non-finite one a bare word; an empty list or object is `[]` or `{}`.
+pub fn write_json(out: &mut String, json: &Json, indent: Option<usize>) {
+    write_level(out, json, indent, 0);
+}
+
+fn write_level(out: &mut String, json: &Json, indent: Option<usize>, level: usize) {
+    let newline = |out: &mut String, depth: usize| {
+        if let Some(step) = indent {
+            out.push('\n');
+            out.push_str(&" ".repeat(step * depth));
+        }
+    };
+    match json {
+        Json::Null => out.push_str("null"),
+        Json::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Json::Int(int) => out.push_str(int.text()),
+        Json::Float(x) if x.is_nan() => out.push_str("NaN"),
+        Json::Float(x) if x.is_infinite() => out.push_str(if *x > 0.0 { "Infinity" } else { "-Infinity" }),
+        Json::Float(x) => out.push_str(&crate::canon::py_float_repr(*x)),
+        Json::Str(text) => write_string(out, text.units()),
+        Json::Array(items) if items.is_empty() => out.push_str("[]"),
+        Json::Object(pairs) if pairs.is_empty() => out.push_str("{}"),
+        Json::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                out.push_str(if index == 0 { "" } else { "," });
+                newline(out, level + 1);
+                write_level(out, item, indent, level + 1);
+            }
+            newline(out, level);
+            out.push(']');
+        }
+        Json::Object(pairs) => {
+            out.push('{');
+            for (index, (key, item)) in pairs.iter().enumerate() {
+                out.push_str(if index == 0 { "" } else { "," });
+                newline(out, level + 1);
+                write_string(out, key.units());
+                out.push_str(if indent.is_some() { ": " } else { ":" });
+                write_level(out, item, indent, level + 1);
+            }
+            newline(out, level);
+            out.push('}');
+        }
+    }
+}
+
+/// A `serde_json` value as the ordered wire value (object keys in the order `serde_json` holds them, sorted).
+pub fn from_serde(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Bool(flag) => Json::Bool(*flag),
+        Value::Number(number) => match (number.as_i64(), number.as_u64()) {
+            (Some(int), _) => Json::int(int),
+            (None, Some(big)) => PyInt::from_decimal(false, &big.to_string()).map_or(Json::Null, Json::Int),
+            _ => Json::Float(number.as_f64().unwrap_or(f64::NAN)),
+        },
+        Value::String(text) => Json::text(text),
+        Value::Array(items) => Json::Array(items.iter().map(from_serde).collect()),
+        Value::Object(map) => Json::Object(map.iter().map(|(k, v)| (PyStr::from_text(k), from_serde(v))).collect()),
+    }
+}
+
 /// Append a request id exactly as received.
 pub fn write_json_id(out: &mut String, id: &Id) {
     match id {
@@ -595,5 +674,41 @@ mod tests {
             r#"{"a":[1,true,null,"caf\u00e9 \ud83d\ude00 \u007f \"q\"\n"]}"#
         );
         assert!(out.is_ascii());
+    }
+
+    #[test]
+    fn json_dumps_indent_two_and_compact_match_python() {
+        let Ok(tree) = parse(
+            r#"{"a":[1,2.5,{"b":null}],"c":{},"d":[],"\u00e9":"x\n\u2028\ud83d\ude00","f":1e16,"g":1e-5,"h":100.0,"i":true,"j":-0.0}"#,
+        ) else {
+            unreachable!()
+        };
+        let mut pretty = String::new();
+        write_json(&mut pretty, &tree, Some(2));
+        assert_eq!(
+            pretty,
+            "{\n  \"a\": [\n    1,\n    2.5,\n    {\n      \"b\": null\n    }\n  ],\n  \"c\": {},\n  \"d\": [],\n  \"\\u00e9\": \"x\\n\\u2028\\ud83d\\ude00\",\n  \"f\": 1e+16,\n  \"g\": 1e-05,\n  \"h\": 100.0,\n  \"i\": true,\n  \"j\": -0.0\n}"
+        );
+        let mut compact = String::new();
+        write_json(&mut compact, &tree, None);
+        assert_eq!(
+            compact,
+            r#"{"a":[1,2.5,{"b":null}],"c":{},"d":[],"\u00e9":"x\n\u2028\ud83d\ude00","f":1e+16,"g":1e-05,"h":100.0,"i":true,"j":-0.0}"#
+        );
+        let mut words = String::new();
+        write_json(&mut words, &Json::Array(vec![Json::Float(f64::NAN), Json::Float(f64::NEG_INFINITY)]), None);
+        assert_eq!(words, "[NaN,-Infinity]");
+    }
+
+    #[test]
+    fn decimal_integers_are_normalised_and_serde_values_convert() {
+        assert_eq!(PyInt::from_decimal(true, "000").map(|i| i.text().to_string()).as_deref(), Some("0"));
+        assert_eq!(PyInt::from_decimal(true, "007").map(|i| i.text().to_string()).as_deref(), Some("-7"));
+        assert_eq!(PyInt::from_decimal(false, ""), None);
+        assert_eq!(PyInt::from_decimal(false, "1_0"), None);
+        let tree = from_serde(&json!({"n": 1, "f": 1.0, "big": 18446744073709551615u64, "s": "é", "l": [null, true]}));
+        let mut out = String::new();
+        write_json(&mut out, &tree, None);
+        assert_eq!(out, r#"{"big":18446744073709551615,"f":1.0,"l":[null,true],"n":1,"s":"\u00e9"}"#);
     }
 }
