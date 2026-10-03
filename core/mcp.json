@@ -1,0 +1,1511 @@
+{
+  "notes": [
+    "Measured from the Python server by tests/gen_mcp_fixtures.py; never edited by hand.",
+    "protocol.accepted: the versions an initialize request is answered with as itself; any other version (older, newer, unknown) is answered with protocol.default.",
+    "coercions: outcome is accepted (coerced holds the value the tool function receives, ints as decimal text, floats by repr), rejected (isError, kb23-pydantic-validation-text: only the 'Error executing tool <name>: ' prefix is held), protocol_error (a JSON-RPC error, code given) or dropped (no line at all)."
+  ],
+  "protocol": {
+    "accepted": [
+      "2024-11-05",
+      "2025-03-26",
+      "2025-06-18",
+      "2025-11-25"
+    ],
+    "default": "2025-11-25"
+  },
+  "serverInfo": {
+    "name": "disconect",
+    "version": "0.1.0"
+  },
+  "capabilities": {
+    "experimental": {},
+    "prompts": {
+      "listChanged": false
+    },
+    "resources": {
+      "listChanged": false,
+      "subscribe": false
+    },
+    "tools": {
+      "listChanged": false
+    }
+  },
+  "instructions": "DISCOnect serves one person's watch health data from a local database. Reads one local SQLite file. Opens no network connection and no port. Returns no device serial numbers, file paths, account identifiers, or GPS coordinates.\nTime: Sample timestamps (ts_utc) are RFC 3339 in UTC with a trailing 'Z'. Daily values are keyed by the watch's local calendar date (YYYY-MM-DD), resolved with the UTC offset the watch itself reported nearest to that moment; a night of sleep is keyed by the local date it ended. The time a file was imported (imported_at) is not the time a measurement happened and never stands in for it.\nMissing values: Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.\nSources: source_scope names the layer a value came from. 'device' is decoded from the watch's own FIT bytes, whichever way they arrived (USB, a Connect account export, Gadgetbridge). 'vendor_cloud' is a figure {vendor} computed and delivered as JSON. 'local' is computed here from device data. The scopes are stored side by side and never merged; every value says which scope it belongs to.\nCoverage: Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. Coverage is derived from the retained raw files each time it is asked for; it is never guessed.\nBefore concluding that a period has no data, call get_data_health and read its coverage ledger: a day is present, failed, source_empty or not_covered -- never guess which. Do not diagnose; describe.",
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "What the local store holds: per-stream import provenance and failures, per-metric coverage (all time and in a recent window), sleep nights, activities, recent imports, and the coverage ledger: for every metric and source scope, how many days in the window (up to 3650) are present, failed, source_empty or not_covered, with the gap ranges. Use it to tell 'never imported' from 'failed to decode' from 'the source had nothing'. Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. Coverage is derived from the retained raw files each time it is asked for; it is never guessed.",
+      "inputSchema": {
+        "properties": {
+          "window_days": {
+            "default": 30,
+            "title": "Window Days",
+            "type": "integer"
+          }
+        },
+        "type": "object",
+        "title": "get_data_healthArguments"
+      },
+      "name": "get_data_health",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "get_data_healthDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Daily series for one or more metrics (see the metric enum), newest window ending today or end_date. Daily metrics return {date, value}; sample metrics (heart_rate, stress, respiration_rate, spo2, hrv_rmssd) return per-local-day {date, min, mean, max, samples}. Each series states its unit and source_scope; scopes are never merged. Unknown metric names are listed in ignored_metrics, not errors. Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
+      "inputSchema": {
+        "properties": {
+          "metrics": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "days": {
+            "default": 90,
+            "title": "Days",
+            "type": "integer"
+          },
+          "source_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Scope"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "End Date"
+          }
+        },
+        "required": [
+          "metrics"
+        ],
+        "type": "object",
+        "title": "get_metric_seriesArguments"
+      },
+      "name": "get_metric_series",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "get_metric_seriesDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "One night in full: window, stage minutes, the score breakdown, overnight SpO2/HR/respiration, and the stage timeline when the watch recorded one. Every source's record of the night is returned side by side. Omit date for the latest night. Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
+      "inputSchema": {
+        "properties": {
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Date"
+          }
+        },
+        "type": "object",
+        "title": "get_sleep_detailArguments"
+      },
+      "name": "get_sleep_detail",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "get_sleep_detailDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Recent recorded activities (sport, duration, distance, calories, heart rate), newest first. No routes or coordinates are stored or returned. Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "type": "object",
+        "title": "list_activitiesArguments"
+      },
+      "name": "list_activities",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "list_activitiesDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Deterministic facts: the last window_days (default 7) of every metric with data, compared with this person's own baseline over the baseline_days (default 28) before it. Each fact carries value, direction, delta, z-score, confidence (high/medium/low/insufficient by baseline days with data), a reason_code and the evidence dates. Comparisons are only against the person's own history; no population norms exist here. A fact with confidence 'insufficient' has no comparison, by design. Facts describe, they do not diagnose. end_date defaults to the latest stored date (see as_of). Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
+      "inputSchema": {
+        "properties": {
+          "window_days": {
+            "default": 7,
+            "title": "Window Days",
+            "type": "integer"
+          },
+          "baseline_days": {
+            "default": 28,
+            "title": "Baseline Days",
+            "type": "integer"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "End Date"
+          },
+          "metrics": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Metrics"
+          },
+          "source_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Scope"
+          },
+          "include_points": {
+            "default": false,
+            "title": "Include Points",
+            "type": "boolean"
+          }
+        },
+        "type": "object",
+        "title": "get_period_factsArguments"
+      },
+      "name": "get_period_facts",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "get_period_factsDictOutput"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "The read contract every DISCOnect outlet follows: time, missing-value and source conventions, and the full list of metrics with units, cadence and meaning.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object",
+        "title": "get_contractArguments"
+      },
+      "name": "get_contract",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": true,
+        "title": "get_contractDictOutput"
+      }
+    }
+  ],
+  "errors": {
+    "tool_error": "Error executing tool {name}: {message}",
+    "crash": "Error executing tool {name}",
+    "unknown_tool": "Unknown tool: {name}",
+    "templates": {
+      "not_configured": "{exc}. Nothing can be answered until an import has run.",
+      "schema_too_new": "{exc}",
+      "locked": "{exc}. The store is encrypted or locked: run 'disconect key cache' once in a terminal, then restart disconect-mcp.",
+      "open_failed": "database could not be opened: {exc}",
+      "value_error": "{exc}",
+      "database_error": "database error: {exc}",
+      "no_metrics": "metrics must name at least one metric; call get_contract for the list"
+    },
+    "storage": {
+      "not_configured": "no DISCOnect database yet; run 'disconect import' first"
+    },
+    "bad_day": {
+      "end_date": "end_date must be YYYY-MM-DD",
+      "date": "date must be YYYY-MM-DD"
+    }
+  },
+  "methods": {
+    "ping": {
+      "result": {}
+    },
+    "resources/list": {
+      "result": {
+        "resources": []
+      }
+    },
+    "resources/templates/list": {
+      "result": {
+        "resourceTemplates": []
+      }
+    },
+    "prompts/list": {
+      "result": {
+        "prompts": []
+      }
+    },
+    "logging/setLevel": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found",
+        "data": "logging/setLevel"
+      }
+    },
+    "completion/complete": {
+      "error": {
+        "code": -32602,
+        "message": "Invalid request parameters",
+        "data": ""
+      }
+    },
+    "server/discover": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found",
+        "data": "server/discover"
+      }
+    },
+    "no/such/method": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found",
+        "data": "no/such/method"
+      }
+    },
+    "resources/read": {
+      "error": {
+        "code": -32602,
+        "message": "Unknown resource: file:///x",
+        "data": {
+          "uri": "file:///x"
+        }
+      }
+    },
+    "prompts/get": {
+      "error": {
+        "code": 0,
+        "message": "Unknown prompt: x"
+      }
+    },
+    "resources/subscribe": {
+      "error": {
+        "code": -32601,
+        "message": "Method not found",
+        "data": "resources/subscribe"
+      }
+    }
+  },
+  "pre_initialize": {
+    "ping": {
+      "result": {}
+    },
+    "tools/list": {
+      "error": {
+        "code": -32602,
+        "message": "Invalid request parameters",
+        "data": ""
+      }
+    },
+    "tools/call": {
+      "error": {
+        "code": -32602,
+        "message": "Invalid request parameters",
+        "data": ""
+      }
+    },
+    "resources/list": {
+      "error": {
+        "code": -32602,
+        "message": "Invalid request parameters",
+        "data": ""
+      }
+    },
+    "initialize": {
+      "error": {
+        "code": -32602,
+        "message": "Invalid request parameters",
+        "data": ""
+      }
+    }
+  },
+  "coercions": {
+    "int": {
+      "tool": "list_activities",
+      "param": "limit",
+      "cases": [
+        {
+          "input": "3",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"3\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "2.0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "2"
+            }
+          }
+        },
+        {
+          "input": "2.5",
+          "outcome": "rejected"
+        },
+        {
+          "input": "true",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "1"
+            }
+          }
+        },
+        {
+          "input": "false",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "0"
+            }
+          }
+        },
+        {
+          "input": "null",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"abc\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"1e2\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\" 3 \"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"3.0\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "1e23",
+          "outcome": "rejected"
+        },
+        {
+          "input": "-1e23",
+          "outcome": "rejected"
+        },
+        {
+          "input": "99999999999999999999999",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "99999999999999999999999"
+            }
+          }
+        },
+        {
+          "input": "\"99999999999999999999999\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "99999999999999999999999"
+            }
+          }
+        },
+        {
+          "input": "[]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"+3\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"-3\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "-3"
+            }
+          }
+        },
+        {
+          "input": "\"0x10\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"1_000\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "1000"
+            }
+          }
+        },
+        {
+          "input": "\"\\u0663\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"\\uff13\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "NaN",
+          "outcome": "rejected"
+        },
+        {
+          "input": "Infinity",
+          "outcome": "rejected"
+        },
+        {
+          "input": "-0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "0"
+            }
+          }
+        },
+        {
+          "input": "0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "0"
+            }
+          }
+        },
+        {
+          "input": "-1",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "-1"
+            }
+          }
+        },
+        {
+          "input": "1e2",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "100"
+            }
+          }
+        },
+        {
+          "input": "3e0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "0.0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "0"
+            }
+          }
+        },
+        {
+          "input": "-0.0",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "0"
+            }
+          }
+        },
+        {
+          "input": "200",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "200"
+            }
+          }
+        },
+        {
+          "input": "201",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "201"
+            }
+          }
+        },
+        {
+          "input": "9007199254740993",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "9007199254740993"
+            }
+          }
+        },
+        {
+          "input": "-9007199254740993",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "-9007199254740993"
+            }
+          }
+        },
+        {
+          "input": "\"  \"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"3 \"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"3\\n\"",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "3"
+            }
+          }
+        },
+        {
+          "input": "\"٣\"",
+          "outcome": "rejected"
+        }
+      ]
+    },
+    "str|None": {
+      "tool": "get_sleep_detail",
+      "param": "date",
+      "cases": [
+        {
+          "input": "\"2025-06-30\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": "2025-06-30"
+            }
+          }
+        },
+        {
+          "input": "\"\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": ""
+            }
+          }
+        },
+        {
+          "input": "null",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "null": true
+            }
+          }
+        },
+        {
+          "input": "3",
+          "outcome": "rejected"
+        },
+        {
+          "input": "true",
+          "outcome": "rejected"
+        },
+        {
+          "input": "2.5",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"x\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": "x"
+            }
+          }
+        },
+        {
+          "input": "\"\\u00e9\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": "é"
+            }
+          }
+        },
+        {
+          "input": "\"[\\\"a\\\"]\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"null\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "null": true
+            }
+          }
+        },
+        {
+          "input": "\"3\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": "3"
+            }
+          }
+        },
+        {
+          "input": "\"\\ud83d\\ude00\"",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "str": "😀"
+            }
+          }
+        }
+      ]
+    },
+    "bool": {
+      "tool": "get_period_facts",
+      "param": "include_points",
+      "cases": [
+        {
+          "input": "true",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "false",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "1",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "0",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "2",
+          "outcome": "rejected"
+        },
+        {
+          "input": "-1",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"true\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"false\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\"True\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"TRUE\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"yes\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"no\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\"on\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"off\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\"1\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"0\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\"t\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"f\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\"y\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "\"n\"",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "\" true\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"null\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "null",
+          "outcome": "rejected"
+        },
+        {
+          "input": "1.0",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": true
+            }
+          }
+        },
+        {
+          "input": "0.0",
+          "outcome": "accepted",
+          "coerced": {
+            "include_points": {
+              "bool": false
+            }
+          }
+        },
+        {
+          "input": "0.5",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"abc\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"2\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"1.0\"",
+          "outcome": "rejected"
+        }
+      ]
+    },
+    "list[str]": {
+      "tool": "get_metric_series",
+      "param": "metrics",
+      "cases": [
+        {
+          "input": "[\"steps\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": []
+            }
+          }
+        },
+        {
+          "input": "\"steps\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"[\\\"steps\\\"]\"",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[\"steps\",1]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[null]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "null",
+          "outcome": "rejected"
+        },
+        {
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[\"steps\",\"steps\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                },
+                {
+                  "str": "steps"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[1]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"[]\"",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": []
+            }
+          }
+        },
+        {
+          "input": "[[\"steps\"]]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"steps,heart_rate\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[\"heart_rate\",\"stress\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "heart_rate"
+                },
+                {
+                  "str": "stress"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[\"\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": ""
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[true]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "3",
+          "outcome": "rejected"
+        },
+        {
+          "input": "true",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"null\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"{}\"",
+          "outcome": "rejected"
+        }
+      ]
+    },
+    "list[str]|None": {
+      "tool": "get_period_facts",
+      "param": "metrics",
+      "cases": [
+        {
+          "input": "[\"steps\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": []
+            }
+          }
+        },
+        {
+          "input": "null",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "null": true
+            }
+          }
+        },
+        {
+          "input": "\"steps\"",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"[\\\"steps\\\"]\"",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "input": "[1]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "input": "[\"steps\",null]",
+          "outcome": "rejected"
+        },
+        {
+          "input": "\"null\"",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "null": true
+            }
+          }
+        },
+        {
+          "input": "\"[]\"",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": []
+            }
+          }
+        },
+        {
+          "input": "[\"\"]",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": ""
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "arguments": {
+      "tool": "list_activities",
+      "param": null,
+      "cases": [
+        {
+          "tool": "list_activities",
+          "input": "<absent>",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "20"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "null",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "20"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "{}",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "20"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "[]",
+          "outcome": "protocol_error",
+          "code": -32602
+        },
+        {
+          "tool": "list_activities",
+          "input": "\"x\"",
+          "outcome": "protocol_error",
+          "code": -32602
+        },
+        {
+          "tool": "list_activities",
+          "input": "3",
+          "outcome": "protocol_error",
+          "code": -32602
+        },
+        {
+          "tool": "list_activities",
+          "input": "true",
+          "outcome": "protocol_error",
+          "code": -32602
+        },
+        {
+          "tool": "list_activities",
+          "input": "{\"limit\":2,\"extra\":1}",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "2"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "{\"limit\":1,\"limit\":2}",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "2"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "{\"Limit\":2}",
+          "outcome": "accepted",
+          "coerced": {
+            "limit": {
+              "int": "20"
+            }
+          }
+        },
+        {
+          "tool": "list_activities",
+          "input": "{\"limit\":2,\"limit\":\"x\"}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "<absent>",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "{}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "{\"days\":3}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "{\"metrics\":[\"steps\"]}",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            },
+            "days": {
+              "int": "90"
+            },
+            "source_scope": {
+              "null": true
+            },
+            "end_date": {
+              "null": true
+            }
+          }
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "{\"metrics\":[\"steps\"],\"end_date\":null}",
+          "outcome": "accepted",
+          "coerced": {
+            "metrics": {
+              "list": [
+                {
+                  "str": "steps"
+                }
+              ]
+            },
+            "days": {
+              "int": "90"
+            },
+            "source_scope": {
+              "null": true
+            },
+            "end_date": {
+              "null": true
+            }
+          }
+        },
+        {
+          "tool": "get_metric_series",
+          "input": "{\"metrics\":[\"steps\"],\"source_scope\":null,\"days\":null}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_contract",
+          "input": "<absent>",
+          "outcome": "accepted",
+          "coerced": {}
+        },
+        {
+          "tool": "get_contract",
+          "input": "{}",
+          "outcome": "accepted",
+          "coerced": {}
+        },
+        {
+          "tool": "get_contract",
+          "input": "{\"x\":1}",
+          "outcome": "accepted",
+          "coerced": {}
+        },
+        {
+          "tool": "get_contract",
+          "input": "null",
+          "outcome": "accepted",
+          "coerced": {}
+        },
+        {
+          "tool": "get_data_health",
+          "input": "<absent>",
+          "outcome": "accepted",
+          "coerced": {
+            "window_days": {
+              "int": "30"
+            }
+          }
+        },
+        {
+          "tool": "get_data_health",
+          "input": "{\"window_days\":null}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_period_facts",
+          "input": "{\"window_days\":null}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_period_facts",
+          "input": "{\"include_points\":null}",
+          "outcome": "rejected"
+        },
+        {
+          "tool": "get_sleep_detail",
+          "input": "<absent>",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "null": true
+            }
+          }
+        },
+        {
+          "tool": "get_sleep_detail",
+          "input": "{\"date\":null}",
+          "outcome": "accepted",
+          "coerced": {
+            "date": {
+              "null": true
+            }
+          }
+        }
+      ]
+    }
+  },
+  "identity": {
+    "name": "disconect",
+    "version": "0.1.0"
+  }
+}
