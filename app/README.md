@@ -48,6 +48,15 @@ and as the MCP server for Claude Desktop). Protocol: `../disconect/docs/serve-pr
   non-affiliation notice (the only place they live on the UI side). `src/tokens.css` — written
   by `../disconect/docs/design/gen_tokens.py`; `src/app.css` — layout, token-only.
 
+## Coach projection
+
+What the in-app coach may send to a model is decided in `src-tauri/src/coach/`, by three pure functions: `views::project`
+(an allowlist: days, counts, numbers and a few closed vocabularies; no time of day, no free text, no file, device or
+account identifier), `schema::validate` (a fail-closed positive schema: an unlisted key or an unknown string is an
+error that never repeats the value) and `caps::fit` (a byte budget per tool, with the cuts named in the answer).
+The contract answer is never sent. The table of kept and dropped fields, tool by tool, is the module doc of
+`src-tauri/src/coach/views.rs`; the drawer that shows the user what the model can see cites it.
+
 ## Build and run
 ```sh
 tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build -> .app -> ad-hoc sign
