@@ -257,11 +257,15 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "key.status",
             "key.unlock",
             "key.cache",
-            "data.facts",
+            "data.health",
             "data.metric",
-            "data.today"
+            "data.today",
+            "data.facts",
+            "import.run",
+            "import.last"
         ]
     );
+    assert!(DEFERRED_METHODS.is_empty(), "slice 3D ported the last deferred methods");
     for name in DEFERRED_METHODS {
         assert!(
             !ported.contains(name),

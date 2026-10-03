@@ -3,10 +3,16 @@
 //! stdio, ported from `hearthbeat/serve.py` (the oracle is that file and `tests/test_serve.py`;
 //! `docs/serve-protocol.md` follows them).
 //!
-//! Slice 3A ports the transport and the start-up methods: `app.info`, `key.status`, `key.unlock`,
-//! `key.cache`; slice 3B adds `data.facts`; slice 3C adds `data.metric` and `data.today`. Every other method of the protocol is simply absent from [`METHODS`], so it answers
-//! `unknown_method` until its slice lands (never a new error code, never a fake result); the list of
-//! what is still absent is [`crate::read::DEFERRED_METHODS`].
+//! Slice 3A ported the transport and the start-up methods: `app.info`, `key.status`, `key.unlock`,
+//! `key.cache`; slice 3B added `data.facts`; slice 3C `data.metric` and `data.today`; slice 3D
+//! `data.health`, `import.last` and `import.run`, which completes the oracle's table. A method not in
+//! [`METHODS`] answers `unknown_method` (never a new error code, never a fake result); the list of what
+//! was once absent is [`crate::read::DEFERRED_METHODS`], now empty.
+//!
+//! `import.run` is the one asynchronous method: the request loop validates it, takes the import slot
+//! and starts a worker thread that holds the write lock, streams `progress` events and writes the
+//! response when it is done (so a read such as `import.last` is answered while it runs); at EOF the loop
+//! waits for the worker, like the oracle.
 //!
 //! Boundaries, drawn as hard as the oracle draws them:
 //!
@@ -32,7 +38,10 @@
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use serde_json::{Value, json};
 use unicode_normalization::UnicodeNormalization;
@@ -44,10 +53,13 @@ use crate::keychain::{self, KeychainError, KeychainState};
 use crate::keys::{self, KeyError, Secret32};
 use crate::read::ReadError;
 use crate::read::coverage::{self, NOT_COVERED, PRESENT};
+use crate::read::health;
 use crate::read::insight::{self, FactsQuery};
 use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
+use crate::sources::{self, SourceError};
 use crate::store::{self, StoreError};
+use crate::time::now_instant;
 use crate::wirejson::{self, Id, Json, PyStr};
 
 /// What `app.info.core` says: this implementation, not Python's version string.
@@ -68,6 +80,7 @@ pub enum Failure {
     Keychain(KeychainError),
     Contract(ContractError),
     Read(ReadError),
+    Source(SourceError),
     Io(io::Error),
 }
 
@@ -99,7 +112,36 @@ impl Failure {
             ),
             Failure::Contract(_) => ("internal", "unexpected ContractError".into()),
             Failure::Read(error) => read_parts(error),
+            Failure::Source(error) => source_parts(error),
             Failure::Io(error) => io_parts(error),
+        }
+    }
+}
+
+/// An import failure under the oracle's class-to-code map. A missing path is `FileNotFoundError`
+/// (`not_found`, fixed text); a run the oracle aborts with an uncaught Python exception carries
+/// `Class: message`, mapped by class (`ValueError` and its subclasses `bad_params`, `FileNotFoundError`
+/// `not_found`, anything else `internal` reporting only the class).
+fn source_parts(error: &SourceError) -> (&'static str, String) {
+    match error {
+        SourceError::NotFound(_) => ("not_found", error.to_string()),
+        SourceError::Io(inner) => io_parts(inner),
+        SourceError::Zip(_) => ("internal", "unexpected BadZipFile".into()),
+        SourceError::Writer(crate::writer::WriterError::Db(inner)) | SourceError::Db(inner) => {
+            ("database", format!("database error: {inner}"))
+        }
+        SourceError::Writer(crate::writer::WriterError::Compress(_)) => {
+            ("internal", "unexpected error".into())
+        }
+        SourceError::Abort(text) => {
+            let (class, message) = text.split_once(": ").unwrap_or((text.as_str(), ""));
+            match class {
+                "ValueError" | "UnicodeDecodeError" | "UnicodeEncodeError" | "JSONDecodeError" => {
+                    ("bad_params", message.to_string())
+                }
+                "FileNotFoundError" => ("not_found", message.to_string()),
+                other => ("internal", format!("unexpected {other}")),
+            }
         }
     }
 }
@@ -175,6 +217,11 @@ impl From<ReadError> for Failure {
         Failure::Read(error)
     }
 }
+impl From<SourceError> for Failure {
+    fn from(error: SourceError) -> Failure {
+        Failure::Source(error)
+    }
+}
 impl From<ContractError> for Failure {
     fn from(error: ContractError) -> Failure {
         Failure::Contract(error)
@@ -247,19 +294,41 @@ fn failure_line(id: &Id, failure: &Failure) -> String {
 // ---- session and requests ----
 
 /// Everything one serve process holds: which store it serves, where output goes, the master key
-/// `key.unlock` registered. (The import slot joins it with `import.run`.)
+/// `key.unlock` registered, and the import slot with its worker threads.
 pub struct Session {
     pub db_path: PathBuf,
-    pub channel: Channel,
+    pub channel: Arc<Channel>,
     unlocked: Option<Secret32>,
+    /// True while an import worker owns the slot (`Session.import_slot` in the oracle).
+    import_slot: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+    /// Test hook: the next import worker waits for this channel to deliver or close first.
+    hold: Option<Receiver<()>>,
 }
 
 impl Session {
     pub fn new(db_path: PathBuf, channel: Channel) -> Session {
         Session {
             db_path,
-            channel,
+            channel: Arc::new(channel),
             unlocked: None,
+            import_slot: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
+            hold: None,
+        }
+    }
+
+    /// Test hook (the oracle's tests monkeypatch `import_path` to hold the worker): the next import
+    /// worker does not start until `gate` delivers a message or its sender is dropped.
+    #[doc(hidden)]
+    pub fn hold_next_import(&mut self, gate: Receiver<()>) {
+        self.hold = Some(gate);
+    }
+
+    /// Wait for every import worker (the loop's last act, so an answer is never lost at EOF).
+    fn wait_for_imports(&mut self) {
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
         }
     }
 
@@ -311,17 +380,26 @@ pub struct Call {
     pub params: Json,
 }
 
-pub type Handler = fn(&mut Session, &Call) -> Result<Value, Failure>;
+/// How a method answers: now with a result, or by starting a worker that answers later.
+#[derive(Clone, Copy)]
+pub enum Handler {
+    Reply(fn(&mut Session, &Call) -> Result<Value, Failure>),
+    /// Validates, then starts a thread that writes the response itself (`import.run`).
+    Spawn(fn(&mut Session, &Call) -> Result<(), Failure>),
+}
 
-/// The protocol's methods. A method exists exactly when it is a name here.
+/// The protocol's methods, in the oracle's order. A method exists exactly when it is a name here.
 pub const METHODS: &[(&str, Handler)] = &[
-    ("app.info", app_info),
-    ("key.status", key_status),
-    ("key.unlock", key_unlock),
-    ("key.cache", key_cache),
-    ("data.facts", data_facts),
-    ("data.metric", data_metric),
-    ("data.today", data_today),
+    ("app.info", Handler::Reply(app_info)),
+    ("key.status", Handler::Reply(key_status)),
+    ("key.unlock", Handler::Reply(key_unlock)),
+    ("key.cache", Handler::Reply(key_cache)),
+    ("data.health", Handler::Reply(data_health)),
+    ("data.metric", Handler::Reply(data_metric)),
+    ("data.today", Handler::Reply(data_today)),
+    ("data.facts", Handler::Reply(data_facts)),
+    ("import.run", Handler::Spawn(import_run)),
+    ("import.last", Handler::Reply(import_last)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -513,6 +591,27 @@ fn key_cache(session: &mut Session, call: &Call) -> Result<Value, Failure> {
 
 // ---- data ----
 
+/// Coverage, provenance and recent imports; the core's convention texts are left out and the
+/// manufacturer's name scrubbed.
+fn data_health(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let window_days = int_param(call, "window_days", health::DEFAULT_HEALTH_DAYS)?;
+    let store = session.reader()?;
+    let mut report = health::data_health(store.conn(), Contract::get()?, window_days, now_instant())?;
+    if let Some(object) = report.as_object_mut() {
+        object.remove("conventions");
+    }
+    identity::neutral(&mut report);
+    Ok(report)
+}
+
+/// The newest import runs, each with its recorded failure count.
+fn import_last(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let store = session.reader()?;
+    Ok(health::import_last(store.conn())?)
+}
+
 /// The recent window against this person's own baseline, as facts with confidence. The convention
 /// text `sources` is left out and the manufacturer's name scrubbed, as in the oracle.
 fn data_facts(session: &mut Session, call: &Call) -> Result<Value, Failure> {
@@ -633,6 +732,149 @@ fn data_today(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     Ok(json!({"day": today, "metrics": rows}))
 }
 
+// ---- import ----
+
+/// Protocol transport names -> the names the store records (`TRANSPORTS` in the oracle).
+const TRANSPORTS: [(&str, &str); 2] = [
+    ("export", sources::TRANSPORT_CONNECT_EXPORT),
+    ("usb", "usb"),
+];
+
+/// `str(pathlib.Path(text))`: empty and `.` components dropped, a leading `//` kept, `.` for nothing.
+fn py_path_text(text: &str) -> String {
+    let prefix = if text.starts_with("//") && !text.starts_with("///") {
+        "//"
+    } else if text.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let body: Vec<&str> = text
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let joined = format!("{prefix}{}", body.join("/"));
+    if joined.is_empty() { ".".into() } else { joined }
+}
+
+/// One import request, everything the worker needs.
+struct ImportJob {
+    id: Id,
+    /// None when the request's path holds a lone surrogate: no file can have that name here.
+    path: Option<PathBuf>,
+    /// The path as text for the one message that names it.
+    named: String,
+    transport: Option<&'static str>,
+    db_path: PathBuf,
+    master: Option<Secret32>,
+    channel: Arc<Channel>,
+    slot: Arc<AtomicBool>,
+    hold: Option<Receiver<()>>,
+}
+
+/// A `progress` event line, shaped like the oracle's (`note` is redacted).
+fn progress_line(done: u64, total: Option<u64>, note: &str) -> String {
+    let mut line = format!("{{\"event\":\"progress\",\"op\":\"import\",\"done\":{done},\"total\":");
+    match total {
+        Some(total) => line.push_str(&total.to_string()),
+        None => line.push_str("null"),
+    }
+    line.push_str(",\"note\":");
+    wirejson::write_text(&mut line, &redact_text(note));
+    line.push('}');
+    line
+}
+
+/// `_run_import`: import under the write lock (never waiting for it), streaming progress events.
+fn run_import(job: &ImportJob) -> Result<Value, Failure> {
+    let store = store::open_for_write_with(&job.db_path, "import", 0.0, job.master.as_ref())?;
+    let Some(path) = &job.path else {
+        return Err(SourceError::NotFound(job.named.clone()).into());
+    };
+    let channel = &job.channel;
+    // the bridge being gone is not the import's problem: EOF on stdin ends the process
+    let mut progress = |done: u64, total: Option<u64>, note: &str| {
+        let _ = channel.write_line(&progress_line(done, total, note));
+    };
+    let stats = sources::import_path(store.conn(), path, job.transport, Some(&mut progress))?;
+    let run_id: Option<i64> = store
+        .conn()
+        .query_row("SELECT MAX(id) FROM import_runs", [], |row| row.get(0))
+        .map_err(StoreError::from)?;
+    Ok(json!({
+        "run_id": run_id, "files": stats.files_seen, "ok": stats.files_imported,
+        "partial": stats.status() == "partial", "duplicate": stats.files_duplicate,
+        "failed": stats.files_failed,
+    }))
+}
+
+/// `_import_worker`: run the import, free the slot, then answer the request.
+fn import_worker(job: ImportJob) {
+    if let Some(gate) = &job.hold {
+        let _ = gate.recv();
+    }
+    let line = match run_import(&job) {
+        Ok(result) => result_line(&job.id, &result),
+        Err(failure) => failure_line(&job.id, &failure),
+    };
+    job.slot.store(false, Ordering::SeqCst);
+    let _ = job.channel.write_line(&line);
+}
+
+/// Start an import on a worker thread; the answer is sent when it finishes.
+fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
+    session.require_unlocked()?;
+    let path = text_param(call, "path")?;
+    let transport = match optional_text_param(call, "transport")? {
+        None => None,
+        Some(name) => match TRANSPORTS.iter().find(|(known, _)| name.equals(known)) {
+            Some((_, stored)) => Some(*stored),
+            None => {
+                return Err(Failure::serve(
+                    "bad_params",
+                    "transport must be one of ['export', 'usb']",
+                ));
+            }
+        },
+    };
+    if session
+        .import_slot
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(Failure::serve("busy", "an import is already running"));
+    }
+    // a path with a lone surrogate cannot name a file here: it is reported as missing (booked, kb/23)
+    let text = path.to_text();
+    let lossy = text.clone().unwrap_or_else(|| path.units_lossy());
+    let named = py_path_text(&keys::expand_user(Path::new(&lossy)).to_string_lossy());
+    let job = ImportJob {
+        id: call.id.clone(),
+        path: text.map(|_| PathBuf::from(&named)),
+        named,
+        transport,
+        db_path: session.db_path.clone(),
+        master: session.unlocked_master().cloned(),
+        channel: Arc::clone(&session.channel),
+        slot: Arc::clone(&session.import_slot),
+        hold: session.hold.take(),
+    };
+    let slot = Arc::clone(&session.import_slot);
+    match std::thread::Builder::new()
+        .name("import".into())
+        .spawn(move || import_worker(job))
+    {
+        Ok(handle) => {
+            session.workers.push(handle);
+            Ok(())
+        }
+        Err(error) => {
+            slot.store(false, Ordering::SeqCst);
+            Err(Failure::Io(error))
+        }
+    }
+}
+
 // ---- the loop ----
 
 /// A line that is not a usable request; the id is [`Id::None`] when not even an id could be read.
@@ -678,14 +920,20 @@ fn parse(line: &str) -> Result<Call, Rejected> {
     })
 }
 
-/// The response line for `call`.
-fn dispatch(session: &mut Session, call: &Call) -> String {
+/// The response line for `call`, or None when the handler answers later (the import worker).
+fn dispatch(session: &mut Session, call: &Call) -> Option<String> {
     let Some((_, handler)) = METHODS.iter().find(|(name, _)| call.method.equals(name)) else {
-        return error_line(&call.id, "unknown_method", "no such method");
+        return Some(error_line(&call.id, "unknown_method", "no such method"));
     };
-    match handler(session, call) {
-        Ok(result) => result_line(&call.id, &result),
-        Err(failure) => failure_line(&call.id, &failure),
+    match handler {
+        Handler::Reply(handler) => Some(match handler(session, call) {
+            Ok(result) => result_line(&call.id, &result),
+            Err(failure) => failure_line(&call.id, &failure),
+        }),
+        Handler::Spawn(handler) => match handler(session, call) {
+            Ok(()) => None,
+            Err(failure) => Some(failure_line(&call.id, &failure)),
+        },
     }
 }
 
@@ -693,9 +941,12 @@ fn dispatch(session: &mut Session, call: &Call) -> String {
 pub fn handle_line(session: &mut Session, line: &str) -> io::Result<()> {
     let reply = match parse(line) {
         Ok(call) => dispatch(session, &call),
-        Err(rejected) => error_line(&rejected.id, "bad_params", rejected.message),
+        Err(rejected) => Some(error_line(&rejected.id, "bad_params", rejected.message)),
     };
-    session.channel.write_line(&reply)
+    match reply {
+        Some(line) => session.channel.write_line(&line),
+        None => Ok(()),
+    }
 }
 
 /// Python's `str.strip()` emptiness test: Unicode white space plus the four ASCII separators.
@@ -704,9 +955,15 @@ fn is_blank(line: &str) -> bool {
         .all(|c| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 
-/// The request loop: one request per non-blank line until the input ends. Lines end at `\n` only;
-/// bytes that are not UTF-8 become U+FFFD. Returns the process exit code.
-pub fn serve_lines(session: &mut Session, mut input: impl Read) -> i32 {
+/// The request loop: one request per non-blank line until the input ends, then wait for any import.
+/// Lines end at `\n` only; bytes that are not UTF-8 become U+FFFD. Returns the process exit code.
+pub fn serve_lines(session: &mut Session, input: impl Read) -> i32 {
+    read_requests(session, input);
+    session.wait_for_imports();
+    0
+}
+
+fn read_requests(session: &mut Session, mut input: impl Read) {
     let mut line: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -720,12 +977,11 @@ pub fn serve_lines(session: &mut Session, mut input: impl Read) -> i32 {
             if *byte != b'\n' {
                 line.push(*byte);
             } else if answer(session, &mut line).is_err() {
-                return 0; // the bridge's pipe is gone
+                return; // the bridge's pipe is gone
             }
         }
     }
     let _ = answer(session, &mut line);
-    0
 }
 
 fn answer(session: &mut Session, line: &mut Vec<u8>) -> io::Result<()> {

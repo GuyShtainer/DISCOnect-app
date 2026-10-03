@@ -129,7 +129,7 @@ fn export_with_readiness(dir: &Path, name: &str, record: &str) -> PathBuf {
 }
 
 fn import(device: &Device, path: &Path) {
-    import_path(device.conn(), path, None).expect("import");
+    import_path(device.conn(), path, None, None).expect("import");
 }
 
 fn push(device: &Device, relay: &dyn Relay) -> sync::PushResult {

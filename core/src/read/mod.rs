@@ -6,8 +6,8 @@
 //! Slice 3A scaffolded it; slice 3B adds `insight` (`data.facts`), `queries` (the sample-day
 //! aggregates it reads) and `numerics` (`fsum` and the exact `stdev` of Python's `statistics`);
 //! slice 3C adds `coverage` (the ledger) and the calendar half of `queries` (`data.metric`,
-//! `data.today`). What lands next, in the pitch's order: `health` (`data.health`), then the
-//! `import.*` progress hook. Until then each of those methods is absent from [`crate::serve::METHODS`].
+//! `data.today`); slice 3D adds `health` (`data.health`, `import.last`) and the import progress hook
+//! (`sources::import_path`) that `import.run` streams.
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
@@ -16,6 +16,7 @@
 use crate::contract::ContractError;
 
 pub mod coverage;
+pub mod health;
 pub mod insight;
 pub mod numerics;
 pub mod pyrepr;
@@ -38,11 +39,8 @@ pub enum ReadError {
     Contract(#[from] ContractError),
 }
 
-/// The protocol methods the oracle has that this core does not answer yet. Each answers
+/// The protocol methods the oracle has that this core does not answer yet. Each would answer
 /// `unknown_method`; `tools/serve_diff.py` counts a Python success against it as "not yet ported",
-/// never as a difference. A test keeps this list and `METHODS` disjoint and complete.
-pub const DEFERRED_METHODS: &[&str] = &[
-    "data.health",
-    "import.last",
-    "import.run",
-];
+/// never as a difference. A test keeps this list and `METHODS` disjoint and complete. Slice 3D
+/// ported the last three (`data.health`, `import.last`, `import.run`), so none is left.
+pub const DEFERRED_METHODS: &[&str] = &[];

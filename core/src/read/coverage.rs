@@ -89,7 +89,7 @@ impl Window {
     }
 }
 
-fn has_table(conn: &Connection, name: &str) -> Result<bool, ReadError> {
+pub(crate) fn has_table(conn: &Connection, name: &str) -> Result<bool, ReadError> {
     let found: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",

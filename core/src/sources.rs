@@ -222,12 +222,45 @@ pub fn iter_fit_files(path: &Path) -> Result<Vec<(String, Vec<u8>)>, SourceError
     Ok(out)
 }
 
-pub(crate) fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>) -> Result<(), WriterError> {
+/// `ProgressCallback`: `progress(done, total_or_None, note)`. The FIT phase reports `(done, total,
+/// outcome)` after each file, where `outcome` is what `write_fit` returned (`imported`, `duplicate` or
+/// `failed`: the oracle's `_import_fit_batch` names it `stream`, but it is the status constant); an
+/// export's JSON phase restarts `done` at 0 and reports `(done, None, stream)` after each imported file.
+/// Never a file name or path.
+pub type Progress<'a> = &'a mut dyn FnMut(u64, Option<u64>, &str);
+
+/// Lend a progress callback to one phase without giving it away.
+pub fn reborrow<'b>(progress: &'b mut Option<Progress<'_>>) -> Option<Progress<'b>> {
+    match progress {
+        Some(inner) => Some(&mut **inner),
+        None => None,
+    }
+}
+
+/// The text `write_fit` returns in the oracle (`IMPORTED`, `DUPLICATE`, `FAILED`, `REPARSED`).
+fn outcome_text(outcome: WriteOutcome) -> &'static str {
+    match outcome {
+        WriteOutcome::Imported => "imported",
+        WriteOutcome::Duplicate => "duplicate",
+        WriteOutcome::Failed => "failed",
+        WriteOutcome::Reparsed => "reparsed",
+    }
+}
+
+pub(crate) fn import_batch(
+    files: &[(String, Vec<u8>)],
+    writer: &mut Writer<'_>,
+    mut progress: Option<Progress<'_>>,
+) -> Result<(), WriterError> {
     for (_label, data) in files {
         writer.offsets.extend(fit::scan_clock_offsets(data));
     }
-    for (label, data) in files {
-        writer.write_fit(data, label, None)?;
+    let total = files.len() as u64;
+    for (done, (label, data)) in (1u64..).zip(files) {
+        let outcome = writer.write_fit(data, label, None)?;
+        if let Some(report) = progress.as_deref_mut() {
+            report(done, Some(total), outcome_text(outcome));
+        }
     }
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
@@ -237,7 +270,13 @@ pub(crate) fn import_batch(files: &[(String, Vec<u8>)], writer: &mut Writer<'_>)
 /// Import whatever `path` is into `conn` (a writable connection holding the write lock) and report.
 /// `transport` defaults to `connect_export` for an account export and `drop` otherwise. An
 /// export's FIT members go first (one clock-offset pre-pass), then its JSON files, in one run.
-pub fn import_path(conn: &Connection, path: &Path, transport: Option<&str>) -> Result<ImportStats, SourceError> {
+/// `progress` is called after each file (see [`Progress`]).
+pub fn import_path(
+    conn: &Connection,
+    path: &Path,
+    transport: Option<&str>,
+    mut progress: Option<Progress<'_>>,
+) -> Result<ImportStats, SourceError> {
     if !path.exists() {
         return Err(SourceError::NotFound(path.display().to_string()));
     }
@@ -247,10 +286,14 @@ pub fn import_path(conn: &Connection, path: &Path, transport: Option<&str>) -> R
     writer.begin_run()?;
     let outcome = if is_export {
         export::collect_fit_members(path)
-            .and_then(|files| import_batch(&files, &mut writer).map_err(SourceError::from))
-            .and_then(|()| export::import_connect_export(path, &mut writer))
+            .and_then(|files| {
+                import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
+            })
+            .and_then(|()| export::import_connect_export(path, &mut writer, reborrow(&mut progress)))
     } else {
-        iter_fit_files(path).and_then(|files| import_batch(&files, &mut writer).map_err(SourceError::from))
+        iter_fit_files(path).and_then(|files| {
+            import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
+        })
     };
     if let Err(error) = outcome {
         writer.finish_run(Some(&error.to_string()))?;

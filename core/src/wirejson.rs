@@ -40,6 +40,11 @@ impl PyStr {
         String::from_utf16(&self.0).ok()
     }
 
+    /// The text with each lone surrogate replaced by U+FFFD (for a message that cannot carry it).
+    pub fn units_lossy(&self) -> String {
+        String::from_utf16_lossy(&self.0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

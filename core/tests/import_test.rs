@@ -42,7 +42,7 @@ fn every_fixture_but_garbage_imports_and_garbage_fails_then_rerun_is_all_duplica
     let store = open(&dir.path().join("plain.db"));
     let conn = store.conn();
 
-    let first = import_path(conn, &folder, None).expect("first import");
+    let first = import_path(conn, &folder, None, None).expect("first import");
     assert_eq!((first.files_seen, first.files_imported, first.files_duplicate, first.files_failed), (total, total - 1, 0, 1));
     assert_eq!(first.status(), "partial");
     assert_eq!(first.transport, "drop");
@@ -67,7 +67,7 @@ fn every_fixture_but_garbage_imports_and_garbage_fails_then_rerun_is_all_duplica
     assert!(size > 0 && !payload.is_empty());
 
     let rows_before: Vec<(String, i64)> = store::table_counts(conn).expect("counts");
-    let second = import_path(conn, &folder, Some("usb")).expect("second import");
+    let second = import_path(conn, &folder, Some("usb"), None).expect("second import");
     assert_eq!((second.files_seen, second.files_imported, second.files_duplicate), (total, 0, total - 1));
     // the undecodable file fails again (its failure row is unique by hash, so it is not duplicated)
     assert_eq!(second.files_failed, 1);
@@ -113,7 +113,7 @@ fn single_file_and_zip_are_bags_of_fit_files() {
     assert_eq!(labels, ["a.FIT", "z/b.fit"]);
 
     let store = open(&dir.path().join("zip.db"));
-    let stats = import_path(store.conn(), &zip_path, Some("ciq")).expect("zip import");
+    let stats = import_path(store.conn(), &zip_path, Some("ciq"), None).expect("zip import");
     assert_eq!((stats.files_imported, stats.files_duplicate), (1, 1), "the two entries are the same bytes");
     assert_eq!(stats.status(), "ok");
 }
@@ -122,7 +122,7 @@ fn single_file_and_zip_are_bags_of_fit_files() {
 fn a_missing_path_is_an_error_and_writes_no_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open(&dir.path().join("none.db"));
-    assert!(import_path(store.conn(), &dir.path().join("nope"), None).is_err());
+    assert!(import_path(store.conn(), &dir.path().join("nope"), None, None).is_err());
     assert_eq!(count(store.conn(), "import_runs"), 0);
 }
 

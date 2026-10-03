@@ -142,7 +142,7 @@ fn run_import(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, Stri
         };
         (code, e.to_string())
     })?;
-    let stats = sources::import_path(opened.conn(), path, args.transport.as_deref())
+    let stats = sources::import_path(opened.conn(), path, args.transport.as_deref(), None)
         .map_err(|e| (import_exit_code(&e), e.to_string()))?;
     for line in stats.summary_lines() {
         println!("{line}");

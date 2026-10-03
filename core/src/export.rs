@@ -1338,8 +1338,15 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// `import_connect_export`: feed every recognised JSON file of the export to `writer`; everything
 /// else counts as ignored. (The FIT corpus is the caller's: [`collect_fit_members`].)
-pub fn import_connect_export(path: &Path, writer: &mut Writer<'_>) -> Result<(), SourceError> {
+/// `progress(done, None, stream)` is called after each imported file; `done` counts from 0 for the
+/// JSON phase and an ignored entry is not counted.
+pub fn import_connect_export(
+    path: &Path,
+    writer: &mut Writer<'_>,
+    mut progress: Option<crate::sources::Progress<'_>>,
+) -> Result<(), SourceError> {
     let mut tree = Tree::open(path)?;
+    let mut done: u64 = 0;
     for index in 0..tree.entries.len() {
         let written = tree.written(index)?;
         let Some(info) = plan(&tree.entries[index], written) else {
@@ -1347,6 +1354,10 @@ pub fn import_connect_export(path: &Path, writer: &mut Writer<'_>) -> Result<(),
             continue;
         };
         import_entry(&mut tree, index, &info, writer)?;
+        done += 1;
+        if let Some(report) = progress.as_deref_mut() {
+            report(done, None, info.stream);
+        }
     }
     Ok(())
 }
@@ -1993,7 +2004,7 @@ mod tests {
         write(&root, "elsewhere/notes.json", "[]");
         let store = store_in(dir.path());
         let conn = store.conn();
-        let stats = import_path(conn, &root, None).expect("import");
+        let stats = import_path(conn, &root, None, None).expect("import");
         assert_eq!(stats.transport, "connect_export");
         assert_eq!(stats.dropped.get("uds_without_date"), Some(&1));
         assert_eq!(
@@ -2037,7 +2048,7 @@ mod tests {
             0
         );
         // a second import is all duplicates and books the same failure once
-        let again = import_path(conn, &root, None).expect("second import");
+        let again = import_path(conn, &root, None, None).expect("second import");
         assert_eq!((again.files_imported, again.files_duplicate), (0, 2));
         assert_eq!(count(conn, "SELECT count(*) FROM import_failures"), 1);
     }
@@ -2059,7 +2070,7 @@ mod tests {
         writer.finish().expect("finish");
         let store = store_in(dir.path());
         let conn = store.conn();
-        import_path(conn, &zip_path, None).expect("import");
+        import_path(conn, &zip_path, None, None).expect("import");
         let ranges: Vec<(String, String, String)> = conn
             .prepare("SELECT stream, from_day, to_day FROM export_ranges ORDER BY stream")
             .expect("prepare")
@@ -2101,7 +2112,7 @@ mod tests {
         );
         let store = store_in(dir.path());
         let conn = store.conn();
-        let error = import_path(conn, &root, None).expect_err("aborts");
+        let error = import_path(conn, &root, None, None).expect_err("aborts");
         assert!(
             matches!(&error, SourceError::Abort(m) if m.starts_with("BadZipFile")),
             "{error}"
@@ -2136,7 +2147,7 @@ mod tests {
         );
         let store = store_in(dir.path());
         let conn = store.conn();
-        let error = import_path(conn, &root, None).expect_err("aborts");
+        let error = import_path(conn, &root, None, None).expect_err("aborts");
         assert!(
             matches!(&error, SourceError::Abort(m) if m.starts_with("OverflowError")),
             "{error}"
@@ -2167,7 +2178,7 @@ mod tests {
         );
         let store = store_in(dir.path());
         let conn = store.conn();
-        let stats = import_path(conn, &root, None).expect("import");
+        let stats = import_path(conn, &root, None, None).expect("import");
         assert_eq!((stats.files_imported, stats.files_failed), (1, 1));
         let kind: String = conn
             .query_row("SELECT kind FROM import_failures", [], |r| r.get(0))
