@@ -859,3 +859,50 @@ mod tests {
         assert_eq!(engine.decode("AB==").expect("lenient"), vec![0]);
     }
 }
+
+#[cfg(test)]
+mod wire_constants {
+    //! The committed relay object, built once by the Python relay code from synthetic records under
+    //! the committed test key; the Python twin is `tests/test_wire_constants.py`.
+    use super::*;
+    use crate::keys::{self, PassphraseSource};
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+
+    const ACCOUNT_HEX: &str = "053e1211c6660255d9168e529d6a11ff000433dab305659da7e9aa8dfa92021e";
+    const BUNDLE_SHA256: &str = "fbf8bf9ae03e91062bea3a00b12c9beda24829c5cc96f7eb72da07fe518ea0d6";
+    const PAYLOAD_SHA256: &str = "4958ec2a21a490f2213f2f1d7b9cf93863d1e7eb257aa265f5716c943a3a0c87";
+    const NAME: &str = "053e1211c6660255d9168e529d6a11ff000433dab305659da7e9aa8dfa92021e/00112233445566778899aabbccddeeff";
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn labels_are_frozen_verbatim() {
+        assert_eq!(INFO_BUNDLE, b"hearthbeat/relay/v1/bundle");
+        assert_eq!(INFO_ACCOUNT, b"hearthbeat/relay-account");
+        assert_eq!(AAD_PREFIX, b"hearthbeat/relay/v1/");
+    }
+
+    #[test]
+    fn known_answer_bundle_decrypts_and_parses() {
+        let master = keys::unlock(
+            &fixtures().join("test.keys.json"),
+            PassphraseSource::Explicit("core-test-passphrase-2026"),
+        )
+        .expect("unlock the fixture key");
+        assert_eq!(account_for(master.as_ref()), ACCOUNT_HEX);
+        let blob = std::fs::read(fixtures().join("relay/known-answer.bundle")).expect("fixture bundle");
+        assert_eq!(hex::encode(Sha256::digest(&blob)), BUNDLE_SHA256);
+        let opened = unpack(master.as_ref(), NAME, &blob).expect("unpack");
+        assert_eq!((opened.records.len(), opened.ranges.len()), (3, 1));
+        assert_eq!(opened.header.device_id, "synthetic-device-a");
+        assert_eq!(opened.header.device_seq, 1);
+        let mut digest = Sha256::new();
+        for record in &opened.records {
+            digest.update(&record.payload);
+        }
+        assert_eq!(hex::encode(digest.finalize()), PAYLOAD_SHA256);
+    }
+}

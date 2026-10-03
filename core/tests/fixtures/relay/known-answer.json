@@ -1,0 +1,9 @@
+{
+  "account": "053e1211c6660255d9168e529d6a11ff000433dab305659da7e9aa8dfa92021e",
+  "bundle_sha256": "fbf8bf9ae03e91062bea3a00b12c9beda24829c5cc96f7eb72da07fe518ea0d6",
+  "name": "053e1211c6660255d9168e529d6a11ff000433dab305659da7e9aa8dfa92021e/00112233445566778899aabbccddeeff",
+  "note": "synthetic records; encrypted once with the Python relay code under the committed test key (core-test-passphrase-2026)",
+  "payload_sha256": "4958ec2a21a490f2213f2f1d7b9cf93863d1e7eb257aa265f5716c943a3a0c87",
+  "ranges": 1,
+  "records": 3
+}

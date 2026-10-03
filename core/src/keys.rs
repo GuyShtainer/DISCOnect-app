@@ -27,6 +27,12 @@ pub const NEXT_SUFFIX: &str = ".next";
 pub const RECOVERY_WORDS_ENV: &str = "HEARTHBEAT_RECOVERY_WORDS";
 pub const PURPOSE_PASSPHRASE: &str = "passphrase";
 
+// Frozen wire constants (docs/kb/24-wire-constants.md): they stay `hearthbeat` through every rename.
+const INFO_DB: &[u8] = b"hearthbeat/db";
+const INFO_KEY_ID: &[u8] = b"hearthbeat/key-id";
+const AAD_PREFIX: &[u8] = b"hearthbeat/keys/v1/";
+const KEY_FILE_FORMAT: &str = "hearthbeat-keys";
+
 const KDF_FLOOR_M_KIB: u64 = 64 * 1024;
 const KDF_FLOOR_T: u64 = 2;
 const KDF_CEILING_M_KIB: u64 = 4 * 1024 * 1024;
@@ -110,7 +116,7 @@ pub fn read_key_file(path: &Path) -> Result<KeyFile, KeyError> {
 }
 
 fn parse_document(raw: &Value) -> Result<KeyFile, KeyError> {
-    let format_ok = raw.get("format").and_then(Value::as_str) == Some("hearthbeat-keys");
+    let format_ok = raw.get("format").and_then(Value::as_str) == Some(KEY_FILE_FORMAT);
     let version = raw.get("format_version").and_then(Value::as_u64).unwrap_or(0);
     if !format_ok || version > FORMAT_VERSION {
         return corrupt("key file is not a hearthbeat key file this build understands");
@@ -167,7 +173,7 @@ pub fn normalise_passphrase(text: &str) -> Zeroizing<Vec<u8>> {
 }
 
 fn aad(purpose: &str, key_id: &[u8; 16]) -> Vec<u8> {
-    let mut out = b"hearthbeat/keys/v1/".to_vec();
+    let mut out = AAD_PREFIX.to_vec();
     out.extend_from_slice(purpose.as_bytes());
     out.push(b'/');
     out.extend_from_slice(hex::encode(key_id).as_bytes());
@@ -200,7 +206,7 @@ fn hkdf32(master: &[u8], info: &[u8]) -> Secret32 {
 pub fn key_id_for(master: &[u8; 32]) -> [u8; 16] {
     let mut out = [0u8; 16];
     // 16 bytes is far below the HKDF-SHA256 limit; expand cannot fail.
-    if Hkdf::<Sha256>::new(None, master).expand(b"hearthbeat/key-id", &mut out).is_err() {
+    if Hkdf::<Sha256>::new(None, master).expand(INFO_KEY_ID, &mut out).is_err() {
         out = [0u8; 16];
     }
     out
@@ -208,7 +214,7 @@ pub fn key_id_for(master: &[u8; 32]) -> [u8; 16] {
 
 /// The 32-byte SQLCipher raw key for `master`.
 pub fn db_key(master: &[u8; 32]) -> Secret32 {
-    hkdf32(master, b"hearthbeat/db")
+    hkdf32(master, INFO_DB)
 }
 
 /// Lowercase hex of [`db_key`].
@@ -308,4 +314,36 @@ pub fn unlock(key_path: &Path, source: PassphraseSource<'_>) -> Result<Secret32,
         PassphraseSource::Env => from_env.ok_or(KeyError::Locked)?,
     };
     unlock_with_passphrase(&key_file, &passphrase)
+}
+
+#[cfg(test)]
+mod wire_constants {
+    //! Known-answer vectors for the frozen derivations; the Python twin is `tests/test_wire_constants.py`.
+    use super::*;
+
+    const KEY_ID_HEX: &str = "b4714bc6c191877abbd67d79274a4fd2";
+    const DB_KEY_HEX: &str = "5a0db69ac2f8cc262e5bfb28d4deb8b9ba8637307cea5de707d890654573b162";
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.keys.json")
+    }
+
+    #[test]
+    fn labels_are_frozen_verbatim() {
+        assert_eq!(INFO_DB, b"hearthbeat/db");
+        assert_eq!(INFO_KEY_ID, b"hearthbeat/key-id");
+        assert_eq!(AAD_PREFIX, b"hearthbeat/keys/v1/");
+        assert_eq!(KEY_FILE_FORMAT, "hearthbeat-keys");
+        let key_id: [u8; 16] = [0x11; 16];
+        let expected = format!("hearthbeat/keys/v1/passphrase/{}", hex::encode(key_id));
+        assert_eq!(aad(PURPOSE_PASSPHRASE, &key_id), expected.as_bytes());
+    }
+
+    #[test]
+    fn known_answer_key_id_and_db_key() {
+        let key_file = read_key_file(&fixture()).expect("fixture key file");
+        let secret = unlock_with_passphrase(&key_file, "core-test-passphrase-2026").expect("unlock");
+        assert_eq!(hex::encode(key_id_for(&secret)), KEY_ID_HEX);
+        assert_eq!(&*db_key_hex(&secret), DB_KEY_HEX);
+    }
 }
