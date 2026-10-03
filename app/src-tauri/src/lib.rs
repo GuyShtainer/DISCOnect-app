@@ -73,12 +73,9 @@ fn core_stderr(state: State<'_, Core>) -> Result<Vec<String>, CoreError> {
     Ok(core_of(&state)?.stderr_tail())
 }
 
-/// Evidence hook, debug builds only: unlock with the passphrase read from the file named by
-/// `DISCONECT_DEBUG_PASSPHRASE_FILE`, so Claude can capture unlocked screens without typing
-/// into the webview. Compiled out of release builds.
+/// The passphrase named by `DISCONECT_DEBUG_PASSPHRASE_FILE` (evidence runs on scratch stores).
 #[cfg(debug_assertions)]
-#[tauri::command]
-async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreError> {
+fn debug_passphrase() -> Result<Zeroizing<String>, CoreError> {
     let Some(path) = std::env::var_os("DISCONECT_DEBUG_PASSPHRASE_FILE") else {
         return Err(CoreError { code: "bad_params".into(), message: "no debug passphrase file set".into() });
     };
@@ -86,8 +83,16 @@ async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreErr
         std::fs::read_to_string(path)
             .map_err(|e| CoreError { code: "bad_params".into(), message: format!("cannot read the debug file: {e}") })?,
     );
-    let pass = Zeroizing::new(text.trim_end_matches(['\n', '\r']).to_string());
-    core_of(&state)?.unlock(pass).await
+    Ok(Zeroizing::new(text.trim_end_matches(['\n', '\r']).to_string()))
+}
+
+/// Evidence hook, debug builds only: unlock with the passphrase read from the file named by
+/// `DISCONECT_DEBUG_PASSPHRASE_FILE`, so Claude can capture unlocked screens without typing
+/// into the webview. Compiled out of release builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreError> {
+    core_of(&state)?.unlock(debug_passphrase()?).await
 }
 
 /// The store the in-process core serves, resolved here and handed over explicitly (the core is
@@ -160,6 +165,12 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
             let core = start_core(app.handle());
+            // Evidence runs (debug builds, scratch stores): unlock before the window asks, so a
+            // screenshot shows the unlocked screens; nothing is typed into the webview.
+            #[cfg(debug_assertions)]
+            if let (Ok(core), Ok(pass)) = (&core, debug_passphrase()) {
+                let _ = tauri::async_runtime::block_on(core.unlock(pass));
+            }
             app.manage(Core(core));
             Ok(())
         });
