@@ -4,7 +4,7 @@
 //! `docs/serve-protocol.md` follows them).
 //!
 //! Slice 3A ports the transport and the start-up methods: `app.info`, `key.status`, `key.unlock`,
-//! `key.cache`; slice 3B adds `data.facts`. Every other method of the protocol is simply absent from [`METHODS`], so it answers
+//! `key.cache`; slice 3B adds `data.facts`; slice 3C adds `data.metric` and `data.today`. Every other method of the protocol is simply absent from [`METHODS`], so it answers
 //! `unknown_method` until its slice lands (never a new error code, never a fake result); the list of
 //! what is still absent is [`crate::read::DEFERRED_METHODS`].
 //!
@@ -43,7 +43,9 @@ use crate::identity::{self, NOTICE, PRODUCT};
 use crate::keychain::{self, KeychainError, KeychainState};
 use crate::keys::{self, KeyError, Secret32};
 use crate::read::ReadError;
+use crate::read::coverage::{self, NOT_COVERED, PRESENT};
 use crate::read::insight::{self, FactsQuery};
+use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
 use crate::store::{self, StoreError};
 use crate::wirejson::{self, Id, Json, PyStr};
@@ -318,6 +320,8 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("key.unlock", key_unlock),
     ("key.cache", key_cache),
     ("data.facts", data_facts),
+    ("data.metric", data_metric),
+    ("data.today", data_today),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -330,6 +334,25 @@ fn int_param(call: &Call, name: &str, default: i64) -> Result<i64, Failure> {
             "bad_params",
             format!("{name} must be an integer"),
         )),
+    }
+}
+
+/// `_text_param(required=True)`: a non-empty string.
+fn text_param(call: &Call, name: &str) -> Result<PyStr, Failure> {
+    match call.params.get(name) {
+        Some(Json::Str(text)) if !text.is_empty() => Ok(text.clone()),
+        _ => Err(Failure::serve(
+            "bad_params",
+            format!("{name} must be a non-empty string"),
+        )),
+    }
+}
+
+/// `_text_param(required=False)`: absent or null is None, anything else must be a non-empty string.
+fn optional_text_param(call: &Call, name: &str) -> Result<Option<PyStr>, Failure> {
+    match call.params.get(name) {
+        None | Some(Json::Null) => Ok(None),
+        _ => text_param(call, name).map(Some),
     }
 }
 
@@ -509,6 +532,105 @@ fn data_facts(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     }
     identity::neutral(&mut facts);
     Ok(facts)
+}
+
+/// `DEFAULT_METRIC_DAYS`: how many days `data.metric` serves when it is not told.
+const DEFAULT_METRIC_DAYS: i64 = 90;
+
+/// One metric and scope as a calendar-filled series: a missing day is null with its status.
+fn data_metric(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let metric = text_param(call, "metric")?;
+    let scope = text_param(call, "scope")?;
+    let days = int_param(call, "days", DEFAULT_METRIC_DAYS)?;
+    let last_day = optional_text_param(call, "last_day")?;
+    let contract = Contract::get()?;
+    let sample = metric
+        .to_text()
+        .is_some_and(|name| contract.cadence_for(&name) == Some("sample"));
+    let cap = if sample { MAX_SAMPLE_DAYS } else { MAX_DAILY_DAYS };
+    let store = session.reader()?;
+    let conn = store.conn();
+    let last = match last_day {
+        Some(text) => queries::parse_date_py(&text)?,
+        None => queries::parse_date(&queries::local_today(conn)?)?,
+    };
+    let first = queries::shift(last, -(days.clamp(1, cap) - 1))?;
+    let series = queries::metric_calendar(
+        conn,
+        contract,
+        &metric,
+        &scope,
+        &queries::iso(first),
+        &queries::iso(last),
+    )?;
+    let name = metric.to_text().unwrap_or_default();
+    Ok(json!({
+        "metric": name,
+        "scope": scope.to_text().unwrap_or_default(),
+        "unit": contract.unit_for(&name),
+        "days": series,
+    }))
+}
+
+/// `_contract_pairs`: every (numeric metric, scope) the contract declares a stream for, in contract order.
+fn contract_pairs(contract: &Contract) -> Vec<(String, String)> {
+    let declared = |metric: &str, scope: &str| {
+        contract
+            .streams_for
+            .iter()
+            .any(|entry| entry.metric == metric && entry.source_scope == scope)
+    };
+    contract
+        .metrics
+        .iter()
+        .flat_map(|item| {
+            contract
+                .source_scopes
+                .iter()
+                .map(move |scope| (item.metric.clone(), scope.clone()))
+        })
+        .filter(|(metric, scope)| declared(metric, scope))
+        .collect()
+}
+
+/// The latest value, with its day, for every metric and scope in the contract; `day` is null when none.
+fn data_today(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let contract = Contract::get()?;
+    let store = session.reader()?;
+    let conn = store.conn();
+    let today = queries::local_today(conn)?;
+    let mut latest = Vec::new();
+    for (metric, scope) in contract_pairs(contract) {
+        let found = queries::latest_value(conn, contract, &metric, &scope)?;
+        latest.push((metric, scope, found));
+    }
+    let statuses = if latest.iter().any(|(_, _, found)| found.is_none()) {
+        coverage::statuses_on(conn, contract, &today)?
+    } else {
+        Default::default()
+    };
+    let rows: Vec<Value> = latest
+        .into_iter()
+        .map(|(metric, scope, found)| {
+            let status = if found.is_some() {
+                PRESENT
+            } else {
+                statuses
+                    .get(&(metric.clone(), scope.clone()))
+                    .copied()
+                    .unwrap_or(NOT_COVERED)
+            };
+            let (day, value) = match found {
+                Some((day, value)) => (Value::from(day), value),
+                None => (Value::Null, Value::Null),
+            };
+            json!({"metric": metric, "scope": scope, "value": value, "unit": contract.unit_for(&metric),
+                   "day": day, "status": status})
+        })
+        .collect();
+    Ok(json!({"day": today, "metrics": rows}))
 }
 
 // ---- the loop ----

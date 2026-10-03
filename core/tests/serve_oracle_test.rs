@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Replay of the committed request script against the committed synthetic store, compared with the
-//! Python oracle's committed responses (`oracle-synthetic.jsonl`, written by `tools/serve_diff.py
-//! --python-only`). No Python runs here: this is the slice's regression net when only cargo is at hand;
-//! the live two-core comparison is `tools/serve_diff.py`.
+//! Replay of the committed request script against the committed synthetic stores (the current schema and
+//! schema v1), compared with the Python oracle's committed responses (`oracle-synthetic*.jsonl.gz`,
+//! written by `tools/serve_diff.py --python-only`). No Python runs here: this is the slice's regression
+//! net when only cargo is at hand; the live two-core comparison is `tools/serve_diff.py`.
 //!
 //! Comparison is on tagged trees: `wirejson::Json` keeps bool, int, float, string, null, list and
 //! object apart, big integers exactly. `app.info.core` and `app.info.db` are the only allowances.
-//! Entries for methods that are not ported yet must answer `unknown_method`.
+//! Entries for methods that are not ported yet must answer `unknown_method`. An entry the script marks
+//! `booked` (Python accepts a `last_day` form the port refuses, `docs/kb/23`) must be answered
+//! `bad_params` unless it matches the oracle anyway.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -31,7 +33,17 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../hearthbeat/tests/fixtures/serve")
 }
 
-fn entry_bytes(entry: &Value) -> Vec<u8> {
+/// The script's anchor days (`$FIRST`, `$MID`, `$LAST`, `$BEFORE`), which the generator took from the store.
+fn anchors(script: &Value) -> Vec<(String, String)> {
+    script["anchors"]
+        .as_object()
+        .expect("anchors")
+        .iter()
+        .map(|(name, day)| (name.clone(), day.as_str().expect("day").to_string()))
+        .collect()
+}
+
+fn entry_bytes(entry: &Value, anchors: &[(String, String)]) -> Vec<u8> {
     let templates = [
         ("$DIGITS4300", format!("1{}", "0".repeat(4299))),
         ("$DIGITS4301", format!("1{}", "0".repeat(4300))),
@@ -41,15 +53,21 @@ fn entry_bytes(entry: &Value) -> Vec<u8> {
         ),
     ];
     if let Some(request) = entry.get("send") {
-        let text = serde_json::to_string(request)
+        let mut text = serde_json::to_string(request)
             .expect("request")
             .replace("$PASSPHRASE", "an unused but perfectly long passphrase");
+        for (name, day) in anchors {
+            text = text.replace(name, day);
+        }
         return text.into_bytes();
     }
     if let Some(raw) = entry.get("raw").and_then(Value::as_str) {
         let mut text = raw.to_string();
         for (name, value) in &templates {
             text = text.replace(name, value);
+        }
+        for (name, day) in anchors {
+            text = text.replace(name, day);
         }
         return text.into_bytes();
     }
@@ -95,16 +113,32 @@ fn mask(node: Json) -> Json {
     Json::Object(pairs)
 }
 
+fn gunzip(path: &Path) -> String {
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(path).expect("oracle file"))
+        .read_to_string(&mut text)
+        .expect("gunzip");
+    text
+}
+
 #[test]
 fn the_rust_core_answers_the_committed_script_like_the_python_oracle() {
+    replay("synthetic.hbdb", "oracle-synthetic.jsonl.gz");
+}
+
+#[test]
+fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_schema_v1_store() {
+    replay("synthetic-v1.hbdb", "oracle-synthetic-v1.jsonl.gz");
+}
+
+fn replay(store_file: &str, oracle_file: &str) {
     let script: Value = serde_json::from_str(
         &std::fs::read_to_string(fixtures().join("script.json")).expect("script"),
     )
     .expect("json");
     // read with wirejson: serde_json cannot hold the 4300-digit id some oracle lines echo
     let oracle: Vec<(String, Vec<Json>)> =
-        std::fs::read_to_string(fixtures().join("oracle-synthetic.jsonl"))
-            .expect("oracle")
+        gunzip(&fixtures().join(oracle_file))
             .lines()
             .map(|l| {
                 let entry = wirejson::parse(l).expect("oracle line");
@@ -127,7 +161,7 @@ fn the_rust_core_answers_the_committed_script_like_the_python_oracle() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("store.db");
-    std::fs::copy(fixtures().join("synthetic.hbdb"), &db).expect("copy store");
+    std::fs::copy(fixtures().join(store_file), &db).expect("copy store");
     let mut child = Command::new(env!("CARGO_BIN_EXE_disconect-core"))
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -144,7 +178,8 @@ fn the_rust_core_answers_the_committed_script_like_the_python_oracle() {
         .expect("spawn");
     let mut stdin = child.stdin.take().expect("stdin");
     let writer = std::thread::spawn({
-        let payloads: Vec<Vec<u8>> = entries.iter().map(entry_bytes).collect();
+        let anchors = anchors(&script);
+        let payloads: Vec<Vec<u8>> = entries.iter().map(|e| entry_bytes(e, &anchors)).collect();
         move || {
             for (index, payload) in payloads.iter().enumerate() {
                 stdin.write_all(payload).expect("write entry");
@@ -193,7 +228,14 @@ fn the_rust_core_answers_the_committed_script_like_the_python_oracle() {
             .map(|n| sorted(mask(n)))
             .collect();
         if got != want {
-            differences.push(format!("#{index} {}", oracle[index].0));
+            let refused = got.len() == 1
+                && got[0]
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    == Some(&Json::Str(PyStr::from_text("bad_params")));
+            if !(entry.get("booked").is_some() && refused) {
+                differences.push(format!("#{index} {}", oracle[index].0));
+            }
         }
     }
     writer.join().expect("writer");

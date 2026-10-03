@@ -13,6 +13,8 @@ use rusqlite::{Connection, params};
 use crate::model::{ClockOffset, Instant};
 use crate::time::{iso_utc, parse_iso_utc};
 
+const MICROS: i64 = 1_000_000;
+
 /// Sorted (moment, offset) pairs with nearest-neighbour lookup.
 #[derive(Debug, Default)]
 pub struct ClockOffsets {
@@ -79,21 +81,27 @@ impl ClockOffsets {
 
     /// The stated offset nearest to `moment` (ties to the earlier entry), or None if none is known.
     pub fn offset_at(&self, moment: Instant) -> Option<i64> {
+        self.offset_near(moment.timestamp().saturating_mul(MICROS))
+    }
+
+    /// `offset_at` for an instant given in microseconds since the epoch: the coverage ledger asks
+    /// about "one microsecond before" a span's exclusive end, and the nearest-offset tie rule must see it.
+    fn offset_near(&self, key: i64) -> Option<i64> {
         if self.moments.is_empty() {
             return None;
         }
-        let key = moment.timestamp();
-        let index = self.moments.partition_point(|m| *m < key); // bisect_left
+        let at = |index: usize| self.moments[index].saturating_mul(MICROS);
+        let index = self.moments.partition_point(|m| m.saturating_mul(MICROS) < key); // bisect_left
         let mut best: Option<usize> = None;
         // Candidates index-1 then index; the first minimum wins.
         for candidate in [index.checked_sub(1), Some(index)].into_iter().flatten() {
             if candidate >= self.moments.len() {
                 continue;
             }
-            let distance = (self.moments[candidate] - key).abs();
+            let distance = (at(candidate) - key).abs();
             let better = match best {
                 None => true,
-                Some(b) => distance < (self.moments[b] - key).abs(),
+                Some(b) => distance < (at(b) - key).abs(),
             };
             if better {
                 best = Some(candidate);
@@ -109,6 +117,22 @@ impl ClockOffsets {
             0
         });
         (moment + Duration::seconds(offset)).date_naive().format("%Y-%m-%d").to_string()
+    }
+
+    /// `local_date` for a read path that must not panic: the local date at `moment`, or at the
+    /// instant one microsecond before it (`before`), or None where Python's date arithmetic would
+    /// raise `OverflowError` (an absurd stored offset).
+    pub fn local_date_checked(&self, moment: Instant, before: bool) -> Option<String> {
+        let shift = i64::from(before);
+        let key = moment.timestamp().saturating_mul(MICROS).saturating_sub(shift);
+        let offset = self.offset_near(key).unwrap_or_else(|| {
+            self.assumed_utc.set(self.assumed_utc.get() + 1);
+            0
+        });
+        let local = moment.checked_add_signed(Duration::try_seconds(offset)?)?;
+        let local = if before { local.checked_sub_signed(Duration::microseconds(1))? } else { local };
+        let date = local.date_naive();
+        (1..=9999).contains(&chrono::Datelike::year(&date)).then(|| date.format("%Y-%m-%d").to_string())
     }
 
     /// Persist offsets a file stated (`INSERT OR REPLACE`).

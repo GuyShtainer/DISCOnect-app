@@ -4,10 +4,10 @@
 //! has no child processes, so this is a library first and a protocol second.
 //!
 //! Slice 3A scaffolded it; slice 3B adds `insight` (`data.facts`), `queries` (the sample-day
-//! aggregates it reads) and `numerics` (`fsum` and the exact `stdev` of Python's `statistics`).
-//! What lands next, in the pitch's order: `coverage` / `queries` (`data.metric`, `data.today`),
-//! `health` (`data.health`), then the `import.*` progress hook. Until then each of those methods is
-//! absent from [`crate::serve::METHODS`].
+//! aggregates it reads) and `numerics` (`fsum` and the exact `stdev` of Python's `statistics`);
+//! slice 3C adds `coverage` (the ledger) and the calendar half of `queries` (`data.metric`,
+//! `data.today`). What lands next, in the pitch's order: `health` (`data.health`), then the
+//! `import.*` progress hook. Until then each of those methods is absent from [`crate::serve::METHODS`].
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
@@ -15,8 +15,10 @@
 
 use crate::contract::ContractError;
 
+pub mod coverage;
 pub mod insight;
 pub mod numerics;
+pub mod pyrepr;
 pub mod queries;
 
 /// Why a read failed, before it has a protocol code (`serve` maps it; a phone shell maps it its own way).
@@ -40,8 +42,6 @@ pub enum ReadError {
 /// `unknown_method`; `tools/serve_diff.py` counts a Python success against it as "not yet ported",
 /// never as a difference. A test keeps this list and `METHODS` disjoint and complete.
 pub const DEFERRED_METHODS: &[&str] = &[
-    "data.metric",
-    "data.today",
     "data.health",
     "import.last",
     "import.run",

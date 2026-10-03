@@ -1,0 +1,654 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! The coverage ledger: why a (metric, scope, day) has no value. The twin of `hearthbeat/coverage.py`.
+//!
+//! Four statuses, decided per local day in a fixed order: `present` > `failed` > `source_empty` >
+//! `not_covered`. Everything is derived on request from what the store retains: `raw_records` spans
+//! (the end is exclusive, so a file ending at local midnight does not cover the day that starts
+//! then), the export windows files claimed, and the failures recorded with their spans. On a schema
+//! without `export_ranges` / `import_failures` the ledger still answers, with those refinements
+//! marked unavailable. No value, label, path or device identifier is read or returned.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::NaiveDate;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::{Value, json};
+
+use super::ReadError;
+use super::queries::{iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
+use crate::clock::ClockOffsets;
+use crate::contract::Contract;
+
+pub const PRESENT: &str = "present";
+pub const FAILED: &str = "failed";
+pub const SOURCE_EMPTY: &str = "source_empty";
+pub const NOT_COVERED: &str = "not_covered";
+
+/// The status window; gap lists, not the window, are what is capped.
+pub const MAX_WINDOW_DAYS: i64 = 3650;
+pub const MAX_GAPS: usize = 20;
+
+/// Device streams written once per night: the watch produces such a file only when there was
+/// something to record, so the all-day monitoring files are what prove the day was imported.
+pub const NIGHTLY_DEVICE_STREAMS: [(&str, &str); 3] = [
+    ("fit:sleep", "fit:monitoring_b"),
+    ("fit:hrv", "fit:monitoring_b"),
+    ("fit:skin_temp", "fit:monitoring_b"),
+];
+
+type Key = (String, String);
+type Flags = Vec<bool>;
+type Declared = BTreeMap<Key, BTreeSet<String>>;
+
+/// Inclusive local-date window with day-index arithmetic (`_Window`).
+struct Window {
+    first: NaiveDate,
+    last: NaiveDate,
+    days: usize,
+}
+
+impl Window {
+    fn new(first: &str, last: &str) -> Result<Window, ReadError> {
+        let (first, last) = (parse_date(first)?, parse_date(last)?);
+        let days = (last - first).num_days() + 1;
+        // `if window.days < 1: raise ValueError(...)` in `_analyse`
+        let days = usize::try_from(days)
+            .ok()
+            .filter(|days| *days >= 1)
+            .ok_or_else(|| ReadError::Value("last_day must not be before first_day".into()))?;
+        Ok(Window { first, last, days })
+    }
+
+    /// Position of `day` inside the window, or None when outside it.
+    fn index(&self, day: &str) -> Result<Option<usize>, ReadError> {
+        let offset = (parse_date(day)? - self.first).num_days();
+        Ok(usize::try_from(offset).ok().filter(|at| *at < self.days))
+    }
+
+    /// Set every day of `from_day..to_day` (clipped to the window).
+    fn mark(&self, flags: &mut [bool], from_day: &str, to_day: &str) -> Result<(), ReadError> {
+        let start = (parse_date(from_day)? - self.first).num_days().max(0);
+        let stop = (parse_date(to_day)? - self.first)
+            .num_days()
+            .min(self.days as i64 - 1);
+        for position in start..=stop {
+            if let Some(flag) = usize::try_from(position)
+                .ok()
+                .and_then(|at| flags.get_mut(at))
+            {
+                *flag = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn day(&self, position: usize) -> Result<String, ReadError> {
+        let offset = i64::try_from(position).map_err(|_| ReadError::Unexpected("OverflowError"))?;
+        shift(self.first, offset).map(iso)
+    }
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool, ReadError> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// Python truthiness of a nullable text cell: NULL and `''` are falsy, as are zero and an empty blob;
+/// any other non-text cell would make `strptime` raise a `TypeError`.
+fn optional_text(cell: ValueRef<'_>) -> Result<Option<&str>, ReadError> {
+    match cell {
+        ValueRef::Null | ValueRef::Integer(0) => Ok(None),
+        ValueRef::Real(0.0) => Ok(None),
+        ValueRef::Blob([]) => Ok(None),
+        ValueRef::Text(_) => text(cell).map(|found| Some(found).filter(|t| !t.is_empty())),
+        _ => Err(ReadError::Unexpected("TypeError")),
+    }
+}
+
+/// Every (metric, scope, stream) triple the store has actually produced.
+fn observed_map(conn: &Connection) -> Result<BTreeSet<(String, String, String)>, ReadError> {
+    let mut triples = BTreeSet::new();
+    for table in ["daily_metrics", "daily_labels", "metric_samples"] {
+        let mut statement = conn.prepare(&format!(
+            "SELECT DISTINCT t.metric, t.source_scope, r.stream FROM {table} t \
+             JOIN raw_records r ON r.id = t.raw_record_id"
+        ))?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            triples.insert((
+                text(row.get_ref(0)?)?.to_string(),
+                text(row.get_ref(1)?)?.to_string(),
+                text(row.get_ref(2)?)?.to_string(),
+            ));
+        }
+    }
+    Ok(triples)
+}
+
+/// Local dates a UTC span touches. The end is exclusive: one microsecond is taken off it unless the
+/// span is empty or inverted, so a file ending at local midnight does not cover the day after.
+fn span_days(
+    offsets: &ClockOffsets,
+    start_utc: Option<&str>,
+    end_utc: Option<&str>,
+) -> Result<Option<(String, String)>, ReadError> {
+    let (Some(start_text), Some(end_text)) = (start_utc, end_utc) else {
+        return Ok(None);
+    };
+    let (start, end) = (parse_moment(start_text)?, parse_moment(end_text)?);
+    let first = local_day(offsets, start, false)?;
+    let last = local_day(offsets, end, end > start)?;
+    Ok(Some(if first <= last {
+        (first, last)
+    } else {
+        (last, first)
+    }))
+}
+
+/// Per stream, the days some retained file or claimed window spans; plus the undatable-file count.
+fn covered_by_stream(
+    conn: &Connection,
+    window: &Window,
+    offsets: &ClockOffsets,
+    refinements: bool,
+) -> Result<(BTreeMap<String, Flags>, i64), ReadError> {
+    let mut covered: BTreeMap<String, Flags> = BTreeMap::new();
+    let mut undatable = 0;
+    let mut statement = conn.prepare("SELECT stream, start_utc, end_utc FROM raw_records")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let stream = text(row.get_ref(0)?)?;
+        let span = span_days(
+            offsets,
+            optional_text(row.get_ref(1)?)?,
+            optional_text(row.get_ref(2)?)?,
+        )?;
+        let Some((from_day, to_day)) = span else {
+            undatable += 1;
+            continue;
+        };
+        let flags = covered
+            .entry(stream.to_string())
+            .or_insert_with(|| vec![false; window.days]);
+        window.mark(flags, &from_day, &to_day)?;
+    }
+    if refinements {
+        let mut statement = conn.prepare("SELECT stream, from_day, to_day FROM export_ranges")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let stream = text(row.get_ref(0)?)?;
+            let flags = covered
+                .entry(stream.to_string())
+                .or_insert_with(|| vec![false; window.days]);
+            window.mark(flags, text(row.get_ref(1)?)?, text(row.get_ref(2)?)?)?;
+        }
+    }
+    for (nightly, all_day) in NIGHTLY_DEVICE_STREAMS {
+        if let Some(source) = covered.get(all_day).cloned() {
+            let flags = covered
+                .entry(nightly.to_string())
+                .or_insert_with(|| vec![false; window.days]);
+            for (flag, inherited) in flags.iter_mut().zip(source) {
+                *flag |= inherited;
+            }
+        }
+    }
+    Ok((covered, undatable))
+}
+
+/// Per stream, the days a recorded failure spans; plus failures that cannot be placed on any day.
+fn failed_by_stream(
+    conn: &Connection,
+    window: &Window,
+    offsets: &ClockOffsets,
+    refinements: bool,
+) -> Result<(BTreeMap<String, Flags>, i64), ReadError> {
+    let mut failed: BTreeMap<String, Flags> = BTreeMap::new();
+    let mut unattributed = 0;
+    if !refinements {
+        return Ok((failed, unattributed));
+    }
+    let mut statement = conn.prepare(
+        "SELECT f.stream, f.start_utc, f.end_utc, r.start_utc, r.end_utc FROM import_failures f \
+         LEFT JOIN raw_records r ON r.id = f.raw_record_id",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        // `start_utc or raw_start`: the failure's own span wins unless it is falsy
+        let start = optional_text(row.get_ref(1)?)?.or(optional_text(row.get_ref(3)?)?);
+        let end = optional_text(row.get_ref(2)?)?.or(optional_text(row.get_ref(4)?)?);
+        let span = span_days(offsets, start, end)?;
+        let stream = match row.get_ref(0)? {
+            ValueRef::Null => None,
+            cell => Some(text(cell)?),
+        };
+        let (Some(stream), Some((from_day, to_day))) = (stream, span) else {
+            unattributed += 1;
+            continue;
+        };
+        let flags = failed
+            .entry(stream.to_string())
+            .or_insert_with(|| vec![false; window.days]);
+        window.mark(flags, &from_day, &to_day)?;
+    }
+    Ok((failed, unattributed))
+}
+
+/// Per (metric, scope), the local days that hold at least one row.
+fn present_days(
+    conn: &Connection,
+    window: &Window,
+    offsets: &ClockOffsets,
+) -> Result<BTreeMap<Key, Flags>, ReadError> {
+    let mut present: BTreeMap<Key, Flags> = BTreeMap::new();
+    let (first, last) = (iso(window.first), iso(window.last));
+    for table in ["daily_metrics", "daily_labels"] {
+        let mut statement = conn.prepare(&format!(
+            "SELECT DISTINCT metric, source_scope, date FROM {table} WHERE date BETWEEN ? AND ?"
+        ))?;
+        let mut rows = statement.query([&first, &last])?;
+        while let Some(row) = rows.next()? {
+            let (metric, scope) = (text(row.get_ref(0)?)?, text(row.get_ref(1)?)?);
+            if let Some(position) = window.index(text(row.get_ref(2)?)?)? {
+                mark_present(&mut present, window, metric, scope, position);
+            }
+        }
+    }
+    // Samples: resolve local dates once per UTC hour bucket, not per sample. Local days can begin up
+    // to 14 h before/after their UTC namesake, so over-fetch one day each side.
+    let low = iso(shift(window.first, -1)?);
+    let high = iso(shift(window.last, 2)?);
+    let mut statement = conn.prepare(
+        "SELECT metric, source_scope, substr(ts_utc, 1, 13) FROM metric_samples \
+         WHERE ts_utc >= ? AND ts_utc < ? GROUP BY 1, 2, 3",
+    )?;
+    let mut rows = statement.query([&low, &high])?;
+    while let Some(row) = rows.next()? {
+        let (metric, scope, hour) = (
+            text(row.get_ref(0)?)?,
+            text(row.get_ref(1)?)?,
+            text(row.get_ref(2)?)?,
+        );
+        let first_day = local_day(offsets, parse_moment(&format!("{hour}:00:00Z"))?, false)?;
+        let last_day = local_day(offsets, parse_moment(&format!("{hour}:59:59Z"))?, false)?;
+        let days: BTreeSet<String> = if first_day == last_day {
+            BTreeSet::from([first_day])
+        } else {
+            // a local midnight falls inside this hour (half-hour zones): resolve each sample
+            let mut inner = conn.prepare(
+                "SELECT ts_utc FROM metric_samples WHERE metric=? AND source_scope=? \
+                 AND substr(ts_utc, 1, 13)=?",
+            )?;
+            let mut stamps = inner.query([metric, scope, hour])?;
+            let mut found = BTreeSet::new();
+            while let Some(stamp) = stamps.next()? {
+                let moment = parse_moment(text(stamp.get_ref(0)?)?)?;
+                found.insert(local_day(offsets, moment, false)?);
+            }
+            found
+        };
+        for day in days {
+            if let Some(position) = window.index(&day)? {
+                mark_present(&mut present, window, metric, scope, position);
+            }
+        }
+    }
+    Ok(present)
+}
+
+fn mark_present(
+    present: &mut BTreeMap<Key, Flags>,
+    window: &Window,
+    metric: &str,
+    scope: &str,
+    position: usize,
+) {
+    let flags = present
+        .entry((metric.to_string(), scope.to_string()))
+        .or_insert_with(|| vec![false; window.days]);
+    if let Some(flag) = flags.get_mut(position) {
+        *flag = true;
+    }
+}
+
+fn statuses_for(
+    window: &Window,
+    present: Option<&Flags>,
+    streams: &BTreeSet<String>,
+    covered: &BTreeMap<String, Flags>,
+    failed: &BTreeMap<String, Flags>,
+) -> Vec<&'static str> {
+    let failed_flags: Vec<&Flags> = streams.iter().filter_map(|s| failed.get(s)).collect();
+    let covered_flags: Vec<&Flags> = streams.iter().filter_map(|s| covered.get(s)).collect();
+    let set = |flags: &Flags, position: usize| flags.get(position).copied().unwrap_or(false);
+    (0..window.days)
+        .map(|position| {
+            if present.is_some_and(|flags| set(flags, position)) {
+                PRESENT
+            } else if failed_flags.iter().any(|flags| set(flags, position)) {
+                FAILED
+            } else if covered_flags.iter().any(|flags| set(flags, position)) {
+                SOURCE_EMPTY
+            } else {
+                NOT_COVERED
+            }
+        })
+        .collect()
+}
+
+/// Runs of consecutive non-present days with one status, oldest first; the newest `MAX_GAPS` kept.
+fn gaps(window: &Window, statuses: &[&'static str]) -> Result<(Vec<Value>, bool), ReadError> {
+    let mut found: Vec<Value> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (position, status) in statuses.iter().copied().chain([PRESENT]).enumerate() {
+        if let Some(start) = run_start
+            && (status == PRESENT || Some(status) != statuses.get(start).copied())
+        {
+            found.push(json!({
+                "from": window.day(start)?,
+                "to": window.day(position - 1)?,
+                "status": statuses.get(start).copied().unwrap_or(PRESENT),
+            }));
+            run_start = None;
+        }
+        if status != PRESENT && run_start.is_none() {
+            run_start = Some(position);
+        }
+    }
+    if found.len() > MAX_GAPS {
+        let cut = found.len() - MAX_GAPS;
+        return Ok((found.split_off(cut), true));
+    }
+    Ok((found, false))
+}
+
+/// Everything the ledger derives for one window, before it is shaped for a caller.
+struct Analysis {
+    window: Window,
+    streams_for: Declared,
+    drift: Vec<Value>,
+    statuses: BTreeMap<Key, Vec<&'static str>>,
+    undatable: i64,
+    unattributed: i64,
+    refinements: bool,
+}
+
+/// Declared streams per (metric, scope), plus any observed stream the declaration lacks.
+fn declared_and_drift(
+    conn: &Connection,
+    contract: &Contract,
+) -> Result<(Declared, Vec<Value>), ReadError> {
+    let mut streams_for: Declared = contract
+        .streams_for
+        .iter()
+        .map(|entry| {
+            (
+                (entry.metric.clone(), entry.source_scope.clone()),
+                entry.streams.iter().cloned().collect(),
+            )
+        })
+        .collect();
+    let mut drift = Vec::new();
+    for (metric, scope, stream) in observed_map(conn)? {
+        let declared = streams_for
+            .entry((metric.clone(), scope.clone()))
+            .or_default();
+        if !declared.contains(&stream) {
+            declared.insert(stream.clone());
+            drift.push(json!({"metric": metric, "source_scope": scope, "stream": stream}));
+        }
+    }
+    Ok((streams_for, drift))
+}
+
+/// The status of every local day in the window, for every (metric, scope) the store knows.
+fn analyse(
+    conn: &Connection,
+    contract: &Contract,
+    first_day: &str,
+    last_day: &str,
+) -> Result<Analysis, ReadError> {
+    let window = Window::new(first_day, last_day)?;
+    let offsets = load_offsets(conn)?;
+    let refinements = has_table(conn, "export_ranges")? && has_table(conn, "import_failures")?;
+    let (streams_for, drift) = declared_and_drift(conn, contract)?;
+    let (covered, undatable) = covered_by_stream(conn, &window, &offsets, refinements)?;
+    let (failed, unattributed) = failed_by_stream(conn, &window, &offsets, refinements)?;
+    let present = present_days(conn, &window, &offsets)?;
+    let statuses = streams_for
+        .iter()
+        .map(|(key, streams)| {
+            (
+                key.clone(),
+                statuses_for(&window, present.get(key), streams, &covered, &failed),
+            )
+        })
+        .collect();
+    Ok(Analysis {
+        window,
+        streams_for,
+        drift,
+        statuses,
+        undatable,
+        unattributed,
+        refinements,
+    })
+}
+
+/// The coverage status of every local day from `first_day` to `last_day` for one metric and scope,
+/// oldest first. A pair no stream can supply is `not_covered` throughout.
+pub fn day_statuses(
+    conn: &Connection,
+    contract: &Contract,
+    metric: &str,
+    scope: &str,
+    first_day: &str,
+    last_day: &str,
+) -> Result<Vec<(String, &'static str)>, ReadError> {
+    let analysis = analyse(conn, contract, first_day, last_day)?;
+    let statuses = analysis
+        .statuses
+        .get(&(metric.to_string(), scope.to_string()))
+        .filter(|found| !found.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![NOT_COVERED; analysis.window.days]);
+    statuses
+        .into_iter()
+        .enumerate()
+        .map(|(position, status)| Ok((analysis.window.day(position)?, status)))
+        .collect()
+}
+
+/// The status of one local `day` for every (metric, scope) the store knows, in one pass.
+pub fn statuses_on(
+    conn: &Connection,
+    contract: &Contract,
+    day: &str,
+) -> Result<BTreeMap<Key, &'static str>, ReadError> {
+    let analysis = analyse(conn, contract, day, day)?;
+    Ok(analysis
+        .statuses
+        .into_iter()
+        .filter_map(|(key, statuses)| statuses.first().map(|status| (key, *status)))
+        .collect())
+}
+
+/// The coverage block of `data_health`: per (metric, scope) counts and gaps over the window ending at
+/// `last_day` (inclusive); `window_days` is clipped to [`MAX_WINDOW_DAYS`]. Plain data: no values,
+/// no identifiers.
+pub fn ledger(
+    conn: &Connection,
+    contract: &Contract,
+    last_day: &str,
+    window_days: i64,
+) -> Result<Value, ReadError> {
+    let window_days = window_days.clamp(1, MAX_WINDOW_DAYS);
+    let last = parse_date(last_day)?;
+    let analysis = analyse(
+        conn,
+        contract,
+        &iso(shift(last, -(window_days - 1))?),
+        &iso(last),
+    )?;
+    let window = &analysis.window;
+    let mut rows = Vec::new();
+    for ((metric, scope), streams) in &analysis.streams_for {
+        let statuses = analysis
+            .statuses
+            .get(&(metric.clone(), scope.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let (found, truncated) = gaps(window, &statuses)?;
+        let count = |wanted: &str| statuses.iter().filter(|s| **s == wanted).count();
+        rows.push(json!({
+            "metric": metric, "source_scope": scope, "streams": streams,
+            "sparse": contract.is_sparse(metric),
+            PRESENT: count(PRESENT), FAILED: count(FAILED),
+            SOURCE_EMPTY: count(SOURCE_EMPTY), NOT_COVERED: count(NOT_COVERED),
+            "gaps": found, "gaps_truncated": truncated,
+        }));
+    }
+    let refinements = if analysis.refinements {
+        &contract.coverage_refinements.available
+    } else {
+        &contract.coverage_refinements.unavailable
+    };
+    Ok(json!({
+        "window": {"from": iso(window.first), "to": iso(window.last), "days": window.days},
+        "statuses": [PRESENT, FAILED, SOURCE_EMPTY, NOT_COVERED],
+        "ledger": rows,
+        "map_drift": analysis.drift,
+        "unattributed_failures": analysis.unattributed,
+        "undatable_files": analysis.undatable,
+        "refinements": refinements,
+        "refinements_available": analysis.refinements,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ClockOffset;
+    use chrono::{TimeZone, Utc};
+
+    fn window(first: &str, last: &str) -> Window {
+        match Window::new(first, last) {
+            Ok(window) => window,
+            Err(error) => unreachable!("window: {error}"),
+        }
+    }
+
+    #[test]
+    fn a_window_clips_marks_and_refuses_an_inverted_range() {
+        let w = window("2025-06-01", "2025-06-10");
+        assert_eq!(w.days, 10);
+        let mut flags = vec![false; w.days];
+        assert!(w.mark(&mut flags, "2025-05-29", "2025-06-02").is_ok());
+        assert!(w.mark(&mut flags, "2025-06-09", "2025-06-20").is_ok());
+        assert!(w.mark(&mut flags, "2025-07-01", "2025-07-02").is_ok());
+        assert_eq!(
+            flags.iter().map(|f| u8::from(*f)).collect::<Vec<_>>(),
+            [1, 1, 0, 0, 0, 0, 0, 0, 1, 1]
+        );
+        assert!(matches!(w.index("2025-06-10"), Ok(Some(9))));
+        assert!(matches!(w.index("2025-06-11"), Ok(None)));
+        assert!(matches!(w.index("2025-05-31"), Ok(None)));
+        assert!(
+            matches!(Window::new("2025-06-02", "2025-06-01"), Err(ReadError::Value(m)) if m == "last_day must not be before first_day")
+        );
+    }
+
+    #[test]
+    fn statuses_follow_the_precedence_present_failed_source_empty_not_covered() {
+        let w = window("2025-06-01", "2025-06-04");
+        let streams: BTreeSet<String> = ["fit:sleep".to_string()].into();
+        let covered = BTreeMap::from([("fit:sleep".to_string(), vec![true, true, true, false])]);
+        let failed = BTreeMap::from([("fit:sleep".to_string(), vec![false, true, true, false])]);
+        let present = vec![false, false, true, false];
+        assert_eq!(
+            statuses_for(&w, Some(&present), &streams, &covered, &failed),
+            [SOURCE_EMPTY, FAILED, PRESENT, NOT_COVERED]
+        );
+        assert_eq!(
+            statuses_for(&w, None, &BTreeSet::new(), &covered, &failed),
+            [NOT_COVERED; 4]
+        );
+    }
+
+    #[test]
+    fn gaps_are_runs_of_one_status_and_only_the_newest_twenty_are_kept() {
+        let w = window("2025-01-01", "2025-03-31");
+        let statuses: Vec<&'static str> = (0..w.days)
+            .map(|day| if day % 2 == 0 { PRESENT } else { NOT_COVERED })
+            .collect();
+        let (found, truncated) = gaps(&w, &statuses).expect("gaps");
+        assert!(truncated && found.len() == MAX_GAPS);
+        assert_eq!(found[MAX_GAPS - 1]["to"], "2025-03-31");
+        let small = [
+            "present",
+            "source_empty",
+            "source_empty",
+            "failed",
+            "present",
+            "not_covered",
+        ];
+        let w = window("2025-06-01", "2025-06-06");
+        let (found, truncated) = gaps(&w, &small).expect("gaps");
+        assert!(!truncated);
+        assert_eq!(found[0]["from"], "2025-06-02");
+        assert_eq!(found[0]["to"], "2025-06-03");
+        assert_eq!(found[1]["status"], "failed");
+        assert_eq!(found[2]["from"], "2025-06-06");
+    }
+
+    #[test]
+    fn a_span_ends_one_microsecond_before_its_exclusive_end() {
+        let mut offsets = ClockOffsets::new();
+        let at = |secs: i64| Utc.timestamp_opt(secs, 0).single().expect("instant");
+        offsets.add(ClockOffset {
+            ts_utc: at(0),
+            offset_s: -18_000,
+        });
+        // 1970-01-02T05:00:00Z is local midnight at -05:00
+        let span =
+            |start: &str, end: &str| span_days(&offsets, Some(start), Some(end)).expect("span");
+        assert_eq!(
+            span("1970-01-01T05:00:00Z", "1970-01-02T05:00:00Z"),
+            Some(("1970-01-01".into(), "1970-01-01".into()))
+        );
+        // an empty span and an inverted one do not lose the microsecond they never had
+        assert_eq!(
+            span("1970-01-02T05:00:00Z", "1970-01-02T05:00:00Z"),
+            Some(("1970-01-02".into(), "1970-01-02".into()))
+        );
+        assert_eq!(
+            span("1970-01-03T05:00:00Z", "1970-01-02T05:00:00Z"),
+            Some(("1970-01-02".into(), "1970-01-03".into()))
+        );
+        assert_eq!(
+            span_days(&offsets, None, Some("1970-01-02T05:00:00Z")).expect("span"),
+            None
+        );
+        assert!(span_days(&offsets, Some("garbage"), Some("1970-01-02T05:00:00Z")).is_err());
+    }
+
+    #[test]
+    fn nightly_streams_are_the_three_the_oracle_names() {
+        assert_eq!(
+            NIGHTLY_DEVICE_STREAMS.map(|(nightly, _)| nightly),
+            ["fit:sleep", "fit:hrv", "fit:skin_temp"]
+        );
+        assert!(
+            NIGHTLY_DEVICE_STREAMS
+                .iter()
+                .all(|(_, all_day)| *all_day == "fit:monitoring_b")
+        );
+    }
+}

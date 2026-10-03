@@ -252,7 +252,15 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
     let ported: Vec<&str> = METHODS.iter().map(|(name, _)| *name).collect();
     assert_eq!(
         ported,
-        ["app.info", "key.status", "key.unlock", "key.cache", "data.facts"]
+        [
+            "app.info",
+            "key.status",
+            "key.unlock",
+            "key.cache",
+            "data.facts",
+            "data.metric",
+            "data.today"
+        ]
     );
     for name in DEFERRED_METHODS {
         assert!(

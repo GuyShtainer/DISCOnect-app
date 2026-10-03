@@ -35,6 +35,14 @@ pub fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The one clock as an instant (whole seconds): the twin of `now_utc()` in `storage/_time.py`.
+pub fn now_instant() -> Instant {
+    i64::try_from(now_unix())
+        .ok()
+        .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+}
+
 /// Now, as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn utc_now_iso() -> String {
     iso_from_unix(now_unix())

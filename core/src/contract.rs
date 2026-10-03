@@ -117,6 +117,16 @@ impl Contract {
         self.metrics.iter().find(|m| m.metric == name)
     }
 
+    /// `'sample'` or `'daily'` for a numeric metric, None for anything else (`contract.cadence_for`).
+    pub fn cadence_for(&self, name: &str) -> Option<&str> {
+        self.metric(name).map(|m| m.cadence.as_str())
+    }
+
+    /// `metric in contract.SPARSE_METRICS`.
+    pub fn is_sparse(&self, name: &str) -> bool {
+        self.sparse_metrics.iter().any(|m| m == name)
+    }
+
     /// Unit of a numeric or label metric (`contract.unit_for`).
     pub fn unit_for(&self, name: &str) -> Option<&str> {
         self.metrics
