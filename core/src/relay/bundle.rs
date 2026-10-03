@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Bundle format and cryptography: the twin of `hearthbeat/relay/bundle.py` (`docs/relay-protocol.md`).
+//! Bundle format and cryptography: the twin of `disconect/relay/bundle.py` (`docs/relay-protocol.md`).
 //!
 //! ```text
 //! object  = version(1) || salt(32) || nonce(12) || ChaCha20-Poly1305(k, nonce, padded, AAD)

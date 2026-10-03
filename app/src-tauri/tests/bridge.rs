@@ -15,7 +15,7 @@ for line in sys.stdin:
     req = json.loads(line)
     m, p, i = req["method"], req.get("params", {}), req["id"]
     if m == "echo":
-        print(json.dumps({"id": i, "result": {"params": p, "env_pass": os.environ.get("HEARTHBEAT_PASSPHRASE"), "home": os.environ.get("HOME") is not None}}), flush=True)
+        print(json.dumps({"id": i, "result": {"params": p, "env_pass": os.environ.get("DISCONECT_PASSPHRASE"), "home": os.environ.get("HOME") is not None}}), flush=True)
     elif m == "slow":
         time.sleep(float(p.get("seconds", 2))); print(json.dumps({"id": i, "result": "late"}), flush=True)
     elif m == "crash":
@@ -71,12 +71,12 @@ async fn ids_are_matched_and_params_round_trip() {
 
 #[tokio::test]
 async fn passphrase_env_is_stripped_but_home_survives() {
-    std::env::set_var("HEARTHBEAT_PASSPHRASE", "must-not-leak");
+    std::env::set_var("DISCONECT_PASSPHRASE", "must-not-leak");
     let (core, _) = start();
     let r = core.call("echo", json!({})).await.unwrap();
-    assert!(r["env_pass"].is_null(), "HEARTHBEAT_PASSPHRASE reached the child");
+    assert!(r["env_pass"].is_null(), "DISCONECT_PASSPHRASE reached the child");
     assert_eq!(r["home"], true);
-    std::env::remove_var("HEARTHBEAT_PASSPHRASE");
+    std::env::remove_var("DISCONECT_PASSPHRASE");
     core.shutdown();
 }
 

@@ -1,6 +1,6 @@
 # `writer` module — port spec (Bet 11 slice 1c)
 
-Source of truth: `projects/hearthbeat/src/hearthbeat/ingest/writer.py`, `ingest/clock.py`,
+Source of truth: `projects/disconect/src/disconect/ingest/writer.py`, `ingest/clock.py`,
 `ingest/sources.py`, `storage/_time.py`. Python wins on any disagreement; fix this page.
 
 ## Time text

@@ -139,7 +139,7 @@ fn cli_import_prints_counts_and_exits_1_on_partial() {
             .arg("import")
             .arg(&folder)
             .args(extra)
-            .env_remove("HEARTHBEAT_PASSPHRASE")
+            .env_remove("DISCONECT_PASSPHRASE")
             .output()
             .expect("run cli")
     };

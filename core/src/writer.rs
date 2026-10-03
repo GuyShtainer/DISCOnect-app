@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Persist decoded facts: raw bytes first, canonical rows second, provenance always. The twin of
-//! `hearthbeat/ingest/writer.py`; see `docs/writer-spec.md` (the Python wins on any disagreement).
+//! `disconect/ingest/writer.py`; see `docs/writer-spec.md` (the Python wins on any disagreement).
 //!
 //! One transaction per source file, so a failure mid-file rolls back that file only. A file whose
 //! bytes are already in `raw_records` is a duplicate and is skipped without decoding.

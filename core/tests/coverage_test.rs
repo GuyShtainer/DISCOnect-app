@@ -14,7 +14,7 @@ use disconect_core::store;
 use serde_json::Value;
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../hearthbeat/tests/fixtures/serve")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../disconect/tests/fixtures/serve")
 }
 
 fn gunzip_json(path: &Path) -> Value {

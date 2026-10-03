@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Read-side queries: the twin of the parts of `hearthbeat/queries.py` that `data.facts` reaches
+//! Read-side queries: the twin of the parts of `disconect/queries.py` that `data.facts` reaches
 //! (`_clean`, `sample_day_aggregates`) plus the store helpers `insight.py` brings (`_latest_stored_date`).
 //! Every value is decoded by SQLite storage class (`ValueRef`), never through a declared Rust type.
 //! `_window` is not here: `period_facts` never calls it (only `metric_series` does).

@@ -142,7 +142,7 @@ fn cli_exits_9_when_locked_or_wrong() {
     std::fs::write(&bad, "wrong passphrase here").unwrap();
     let run = |extra: &[&std::ffi::OsStr]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"))
-            .env_remove("HEARTHBEAT_PASSPHRASE").arg("--db").arg(&db).args(extra).args(["status", "--json"])
+            .env_remove("DISCONECT_PASSPHRASE").arg("--db").arg(&db).args(extra).args(["status", "--json"])
             .output().unwrap()
     };
     let locked = run(&[]);

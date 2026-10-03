@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic facts: a recent window of one person's data against their own history. The twin of
-//! `hearthbeat/insight.py`'s `period_facts` for what `data.facts` needs: `window_days` and
+//! `disconect/insight.py`'s `period_facts` for what `data.facts` needs: `window_days` and
 //! `baseline_days`. The MCP-only parameters (`end_date`, `metrics`, `source_scope`, `include_points`)
 //! and `metric_series` / `sleep_detail` / `list_activities` belong to the Rust-MCP bet; [`FactsQuery`]
 //! is where they will go.

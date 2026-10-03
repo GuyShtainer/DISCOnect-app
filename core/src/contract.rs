@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The read contract as data: `contract.json`, embedded at build time and parsed once.
 //!
-//! The Python core is the source (`hearthbeat/contract.py`, `insight.py`, `coverage.py`); its test
+//! The Python core is the source (`disconect/contract.py`, `insight.py`, `coverage.py`); its test
 //! `tests/test_contract_json.py` demands the file be byte-identical to a fresh serialisation of the
 //! live tables, so nothing here is re-derived by hand. The loader is total: every field of the file
 //! is a field below, and an unknown or missing one is a load error (`deny_unknown_fields`), so a

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Scrub identifiers from free text before it is stored or shown: the twin of `hearthbeat/redact.py`
+//! Scrub identifiers from free text before it is stored or shown: the twin of `disconect/redact.py`
 //! (plus `connect_export.mask_label`, which uses its own, simpler digit-run pattern).
 
 use std::sync::LazyLock;

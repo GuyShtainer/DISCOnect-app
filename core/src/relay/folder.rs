@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The self-hosted relay: a folder. WebDAV, rsync or Syncthing carries it between machines.
-//! The twin of `hearthbeat/relay/folder.py`.
+//! The twin of `disconect/relay/folder.py`.
 
 use std::fs;
 use std::io::Write;

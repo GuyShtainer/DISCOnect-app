@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! What a decoder hands the writer: the Rust twin of `hearthbeat/ingest/model.py`.
+//! What a decoder hands the writer: the Rust twin of `disconect/ingest/model.py`.
 //!
 //! Plain data, no SQL, no parser types. `serde_json::to_value(&decoded)` has exactly the key set
 //! and nesting of the Python oracle's canonical JSON (`tests/decoded_json.py`): instants are

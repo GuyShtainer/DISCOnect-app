@@ -52,7 +52,7 @@ fn mcp_command(app: tauri::AppHandle) -> String {
         .filter(|p| p.is_file());
     match bundled {
         Some(p) => format!("\"{}\" mcp", p.display()),
-        None => "hearthbeat-mcp  (dev build: the core is not bundled; use the venv's script)".to_string(),
+        None => "disconect-mcp  (dev build: the core is not bundled; use the venv's script)".to_string(),
     }
 }
 

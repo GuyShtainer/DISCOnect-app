@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `fsum`, `fmean`, `stdev`, `round(x, 2)` and `_clean`'s `round(x, 3)` against CPython 3.14 on
-//! generated vectors (`fixtures/py_numerics_read.json`, written by `hearthbeat/tests/gen_facts_numerics.py`:
+//! generated vectors (`fixtures/py_numerics_read.json`, written by `disconect/tests/gen_facts_numerics.py`:
 //! plain numbers, no health data). Bits must match, not values; a `null` is a case where Python raises
 //! and the port must answer `None`. Every case is checked; the test reports its counts and demands 100 %.
 

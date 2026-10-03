@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The coverage ledger: why a (metric, scope, day) has no value. The twin of `hearthbeat/coverage.py`.
+//! The coverage ledger: why a (metric, scope, day) has no value. The twin of `disconect/coverage.py`.
 //!
 //! Four statuses, decided per local day in a fixed order: `present` > `failed` > `source_empty` >
 //! `not_covered`. Everything is derived on request from what the store retains: `raw_records` spans

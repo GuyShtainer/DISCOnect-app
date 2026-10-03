@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `serve` in-process: the protocol envelope and the start-up methods against the oracle's behaviour
-//! (`hearthbeat/tests/test_serve.py`), plus source-level rules that keep the transport honest.
+//! (`disconect/tests/test_serve.py`), plus source-level rules that keep the transport honest.
 //! Nothing here reaches the OS keychain: encrypted-store cases that would are process-level tests
 //! with the keychain disabled (`serve_process_test.rs`).
 
@@ -287,7 +287,7 @@ fn synthetic_copy() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("synthetic.db");
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../hearthbeat/tests/fixtures/serve/synthetic.hbdb");
+        .join("../disconect/tests/fixtures/serve/synthetic.hbdb");
     std::fs::copy(source, &db).expect("copy the committed synthetic store");
     (dir, db)
 }
@@ -367,14 +367,14 @@ fn serve_never_reaches_the_environment_passphrase() {
         "take_env_passphrase",
         "PassphraseSource",
         "scrub_env_secrets",
-        "HEARTHBEAT_RECOVERY",
+        "DISCONECT_RECOVERY",
     ] {
         assert!(
             !text.contains(forbidden),
             "serve.rs must not touch {forbidden}"
         );
     }
-    assert!(!text.contains("env::var(\"HEARTHBEAT_PASSPHRASE\""));
+    assert!(!text.contains("env::var(\"DISCONECT_PASSPHRASE\""));
 }
 
 #[test]

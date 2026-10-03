@@ -1,5 +1,5 @@
 // The only place product identity strings live on the UI side (ADR 0001 mitigations: a cheap
-// rename, no manufacturer marks). The Python core carries the same two in hearthbeat/identity.py.
+// rename, no manufacturer marks). The Python core carries the same two in disconect/identity.py.
 export const PRODUCT = "DISCOnect";
 export const NOTICE = "Not affiliated with or endorsed by any watch manufacturer.";
 

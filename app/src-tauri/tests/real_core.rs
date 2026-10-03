@@ -128,7 +128,7 @@ async fn import_through_the_bridge_matches_the_cli() {
         .env("HOME", std::env::var("HOME").unwrap())
         .env("PATH", "/usr/bin:/bin")
         .env("PYTHON_KEYRING_BACKEND", "keyring.backends.null.Keyring")
-        .env("HEARTHBEAT_PASSPHRASE", pass_text.as_str())
+        .env("DISCONECT_PASSPHRASE", pass_text.as_str())
         .output()
         .expect("cli runs");
     let stdout = String::from_utf8_lossy(&out.stdout);

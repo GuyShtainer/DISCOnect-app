@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Connect account-export ingest: the Rust twin of `hearthbeat/ingest/connect_export.py` and the
+//! Connect account-export ingest: the Rust twin of `disconect/ingest/connect_export.py` and the
 //! export branch of `ingest/sources.py::import_path`.
 //!
 //! The export is an extracted folder (or its `DI_CONNECT` folder) or the outer zip. Its FIT corpus

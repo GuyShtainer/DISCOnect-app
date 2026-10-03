@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Push and pull: what crosses the relay and how it is applied. The twin of
-//! `hearthbeat/relay/sync.py` (read its module docstring and `docs/relay-protocol.md`).
+//! `disconect/relay/sync.py` (read its module docstring and `docs/relay-protocol.md`).
 //!
 //! Push = every raw record and export range not yet marked in `relay_seen` /
 //! `relay_seen_ranges` (pushed or received) -> bundles split on the *compressed* payload length

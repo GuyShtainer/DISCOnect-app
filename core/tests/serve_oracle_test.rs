@@ -30,7 +30,7 @@ const APP_INFO_KEYS: [&str; 7] = [
 ];
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../hearthbeat/tests/fixtures/serve")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../disconect/tests/fixtures/serve")
 }
 
 /// The script's anchor days (`$FIRST`, `$MID`, `$LAST`, `$BEFORE`), which the generator took from the store.

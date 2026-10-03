@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `disconect-core [--db <path>]` (no subcommand, or `serve`) runs the JSON-lines sidecar protocol on
-//! stdio; the default store is `$HEARTHBEAT_DB`, else `~/.hearthbeat/hearthbeat.db`.
+//! stdio; the default store is `$DISCONECT_DB`, else `~/.hearthbeat/hearthbeat.db`.
 //!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
 //!  | sync push|pull|status|forget [--relay <folder> [--remember]]`
@@ -8,7 +8,7 @@
 //! `sync` talks to the blind relay (`docs/relay-protocol.md`); the folder comes from `--relay` or
 //! `~/.hearthbeat/relay.json` (`{"folder": path}`, shared with the Python CLI; `--remember` writes
 //! it). `push` and `pull` need the store's master key (a key file beside the db, unlocked with
-//! `--passphrase-file` or `HEARTHBEAT_PASSPHRASE`); `status` and `forget` need no relay and no key
+//! `--passphrase-file` or `DISCONECT_PASSPHRASE`); `status` and `forget` need no relay and no key
 //! beyond opening the store.
 //!
 //! Exit codes (the Python CLI's table): 0 ok; 1 failed, partial (`import` with failures, `pull`

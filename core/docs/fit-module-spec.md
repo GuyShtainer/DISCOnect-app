@@ -1,6 +1,6 @@
 # `fit` module — port spec (Bet 11 slice 1b)
 
-Source of truth: `projects/hearthbeat/src/hearthbeat/ingest/fit_wellness.py` (the oracle) and
+Source of truth: `projects/disconect/src/disconect/ingest/fit_wellness.py` (the oracle) and
 `docs/kb/21-fitparser-name-map.md` (parser differences). This page is the translation table;
 when it and the Python disagree, the Python wins and this page is fixed.
 

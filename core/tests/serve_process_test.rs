@@ -182,7 +182,7 @@ fn env_passphrase_is_ignored_and_reported() {
         .arg("--db")
         .arg(&db)
         .env("HOME", dir.path())
-        .env("HEARTHBEAT_PASSPHRASE", PASSPHRASE);
+        .env("DISCONECT_PASSPHRASE", PASSPHRASE);
     let input = requests(&[
         ("key.status", serde_json::json!({})),
         ("key.cache", serde_json::json!({"enable": true})),
@@ -194,7 +194,7 @@ fn env_passphrase_is_ignored_and_reported() {
     assert_eq!(lines[0]["level"], "warn");
     assert_eq!(
         lines[0]["message"],
-        "HEARTHBEAT_PASSPHRASE is ignored by serve and was removed from the environment"
+        "DISCONECT_PASSPHRASE is ignored by serve and was removed from the environment"
     );
     assert_eq!(lines[1]["result"]["unlocked"], false);
     assert_eq!(
@@ -209,7 +209,7 @@ fn no_subcommand_serves_and_default_db_comes_from_the_environment() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("elsewhere.db");
     let mut command = binary();
-    command.env("HEARTHBEAT_DB", &db).env("HOME", dir.path());
+    command.env("DISCONECT_DB", &db).env("HOME", dir.path());
     let (status, stdout, _stderr) =
         run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
     assert!(status.success());
@@ -220,7 +220,7 @@ fn no_subcommand_serves_and_default_db_comes_from_the_environment() {
         "no file and no key file: not encrypted"
     );
 
-    // with neither --db nor HEARTHBEAT_DB it is ~/.hearthbeat/hearthbeat.db under HOME
+    // with neither --db nor DISCONECT_DB it is ~/.hearthbeat/hearthbeat.db under HOME
     let mut command = binary();
     command.env("HOME", dir.path());
     let (_, stdout, _) = run_to_eof(command, &requests(&[("app.info", serde_json::json!({}))]));
@@ -241,7 +241,7 @@ fn key_path_override_expands_the_home_directory() {
         .arg("--db")
         .arg(&db)
         .env("HOME", dir.path())
-        .env("HEARTHBEAT_KEYS", "~/moved.keys.json");
+        .env("DISCONECT_KEYS", "~/moved.keys.json");
     let (_, stdout, _) = run_to_eof(command, &requests(&[("key.status", serde_json::json!({}))]));
     let status = &parsed(&stdout)[0]["result"];
     assert_eq!(status["key_file"], true);

@@ -1,5 +1,5 @@
 //! The bridge to the core (`disconect-core` serve, or `hearthbeat-core` via `--core hearthbeat`), protocol in
-//! `projects/hearthbeat/docs/serve-protocol.md`. One long-lived child per app; JSON Lines over
+//! `projects/disconect/docs/serve-protocol.md`. One long-lived child per app; JSON Lines over
 //! stdio; the webview and this process never hold the database key.
 //!
 //! Rules enforced here (pitch 07, "Protocol rules"): env allowlist on spawn, request ids,
@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 /// Environment variables the child may inherit. Everything else, the passphrase env above
 /// all, is dropped so a shell-launched app can never unlock through the tests-only path.
-const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "HEARTHBEAT_DB", "HEARTHBEAT_KEYS", "TMPDIR", "LANG"];
+const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "DISCONECT_DB", "DISCONECT_KEYS", "TMPDIR", "LANG"];
 const STDERR_LINES_KEPT: usize = 200;
 const MAX_RESTARTS: u32 = 1;
 
@@ -400,7 +400,7 @@ pub fn locate_bundled(dir: &Path, choice: Option<CoreChoice>) -> Option<PathBuf>
 /// Where the core lives: a bundled sidecar under the app's resources, `disconect-core` first,
 /// `hearthbeat-core` as the fallback, or exactly the one `--core` names. Debug builds, when no
 /// `--core` is given, also honour `DISCONECT_CORE` (an executable path) first and fall back to
-/// the dev venv's `hearthbeat-serve`; release builds never let an environment variable pick
+/// the dev venv's `disconect-serve`; release builds never let an environment variable pick
 /// the executable that receives the passphrase.
 pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> Option<PathBuf> {
     #[cfg(debug_assertions)]
@@ -414,7 +414,7 @@ pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> O
     }
     #[cfg(debug_assertions)]
     if choice != Some(CoreChoice::Disconect) {
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hearthbeat/.venv/bin/hearthbeat-serve");
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../disconect/.venv/bin/disconect-serve");
         if dev.is_file() {
             return Some(dev);
         }
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn passphrase_env_is_not_in_the_allowlist() {
-        assert!(!ENV_ALLOWLIST.contains(&"HEARTHBEAT_PASSPHRASE"));
-        assert!(!ENV_ALLOWLIST.contains(&"HEARTHBEAT_RECOVERY_WORDS"));
+        assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_PASSPHRASE"));
+        assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_RECOVERY_WORDS"));
     }
 }

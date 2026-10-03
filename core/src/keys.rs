@@ -20,11 +20,11 @@ use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
 pub const FORMAT_VERSION: u64 = 1;
-pub const PASSPHRASE_ENV: &str = "HEARTHBEAT_PASSPHRASE";
-pub const KEYS_ENV: &str = "HEARTHBEAT_KEYS";
+pub const PASSPHRASE_ENV: &str = "DISCONECT_PASSPHRASE";
+pub const KEYS_ENV: &str = "DISCONECT_KEYS";
 pub const KEY_FILE_SUFFIX: &str = ".keys.json";
 pub const NEXT_SUFFIX: &str = ".next";
-pub const RECOVERY_WORDS_ENV: &str = "HEARTHBEAT_RECOVERY_WORDS";
+pub const RECOVERY_WORDS_ENV: &str = "DISCONECT_RECOVERY_WORDS";
 pub const PURPOSE_PASSPHRASE: &str = "passphrase";
 
 // Frozen wire constants (docs/kb/24-wire-constants.md): they stay `hearthbeat` through every rename.
@@ -82,7 +82,7 @@ pub fn expand_user(path: &Path) -> PathBuf {
     }
 }
 
-/// `$HEARTHBEAT_KEYS` (with `~` expanded) if set and non-empty, else `<db>.keys.json` beside the database.
+/// `$DISCONECT_KEYS` (with `~` expanded) if set and non-empty, else `<db>.keys.json` beside the database.
 pub fn key_path_for(db_path: &Path) -> PathBuf {
     match std::env::var_os(KEYS_ENV) {
         Some(p) if !p.is_empty() => expand_user(Path::new(&p)),
@@ -119,7 +119,7 @@ fn parse_document(raw: &Value) -> Result<KeyFile, KeyError> {
     let format_ok = raw.get("format").and_then(Value::as_str) == Some(KEY_FILE_FORMAT);
     let version = raw.get("format_version").and_then(Value::as_u64).unwrap_or(0);
     if !format_ok || version > FORMAT_VERSION {
-        return corrupt("key file is not a hearthbeat key file this build understands");
+        return corrupt("key file is not a disconect key file this build understands");
     }
     let key_id_hex = raw.get("key_id").and_then(Value::as_str).unwrap_or("");
     let key_id: [u8; 16] = hex::decode(key_id_hex)
@@ -299,7 +299,7 @@ pub fn scrub_env_secrets() -> bool {
 
 /// Where a passphrase may come from in this slice (no keychain, no prompt).
 pub enum PassphraseSource<'a> {
-    /// `HEARTHBEAT_PASSPHRASE`, then nothing else.
+    /// `DISCONECT_PASSPHRASE`, then nothing else.
     Env,
     /// An explicit passphrase from the caller; the environment variable is still consumed.
     Explicit(&'a str),

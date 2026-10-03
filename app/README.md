@@ -4,7 +4,7 @@ Tauri 2 window over the core. Rust (the shell) holds no business logic: it super
 child (the sidecar, ADR 0008) and relays JSON requests; the webview draws what the core answers.
 The release bundle carries two cores: `disconect-core` (the Rust port, `../disconect-core`, the
 default since Bet 11d) and `hearthbeat-core` (the PyInstaller Python core, kept as the rollback
-and as the MCP server for Claude Desktop). Protocol: `../hearthbeat/docs/serve-protocol.md`.
+and as the MCP server for Claude Desktop). Protocol: `../disconect/docs/serve-protocol.md`.
 
 ## Layout
 - `src-tauri/src/sidecar.rs` — spawn with an env allowlist, request ids, per-method timeouts,
@@ -20,7 +20,7 @@ and as the MCP server for Claude Desktop). Protocol: `../hearthbeat/docs/serve-p
   `src/charts.ts` — ECharts with tokens read at paint time; a missing day is `null`, never
   bridged; not-covered runs are hatched. `src/identity.ts` — the product name and the
   non-affiliation notice (the only place they live on the UI side). `src/tokens.css` — written
-  by `../hearthbeat/docs/design/gen_tokens.py`; `src/app.css` — layout, token-only.
+  by `../disconect/docs/design/gen_tokens.py`; `src/app.css` — layout, token-only.
 
 ## Build and run
 ```sh
@@ -33,7 +33,7 @@ open -n ...disconect-app.app --args --core hearthbeat                   # rollba
 Rollback caveats: argv reaches the app only from a terminal launch (`open -n`, or quit first) —
 Dock and Finder launches carry none, and `--args` sent to a running app is ignored. The Python
 core reads the keychain with the macOS prompt allowed on every screen change, so after a
-`hearthbeat key cache` from the venv it will prompt. The durable rollback is to remove
+`disconect key cache` from the venv it will prompt. The durable rollback is to remove
 `Contents/Resources/disconect-core` from the bundle and re-sign (`codesign --force --deep -s -`):
 the app then runs `hearthbeat-core` from Finder as before.
 `build-app.sh` builds `disconect-core` with `cargo build --release --locked`, paths remapped
@@ -52,17 +52,17 @@ Bundle size (`du -sh`): 60 MiB with the Python core alone, 72 MiB with both (Rus
 sidecar 56 MiB); `tools/core-timing.py` prints the same in MB (1e6 bytes).
 Timing and size harness: `tools/core-timing.py`.
 Dev loop without the bundle: `npm run tauri dev` uses `DISCONECT_CORE=/path/to/disconect-core` (debug
-builds only), else `../hearthbeat/.venv/bin/hearthbeat-serve`.
+builds only), else `../disconect/.venv/bin/disconect-serve`.
 
 Encryption: the app never shows recovery words or runs `key init`; do that in a terminal
-(`hearthbeat key init`). The app unlocks with your passphrase, or from the keychain if you turn
+(`disconect key init`). The app unlocks with your passphrase, or from the keychain if you turn
 the switch on. Keychain items are per code identity: the app and the terminal each keep their
 own, and an app update forgets the app's copy (cache again).
 
 Tests: `cargo test` in `src-tauri` (bridge against a fake sidecar), and
 `cargo test --test real_core -- --ignored` with `DISCONECT_CORE`, `DISCONECT_TEST_DB` (a scratch
 encrypted copy) and `DISCONECT_TEST_PASSPHRASE_FILE` set. Python-side lint for this app lives in
-`../hearthbeat/tests/test_lint_app.py` (no devtools, strict CSP, no colour literals).
+`../disconect/tests/test_lint_app.py` (no devtools, strict CSP, no colour literals).
 
 Evidence captures: `tools/app-shot.sh` with `APP_ARGS`; PNGs go to `~/garmin-data/evidence/`.
 

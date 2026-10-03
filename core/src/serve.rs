@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `disconect-core` with no subcommand: the JSON-lines sidecar protocol the desktop app speaks over
-//! stdio, ported from `hearthbeat/serve.py` (the oracle is that file and `tests/test_serve.py`;
+//! stdio, ported from `disconect/serve.py` (the oracle is that file and `tests/test_serve.py`;
 //! `docs/serve-protocol.md` follows them).
 //!
 //! Slice 3A ported the transport and the start-up methods: `app.info`, `key.status`, `key.unlock`,
@@ -1028,9 +1028,9 @@ pub fn isolate_stdout() -> io::Result<std::fs::File> {
     ))
 }
 
-/// `$HEARTHBEAT_DB` (with `~` expanded) if set and non-empty, else `~/.hearthbeat/hearthbeat.db`.
+/// `$DISCONECT_DB` (with `~` expanded) if set and non-empty, else `~/.hearthbeat/hearthbeat.db`.
 pub fn default_db_path() -> Option<PathBuf> {
-    match std::env::var_os("HEARTHBEAT_DB") {
+    match std::env::var_os("DISCONECT_DB") {
         Some(path) if !path.is_empty() => Some(keys::expand_user(Path::new(&path))),
         _ => std::env::var_os("HOME").map(|home| {
             PathBuf::from(home)

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Data health and the import history: the twin of `hearthbeat/health.py` (`data_health`,
+//! Data health and the import history: the twin of `disconect/health.py` (`data_health`,
 //! `source_agreement`) and of `serve.import_last`. Everything is decoded by SQLite storage class
 //! (`stream_provenance` is `SELECT *` in the oracle, so its columns follow the schema), and the shapes
 //! are the oracle's exactly: `contract_version` is the *string* here (the oracle's `CONTRACT_VERSION`;

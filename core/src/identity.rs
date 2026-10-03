@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Product identity strings and the manufacturer scrub: the twin of `hearthbeat/identity.py` and
+//! Product identity strings and the manufacturer scrub: the twin of `disconect/identity.py` and
 //! `disconect-app/src/identity.ts` (ADR 0001: one cheap place to rename, no manufacturer marks).
 //!
 //! A drift test (`tests/test_identity_drift.py`) fails when the three files stop agreeing, and it

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Decode Garmin wellness FIT files into contract-shaped facts: the Rust twin of
-//! `hearthbeat/ingest/fit_wellness.py` (the oracle; where this file and the Python disagree, the
+//! `disconect/ingest/fit_wellness.py` (the oracle; where this file and the Python disagree, the
 //! Python wins).
 //!
 //! Parser: `fitparser` (MIT). Never Garmin's FIT SDK. Messages and fields are dispatched on

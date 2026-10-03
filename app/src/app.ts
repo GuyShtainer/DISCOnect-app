@@ -262,7 +262,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
   }
   out.append(legend);
   if (health.never_imported) {
-    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: hearthbeat import <export zip | watch folder>."));
+    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: disconect import <export zip | watch folder>."));
     return;
   }
   const card = el("div", "card ledger");
@@ -314,7 +314,7 @@ async function screenKey(out: ParentNode): Promise<void> {
   if (!keyStatus.encrypted) {
     card.append(el("h2", "heading", "Turn encryption on"));
     card.append(el("p", "body", "Run this once in a terminal, where the recovery words can be shown to you and to no one else:"));
-    card.append(el("pre", "mono body", "hearthbeat key init"));
+    card.append(el("pre", "mono body", "disconect key init"));
     card.append(el("p", "caption muted", "The app never shows the 24 words. They are the key; a screenshot or a transcript would be a copy."));
     out.append(card);
     return;
@@ -344,7 +344,7 @@ async function screenKey(out: ParentNode): Promise<void> {
       }
     };
     card.append(form, err);
-    card.append(el("p", "caption muted", "Lost the passphrase? Recovery with the 24 words is done in a terminal: hearthbeat key recover."));
+    card.append(el("p", "caption muted", "Lost the passphrase? Recovery with the 24 words is done in a terminal: disconect key recover."));
     out.append(card);
     setTimeout(() => input.focus(), 0);
     return;

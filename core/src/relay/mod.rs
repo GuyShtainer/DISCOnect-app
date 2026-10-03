@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The blind relay client (ADR 0005, pitch 10; the twin of `hearthbeat/relay/`): encrypted
+//! The blind relay client (ADR 0005, pitch 10; the twin of `disconect/relay/`): encrypted
 //! raw-record bundles between the user's devices through a dumb object store the user controls.
 //!
 //! The relay sees only ciphertext under an account id derived from the master key. Two things

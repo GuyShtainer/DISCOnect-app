@@ -27,7 +27,7 @@ impl Cli {
     fn run(&self, db: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_disconect-core"))
             .env("HOME", &self.home)
-            .env_remove("HEARTHBEAT_PASSPHRASE")
+            .env_remove("DISCONECT_PASSPHRASE")
             .arg("--db")
             .arg(db)
             .arg("--passphrase-file")
@@ -174,7 +174,7 @@ fn a_store_with_no_key_file_cannot_sync_and_a_missing_passphrase_is_locked() {
     let (_dir, db) = encrypted_copy();
     let locked = Command::new(env!("CARGO_BIN_EXE_disconect-core"))
         .env("HOME", &cli.home)
-        .env_remove("HEARTHBEAT_PASSPHRASE")
+        .env_remove("DISCONECT_PASSPHRASE")
         .args(["--db"])
         .arg(&db)
         .args(["sync", "push", "--relay", relay_arg])
