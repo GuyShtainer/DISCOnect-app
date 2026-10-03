@@ -417,12 +417,9 @@ fn json_float(x: f64) -> String {
     }
 }
 
-/// Python's `repr(float)` for a finite value: shortest round-trip digits, exponent form iff the
-/// scientific exponent is below -4 or at least 16.
-pub fn py_float_repr(x: f64) -> String {
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
-    }
+/// The shortest round-trip digits of a finite, non-zero `x` (its magnitude) and the position of the
+/// decimal point relative to the first of them: `value = 0.DIGITS * 10^point`.
+fn shortest_digits(x: f64) -> (String, i32) {
     // ryu's digits are the shortest that round-trip and, among those, the closest to the value:
     // exactly Python's `repr`. (Rust's own `{:e}` is shortest but can pick a different last digit.)
     let mut buffer = ryu::Buffer::new();
@@ -432,33 +429,78 @@ pub fn py_float_repr(x: f64) -> String {
     let all = format!("{whole}{fraction}");
     let leading_zeros = all.len() - all.trim_start_matches('0').len();
     let digits = all.trim_matches('0').to_string();
-    // Position of the decimal point relative to the first significant digit.
     let point = whole.len() as i32 + exponent.parse::<i32>().unwrap_or(0) - leading_zeros as i32;
-    let exp10 = point - 1;
-    let sign = if x < 0.0 { "-" } else { "" };
-    if !(-4..16).contains(&exp10) {
-        let (head, tail) = digits.split_at(1);
-        let fraction = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(".{tail}")
-        };
-        let exp_sign = if exp10 < 0 { '-' } else { '+' };
-        return format!(
-            "{sign}{head}{fraction}e{exp_sign}{:02}",
-            exp10.unsigned_abs()
-        );
-    }
+    (digits, point)
+}
+
+/// `digits` with the decimal point at `point` (plain notation, always one digit after the point).
+fn plain_notation(digits: &str, point: i32) -> String {
     let count = digits.len() as i32;
-    let body = if point <= 0 {
+    if point <= 0 {
         format!("0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
     } else if point >= count {
         format!("{digits}{}.0", "0".repeat((point - count) as usize))
     } else {
         let (whole, fraction) = digits.split_at(point as usize);
         format!("{whole}.{fraction}")
-    };
-    format!("{sign}{body}")
+    }
+}
+
+/// `d[.ddd]` for the scientific form.
+fn mantissa_of(digits: &str) -> String {
+    let (head, tail) = digits.split_at(1);
+    if tail.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}.{tail}")
+    }
+}
+
+/// Python's `repr(float)` for a finite value: shortest round-trip digits, exponent form iff the
+/// scientific exponent is below -4 or at least 16.
+pub fn py_float_repr(x: f64) -> String {
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let (digits, point) = shortest_digits(x);
+    let exp10 = point - 1;
+    let sign = if x < 0.0 { "-" } else { "" };
+    if !(-4..16).contains(&exp10) {
+        let exp_sign = if exp10 < 0 { '-' } else { '+' };
+        return format!(
+            "{sign}{}e{exp_sign}{:02}",
+            mantissa_of(&digits),
+            exp10.unsigned_abs()
+        );
+    }
+    format!("{sign}{}", plain_notation(&digits, point))
+}
+
+/// `pydantic_core.to_json(x)` for a float (measured, `tests/gen_pydantic_floats.py`): the same shortest
+/// digits as `repr`, plain notation iff `1e-5 <= |x| < 1e16`, else `d[.ddd]e<sign><exponent>` with an explicit
+/// sign and no padding (`1e-7`, `1.5e+16`); NaN and the infinities are bare words.
+pub fn pydantic_float(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".to_string();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let (digits, point) = shortest_digits(x);
+    let sign = if x < 0.0 { "-" } else { "" };
+    if (-4..=16).contains(&point) {
+        return format!("{sign}{}", plain_notation(&digits, point));
+    }
+    let exp10 = point - 1;
+    let exp_sign = if exp10 < 0 { '-' } else { '+' };
+    format!(
+        "{sign}{}e{exp_sign}{}",
+        mantissa_of(&digits),
+        exp10.unsigned_abs()
+    )
 }
 
 // ---- entry points ----

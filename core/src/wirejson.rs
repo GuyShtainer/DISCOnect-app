@@ -18,7 +18,7 @@ const MAX_INT_DIGITS: usize = 4300;
 const MAX_DEPTH: usize = 512;
 
 /// A JSON string as Python holds it: code points, but lone surrogates are legal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PyStr(Vec<u16>);
 
 impl PyStr {
@@ -124,6 +124,26 @@ impl Json {
         Json::int(i64::try_from(value).unwrap_or(i64::MAX))
     }
 
+    /// A `dict` literal: the pairs in the order given (Python's insertion order).
+    pub fn object<const N: usize>(pairs: [(&str, Json); N]) -> Json {
+        Json::Object(
+            pairs
+                .into_iter()
+                .map(|(key, value)| (PyStr::from_text(key), value))
+                .collect(),
+        )
+    }
+
+    /// A `list` of `str` values.
+    pub fn texts<'a>(items: impl IntoIterator<Item = &'a String>) -> Json {
+        Json::Array(items.into_iter().map(|item| Json::text(item)).collect())
+    }
+
+    /// A `bool` value.
+    pub fn flag(value: bool) -> Json {
+        Json::Bool(value)
+    }
+
     /// An empty `dict`; fill it with [`Json::set`] to keep Python's insertion order.
     pub fn dict() -> Json {
         Json::Object(Vec::new())
@@ -150,7 +170,10 @@ impl Json {
             Json::Float(number) => Value::Number(serde_json::Number::from_f64(*number)?),
             Json::Str(text) => Value::String(text.units_lossy()),
             Json::Array(items) => Value::Array(
-                items.iter().map(Json::to_serde).collect::<Option<Vec<_>>>()?,
+                items
+                    .iter()
+                    .map(Json::to_serde)
+                    .collect::<Option<Vec<_>>>()?,
             ),
             Json::Object(pairs) => Value::Object(
                 pairs
@@ -496,24 +519,71 @@ pub fn write_value(out: &mut String, value: &Value) {
 /// `None`, else one item per line indented by `indent` spaces per level (`indent=2`). Objects keep the order
 /// they hold; a float is its `repr` and a non-finite one a bare word; an empty list or object is `[]` or `{}`.
 pub fn write_json(out: &mut String, json: &Json, indent: Option<usize>) {
-    write_level(out, json, indent, 0);
+    write_level(out, json, indent, 0, Flavor::JsonDumps);
 }
 
-fn write_level(out: &mut String, json: &Json, indent: Option<usize>, level: usize) {
+/// Append `json` as `pydantic_core.to_json(value, indent=2)` writes it, which is how the Python MCP server
+/// builds the `text` of a tool result: the same layout as `json.dumps(indent=2)`, but raw UTF-8 (only `"`, `\`
+/// and the control characters are escaped; a lone surrogate, which pydantic cannot encode, becomes U+FFFD) and
+/// pydantic's floats ([`crate::canon::pydantic_float`]).
+pub fn write_pydantic_indent2(out: &mut String, json: &Json) {
+    write_level(out, json, Some(2), 0, Flavor::Pydantic);
+}
+
+/// Which library's spelling of strings and floats a writer follows.
+#[derive(Clone, Copy)]
+enum Flavor {
+    JsonDumps,
+    Pydantic,
+}
+
+/// A string literal as pydantic writes it: raw UTF-8, `\"` `\\` `\b` `\f` `\n` `\r` `\t`, other controls as
+/// `\u00xx` (lower-case hex), DEL and everything else untouched.
+fn write_string_utf8(out: &mut String, units: impl IntoIterator<Item = u16>) {
+    out.push('"');
+    for piece in char::decode_utf16(units) {
+        let ch = piece.unwrap_or(char::REPLACEMENT_CHARACTER);
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", control as u32))
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+fn write_level(out: &mut String, json: &Json, indent: Option<usize>, level: usize, flavor: Flavor) {
     let newline = |out: &mut String, depth: usize| {
         if let Some(step) = indent {
             out.push('\n');
             out.push_str(&" ".repeat(step * depth));
         }
     };
+    let string = |out: &mut String, text: &PyStr| match flavor {
+        Flavor::JsonDumps => write_string(out, text.units()),
+        Flavor::Pydantic => write_string_utf8(out, text.units()),
+    };
     match json {
         Json::Null => out.push_str("null"),
         Json::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
         Json::Int(int) => out.push_str(int.text()),
         Json::Float(x) if x.is_nan() => out.push_str("NaN"),
-        Json::Float(x) if x.is_infinite() => out.push_str(if *x > 0.0 { "Infinity" } else { "-Infinity" }),
-        Json::Float(x) => out.push_str(&crate::canon::py_float_repr(*x)),
-        Json::Str(text) => write_string(out, text.units()),
+        Json::Float(x) if x.is_infinite() => {
+            out.push_str(if *x > 0.0 { "Infinity" } else { "-Infinity" })
+        }
+        Json::Float(x) => out.push_str(&match flavor {
+            Flavor::JsonDumps => crate::canon::py_float_repr(*x),
+            Flavor::Pydantic => crate::canon::pydantic_float(*x),
+        }),
+        Json::Str(text) => string(out, text),
         Json::Array(items) if items.is_empty() => out.push_str("[]"),
         Json::Object(pairs) if pairs.is_empty() => out.push_str("{}"),
         Json::Array(items) => {
@@ -521,7 +591,7 @@ fn write_level(out: &mut String, json: &Json, indent: Option<usize>, level: usiz
             for (index, item) in items.iter().enumerate() {
                 out.push_str(if index == 0 { "" } else { "," });
                 newline(out, level + 1);
-                write_level(out, item, indent, level + 1);
+                write_level(out, item, indent, level + 1, flavor);
             }
             newline(out, level);
             out.push(']');
@@ -531,9 +601,9 @@ fn write_level(out: &mut String, json: &Json, indent: Option<usize>, level: usiz
             for (index, (key, item)) in pairs.iter().enumerate() {
                 out.push_str(if index == 0 { "" } else { "," });
                 newline(out, level + 1);
-                write_string(out, key.units());
+                string(out, key);
                 out.push_str(if indent.is_some() { ": " } else { ":" });
-                write_level(out, item, indent, level + 1);
+                write_level(out, item, indent, level + 1, flavor);
             }
             newline(out, level);
             out.push('}');
@@ -548,12 +618,18 @@ pub fn from_serde(value: &Value) -> Json {
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Number(number) => match (number.as_i64(), number.as_u64()) {
             (Some(int), _) => Json::int(int),
-            (None, Some(big)) => PyInt::from_decimal(false, &big.to_string()).map_or(Json::Null, Json::Int),
+            (None, Some(big)) => {
+                PyInt::from_decimal(false, &big.to_string()).map_or(Json::Null, Json::Int)
+            }
             _ => Json::Float(number.as_f64().unwrap_or(f64::NAN)),
         },
         Value::String(text) => Json::text(text),
         Value::Array(items) => Json::Array(items.iter().map(from_serde).collect()),
-        Value::Object(map) => Json::Object(map.iter().map(|(k, v)| (PyStr::from_text(k), from_serde(v))).collect()),
+        Value::Object(map) => Json::Object(
+            map.iter()
+                .map(|(k, v)| (PyStr::from_text(k), from_serde(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -696,19 +772,78 @@ mod tests {
             r#"{"a":[1,2.5,{"b":null}],"c":{},"d":[],"\u00e9":"x\n\u2028\ud83d\ude00","f":1e+16,"g":1e-05,"h":100.0,"i":true,"j":-0.0}"#
         );
         let mut words = String::new();
-        write_json(&mut words, &Json::Array(vec![Json::Float(f64::NAN), Json::Float(f64::NEG_INFINITY)]), None);
+        write_json(
+            &mut words,
+            &Json::Array(vec![Json::Float(f64::NAN), Json::Float(f64::NEG_INFINITY)]),
+            None,
+        );
         assert_eq!(words, "[NaN,-Infinity]");
     }
 
     #[test]
+    fn pydantic_text_is_raw_utf8_with_pydantics_floats() {
+        let Ok(tree) = parse(
+            r#"{"é":"x\n\u0001\u007f\u2028\ud83d\ude00\"\\/\b\f\t\r","a":[],"b":{},"c":[1e-5,1.5e-7,1e16,100.0,-0.0,0.1,12345.678]}"#,
+        ) else {
+            unreachable!()
+        };
+        let mut text = String::new();
+        write_pydantic_indent2(&mut text, &tree);
+        assert_eq!(
+            text,
+            "{\n  \"é\": \"x\\n\\u0001\u{7f}\u{2028}\u{1f600}\\\"\\\\/\\b\\f\\t\\r\",\n  \"a\": [],\n  \"b\": {},\n  \"c\": [\n    0.00001,\n    1.5e-7,\n    1e+16,\n    100.0,\n    -0.0,\n    0.1,\n    12345.678\n  ]\n}"
+        );
+    }
+
+    /// `tests/fixtures/mcp/pydantic_floats.json`: what `pydantic_core.to_json` wrote for each float.
+    #[test]
+    fn every_float_pydantic_wrote_is_reproduced() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../disconect/tests/fixtures/mcp/pydantic_floats.json");
+        let table: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json");
+        let floats = table["floats"].as_array().expect("floats");
+        assert!(floats.len() > 1000);
+        for entry in floats {
+            let bits = u64::from_str_radix(entry["bits"].as_str().expect("bits"), 16).expect("hex");
+            let value = f64::from_bits(bits);
+            let want = entry["pydantic"].as_str().expect("text");
+            assert_eq!(
+                crate::canon::pydantic_float(value),
+                want,
+                "bits {bits:016x} repr {}",
+                entry["repr"]
+            );
+            let mut out = String::new();
+            write_pydantic_indent2(&mut out, &Json::Float(value));
+            assert_eq!(out, want);
+        }
+    }
+
+    #[test]
     fn decimal_integers_are_normalised_and_serde_values_convert() {
-        assert_eq!(PyInt::from_decimal(true, "000").map(|i| i.text().to_string()).as_deref(), Some("0"));
-        assert_eq!(PyInt::from_decimal(true, "007").map(|i| i.text().to_string()).as_deref(), Some("-7"));
+        assert_eq!(
+            PyInt::from_decimal(true, "000")
+                .map(|i| i.text().to_string())
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            PyInt::from_decimal(true, "007")
+                .map(|i| i.text().to_string())
+                .as_deref(),
+            Some("-7")
+        );
         assert_eq!(PyInt::from_decimal(false, ""), None);
         assert_eq!(PyInt::from_decimal(false, "1_0"), None);
-        let tree = from_serde(&json!({"n": 1, "f": 1.0, "big": 18446744073709551615u64, "s": "é", "l": [null, true]}));
+        let tree = from_serde(
+            &json!({"n": 1, "f": 1.0, "big": 18446744073709551615u64, "s": "é", "l": [null, true]}),
+        );
         let mut out = String::new();
         write_json(&mut out, &tree, None);
-        assert_eq!(out, r#"{"big":18446744073709551615,"f":1.0,"l":[null,true],"n":1,"s":"\u00e9"}"#);
+        assert_eq!(
+            out,
+            r#"{"big":18446744073709551615,"f":1.0,"l":[null,true],"n":1,"s":"\u00e9"}"#
+        );
     }
 }

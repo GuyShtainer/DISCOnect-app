@@ -355,7 +355,7 @@ impl Server {
         match (tool.run)(self, &args) {
             Outcome::Done(json) => {
                 let mut text = String::new();
-                wirejson::write_json(&mut text, &json, Some(2));
+                wirejson::write_pydantic_indent2(&mut text, &json);
                 let mut structured = String::new();
                 wirejson::write_json(&mut structured, &json, None);
                 response(
