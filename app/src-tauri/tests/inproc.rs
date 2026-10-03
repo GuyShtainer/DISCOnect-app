@@ -7,8 +7,9 @@
 //!   `disconect-core serve` writes for the same requests (`target/debug/disconect-core`, built from
 //!   `../../core`; the test says so and fails if it is missing);
 //! * the router path (`Sidecar::start_inproc`) answers the same results;
-//! * a malformed `.fit` imported in-process fails the file, not the app (the `panic = "unwind"` proof is
-//!   that `Cargo.toml` says so, read here, plus a core thread that really panics and is restarted);
+//! * a `.fit` that really panics fitparser (`hdr255`: `header_size = 255` + a nonzero header CRC) imported
+//!   in-process fails the file, not the app, and the next `app.info` answers (plus the `panic = "unwind"`
+//!   profile read from `Cargo.toml`, and a core thread that panics and is restarted);
 //! * the passphrase environment variable is never an unlock path in-process.
 
 use std::io::{BufRead, BufReader, Write};
@@ -240,17 +241,17 @@ async fn the_router_path_answers_what_the_sidecar_answers() {
 }
 
 #[tokio::test]
-async fn a_malformed_fit_fails_the_file_not_the_app() {
+async fn a_fit_that_panics_the_parser_fails_the_file_not_the_app() {
     env_init();
     let dir = scratch();
     let db = synthetic_copy(&dir, "synthetic.hbdb");
     let inbox = dir.0.join("inbox");
     std::fs::create_dir_all(&inbox).expect("mkdir");
     std::fs::copy(
-        repo().join("projects/disconect-core/tests/fixtures/synthetic/garbage.fit.bin"),
-        inbox.join("garbage.fit"),
+        repo().join("projects/disconect-core/tests/fixtures/synthetic/hdr255.fit.bin"),
+        inbox.join("hdr255.fit"),
     )
-    .expect("copy garbage");
+    .expect("copy hdr255");
     let events = collect();
     let core = Sidecar::start_inproc(db, events.clone()).expect("in-process core");
 
@@ -264,7 +265,14 @@ async fn a_malformed_fit_fails_the_file_not_the_app() {
     assert_eq!(result["files"], 1);
     assert_eq!(result["failed"], 1, "the failure is reported: {result}");
     assert_eq!(result["ok"], 0);
-
+    // the input is the review's: a 14-byte header declaring `header_size = 255` with a nonzero CRC makes
+    // fitparser itself panic (it slices `input[0..253]`); the core's `catch_unwind` turns that into a failed
+    // file. Guard that the bytes still panic the parser in this build (a fitparser upgrade that fixed it
+    // would otherwise leave this test proving nothing):
+    let bytes = std::fs::read(repo().join("projects/disconect-core/tests/fixtures/synthetic/hdr255.fit.bin")).expect("read hdr255");
+    let direct = disconect_core::fit::decode_fit(&bytes).expect_err("hdr255 does not decode");
+    assert_eq!(direct.kind, "unrecognized_payload");
+    assert!(direct.message.contains("parser panicked on this input"), "{}", direct.message);
     // the same thread is still serving, and recorded the failed run (newest first)
     let info = core
         .call("app.info", json!({}))
