@@ -8,3 +8,6 @@
 # the PyInstaller sidecar is built by tools/build-app.sh, never committed
 /resources/hearthbeat-core/*
 !/resources/hearthbeat-core/README.txt
+# the Rust sidecar is built by tools/build-app.sh, never committed
+/resources/disconect-core/*
+!/resources/disconect-core/README.txt

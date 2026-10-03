@@ -3,7 +3,6 @@
 //! the passphrase env never reaches the child, and `key.unlock` is refused on the plain path.
 //! The real core is covered by `real_core.rs` (ignored by default; needs a scratch DB).
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,7 +49,7 @@ fn fake_launch() -> Launch {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    Launch { program: PathBuf::from(wrapper), args: vec![] }
+    Launch { program: wrapper, args: vec![] }
 }
 
 fn start() -> (Sidecar, Arc<Collect>) {

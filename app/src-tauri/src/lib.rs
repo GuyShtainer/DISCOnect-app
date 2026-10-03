@@ -9,7 +9,7 @@ use serde_json::Value;
 use tauri::{Emitter, Manager, RunEvent, State};
 use zeroize::Zeroizing;
 
-use sidecar::{CoreError, EventSink, Launch, Sidecar};
+use sidecar::{CoreChoice, CoreError, EventSink, Launch, Sidecar};
 
 /// The core, or why it is not there. Stored in Tauri state so commands can reach it.
 pub struct Core(pub Result<Sidecar, CoreError>);
@@ -87,9 +87,13 @@ async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreErr
 
 fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
     let resource_dir = app.path().resource_dir().ok();
-    let program = sidecar::locate_core(resource_dir.as_deref()).ok_or_else(|| CoreError {
+    let choice = CoreChoice::from_args(std::env::args()).map_err(|message| CoreError { code: "core_unavailable".into(), message })?;
+    let program = sidecar::locate_core(resource_dir.as_deref(), choice).ok_or_else(|| CoreError {
         code: "core_unavailable".into(),
-        message: "the core is not bundled with this build and DISCONECT_CORE is unset".into(),
+        message: match choice {
+            Some(c) => format!("the {} core named by --core is not bundled with this build", c.name()),
+            None => "no core is bundled with this build".into(),
+        },
     })?;
     let db = Launch::db_from_args(std::env::args());
     Sidecar::start(Launch::new(program, db), Arc::new(WindowSink(app.clone())))

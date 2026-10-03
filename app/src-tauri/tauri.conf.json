@@ -35,7 +35,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/hearthbeat-core/": "hearthbeat-core/"
+      "resources/hearthbeat-core/": "hearthbeat-core/",
+      "resources/disconect-core/": "disconect-core/"
     }
   }
 }

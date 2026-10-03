@@ -224,7 +224,7 @@ impl Sidecar {
 
     fn reap(&self) -> Option<i32> {
         let mut guard = self.0.running.lock().unwrap();
-        let Some(mut r) = guard.take() else { return None };
+        let mut r = guard.take()?;
         r.child.wait().ok().and_then(|s| s.code())
     }
 
@@ -339,23 +339,81 @@ impl Sidecar {
     }
 }
 
-/// Where the core lives: the bundled one-dir sidecar under the app's resources. Debug builds
-/// also honour `DISCONECT_CORE` (an executable path) and fall back to the dev venv's
-/// `hearthbeat-serve`; release builds never let an environment variable pick the executable
-/// that receives the passphrase.
-pub fn locate_core(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    #[cfg(debug_assertions)]
-    if let Some(p) = std::env::var_os("DISCONECT_CORE") {
-        return Some(PathBuf::from(p));
-    }
-    if let Some(dir) = resource_dir {
-        let bundled = dir.join("hearthbeat-core").join("hearthbeat-core");
-        if bundled.is_file() {
-            return Some(bundled);
+/// Which bundled core the app should run. Chosen by `--core hearthbeat|disconect` on the app's
+/// own argv (rollback switch, pitch 11d step 3); never by an environment variable or a path,
+/// because the executable that receives the passphrase must be one the bundle ships.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreChoice {
+    /// `disconect-core`, the Rust port.
+    Disconect,
+    /// `hearthbeat-core`, the PyInstaller Python core (also the MCP server).
+    Hearthbeat,
+}
+
+impl CoreChoice {
+    /// The `--core` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Disconect => "disconect",
+            Self::Hearthbeat => "hearthbeat",
         }
     }
+
+    /// `--core <name>` or `--core=<name>` from the app's argv. `Ok(None)` when absent; an
+    /// unknown or missing name is an error (fail closed: a typo must not pick a core).
+    pub fn from_args<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Self>, String> {
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            let value = if a == "--core" {
+                it.next().ok_or_else(|| "--core needs a value (hearthbeat or disconect)".to_string())?
+            } else if let Some(rest) = a.strip_prefix("--core=") {
+                rest.to_string()
+            } else {
+                continue;
+            };
+            return match value.as_str() {
+                "disconect" => Ok(Some(Self::Disconect)),
+                "hearthbeat" => Ok(Some(Self::Hearthbeat)),
+                other => Err(format!("--core must be hearthbeat or disconect, not {other:?}")),
+            };
+        }
+        Ok(None)
+    }
+}
+
+/// An executable shipped inside the bundle's resources, if present.
+fn bundled(dir: &Path, name: &str) -> Option<PathBuf> {
+    let p = dir.join(name).join(name);
+    p.is_file().then_some(p)
+}
+
+/// The bundled-executable rule, no environment: without a choice the Rust core first, then
+/// the Python one; with a choice only that one (absent means `None`, never the other).
+pub fn locate_bundled(dir: &Path, choice: Option<CoreChoice>) -> Option<PathBuf> {
+    match choice {
+        Some(CoreChoice::Disconect) => bundled(dir, "disconect-core"),
+        Some(CoreChoice::Hearthbeat) => bundled(dir, "hearthbeat-core"),
+        None => bundled(dir, "disconect-core").or_else(|| bundled(dir, "hearthbeat-core")),
+    }
+}
+
+/// Where the core lives: a bundled sidecar under the app's resources, `disconect-core` first,
+/// `hearthbeat-core` as the fallback, or exactly the one `--core` names. Debug builds, when no
+/// `--core` is given, also honour `DISCONECT_CORE` (an executable path) first and fall back to
+/// the dev venv's `hearthbeat-serve`; release builds never let an environment variable pick
+/// the executable that receives the passphrase.
+pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> Option<PathBuf> {
     #[cfg(debug_assertions)]
-    {
+    if choice.is_none() {
+        if let Some(p) = std::env::var_os("DISCONECT_CORE") {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Some(p) = resource_dir.and_then(|dir| locate_bundled(dir, choice)) {
+        return Some(p);
+    }
+    #[cfg(debug_assertions)]
+    if choice != Some(CoreChoice::Disconect) {
         let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hearthbeat/.venv/bin/hearthbeat-serve");
         if dev.is_file() {
             return Some(dev);
@@ -367,6 +425,64 @@ pub fn locate_core(resource_dir: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch resource dir holding `<name>/<name>` files; removed on drop. (No tempfile
+    /// crate: the app keeps its dependency list short.)
+    struct Bundle(PathBuf);
+
+    impl Drop for Bundle {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn bundle_with(names: &[&str]) -> Bundle {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("disconect-sidecar-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for n in names {
+            std::fs::create_dir_all(dir.join(n)).expect("mkdir");
+            std::fs::write(dir.join(n).join(n), b"x").expect("write");
+        }
+        Bundle(dir)
+    }
+
+    #[test]
+    fn core_flag_is_read_in_both_spellings_and_fails_closed() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(CoreChoice::from_args(args(&["app"])), Ok(None));
+        assert_eq!(CoreChoice::from_args(args(&["app", "--core", "hearthbeat"])), Ok(Some(CoreChoice::Hearthbeat)));
+        assert_eq!(CoreChoice::from_args(args(&["app", "--db", "x", "--core=disconect"])), Ok(Some(CoreChoice::Disconect)));
+        assert!(CoreChoice::from_args(args(&["app", "--core", "python"])).is_err());
+        assert!(CoreChoice::from_args(args(&["app", "--core", "/bin/sh"])).is_err());
+        assert!(CoreChoice::from_args(args(&["app", "--core"])).is_err());
+    }
+
+    #[test]
+    fn bundled_order_is_rust_then_python() {
+        let both = bundle_with(&["disconect-core", "hearthbeat-core"]);
+        let p = locate_bundled(both.0.as_path(), None).expect("found");
+        assert!(p.ends_with("disconect-core/disconect-core"));
+        let only_py = bundle_with(&["hearthbeat-core"]);
+        let p = locate_bundled(only_py.0.as_path(), None).expect("found");
+        assert!(p.ends_with("hearthbeat-core/hearthbeat-core"));
+        let none = bundle_with(&[]);
+        assert_eq!(locate_bundled(none.0.as_path(), None), None);
+    }
+
+    #[test]
+    fn core_switch_picks_only_the_named_bundled_core() {
+        let both = bundle_with(&["disconect-core", "hearthbeat-core"]);
+        let py = locate_bundled(both.0.as_path(), Some(CoreChoice::Hearthbeat)).expect("found");
+        assert!(py.ends_with("hearthbeat-core/hearthbeat-core"));
+        let rs = locate_bundled(both.0.as_path(), Some(CoreChoice::Disconect)).expect("found");
+        assert!(rs.ends_with("disconect-core/disconect-core"));
+        // no silent fallback to the other core when the named one is missing
+        let only_py = bundle_with(&["hearthbeat-core"]);
+        assert_eq!(locate_bundled(only_py.0.as_path(), Some(CoreChoice::Disconect)), None);
+        let only_rs = bundle_with(&["disconect-core"]);
+        assert_eq!(locate_bundled(only_rs.0.as_path(), Some(CoreChoice::Hearthbeat)), None);
+    }
 
     #[test]
     fn db_flag_is_read_from_argv_in_both_spellings() {

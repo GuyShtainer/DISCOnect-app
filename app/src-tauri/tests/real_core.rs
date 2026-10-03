@@ -94,7 +94,7 @@ fn copy_store(db: &str, suffix: &str) -> String {
 fn count_after(summary: &str, word: &str) -> u64 {
     // "ok: 3 imported, 211 duplicate, 0 failed ..." -> the number before `word`
     summary
-        .split(|c: char| c == ',' || c == ':')
+        .split([',', ':'])
         .find_map(|part| {
             let part = part.trim();
             part.strip_suffix(word).and_then(|n| n.trim().parse::<u64>().ok())

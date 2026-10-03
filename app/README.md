@@ -1,13 +1,19 @@
 # disconect-app — the DISCOnect desktop shell (macOS first)
 
-Tauri 2 window over the Python core. Rust holds no business logic: it supervises one
-`hearthbeat serve` child (the sidecar, ADR 0008) and relays JSON requests; the webview draws
-what the core answers. Protocol: `../hearthbeat/docs/serve-protocol.md`.
+Tauri 2 window over the core. Rust (the shell) holds no business logic: it supervises one `serve`
+child (the sidecar, ADR 0008) and relays JSON requests; the webview draws what the core answers.
+The release bundle carries two cores: `disconect-core` (the Rust port, `../disconect-core`, the
+default since Bet 11d) and `hearthbeat-core` (the PyInstaller Python core, kept as the rollback
+and as the MCP server for Claude Desktop). Protocol: `../hearthbeat/docs/serve-protocol.md`.
 
 ## Layout
 - `src-tauri/src/sidecar.rs` — spawn with an env allowlist, request ids, per-method timeouts,
   one restart after a crash, stderr kept in a bounded buffer, child killed on exit, passphrase
   carried only as `Zeroizing` bytes.
+  `locate_core`: release order `disconect-core` then `hearthbeat-core`; the app's own argv
+  `--core disconect|hearthbeat` (parsed like `--db`) picks exactly one bundled core, an unknown
+  name or a missing core is an error, never a fallback. No environment variable and no path can
+  choose the executable in a release build (debug builds keep `DISCONECT_CORE` when no `--core`).
 - `src-tauri/src/lib.rs` — Tauri commands `core_call`, `core_unlock`, `core_stderr`,
   `launch_args` (+ `debug_unlock_from_file` in debug builds only).
 - `src/app.ts` — hash router and the four screens: Today, Trends, Data health, Your key.
@@ -18,12 +24,29 @@ what the core answers. Protocol: `../hearthbeat/docs/serve-protocol.md`.
 
 ## Build and run
 ```sh
-tools/build-app.sh                 # PyInstaller sidecar -> tauri build -> .app -> ad-hoc sign
+tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build -> .app -> ad-hoc sign
+tools/build-app.sh --rust-sidecar  # only the Rust sidecar (reuses the staged Python one)
 open src-tauri/target/release/bundle/macos/disconect-app.app
 open ...disconect-app.app --args --db /path/to/copy.db --screen trend   # a scratch copy, never the live DB
+open ...disconect-app.app --args --core hearthbeat                      # rollback: the Python core
 ```
-Dev loop without the bundle: `npm run tauri dev` finds `../hearthbeat/.venv/bin/hearthbeat-serve`
-(debug builds only) or `DISCONECT_CORE=/path/to/hearthbeat-serve`.
+`build-app.sh` builds `disconect-core` with `cargo build --release --locked`, paths remapped
+(`--remap-path-prefix` for `$HOME` and the repo root, passed as `RUSTFLAGS` because a committed
+`.cargo/config.toml` cannot name one machine's absolute paths and Cargo's `trim-paths` is nightly-only;
+it therefore does not apply to `cargo test --release`, which ships nothing), in
+`/tmp/disconect-core-build` (OpenSSL's C code bakes its build directory into the binary, which the remap
+cannot reach, so the build must not live under the repo). A `strings -a` guard fails the build if the binary
+still holds `/Users/` or the repo folder's name. A missing binary or a failed build fails the script; there
+is no silent fallback to Python. `app.info` is smoke-tested on the staged and on the bundled copies, and
+`Contents/Resources/THIRD-PARTY.txt` carries fitparser's MIT licence (the crates.io package ships none; the
+text is `third-party/fitparser-LICENSE.txt`), ADR 0007's Profile sentence and the dependency licences.
+
+Both sidecars are **arm64-only** (built on this Apple-silicon Mac; no universal build, no Intel Mac).
+Bundle size (`du -sh`): 60 MiB with the Python core alone, 72 MiB with both (Rust sidecar 11 MiB, Python
+sidecar 56 MiB); `tools/core-timing.py` prints the same in MB (1e6 bytes).
+Timing and size harness: `tools/core-timing.py`.
+Dev loop without the bundle: `npm run tauri dev` uses `DISCONECT_CORE=/path/to/disconect-core` (debug
+builds only), else `../hearthbeat/.venv/bin/hearthbeat-serve`.
 
 Encryption: the app never shows recovery words or runs `key init`; do that in a terminal
 (`hearthbeat key init`). The app unlocks with your passphrase, or from the keychain if you turn
