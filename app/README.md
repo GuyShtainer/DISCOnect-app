@@ -109,6 +109,8 @@ answers, five evals, and one scenario replayed through the real egress against a
 
 ## Coach probe and screens
 
+Built and lint-tested, **not yet seen**: no app-shot has been taken of the Coach screens (the debug bundle build was refused in the building session); the HANDOFF holds the commands.
+
 `coach_probe` (`src-tauri/src/coach/probe.rs`) asks the saved endpoint two made-up questions and runs no tool and no core
 call, so it works on a locked store. Round 1 offers the five tools and reads whether the model calls one; round 2 sends a
 filler of 12 000 tokens (4 bytes each, `max_tokens: 1`) and compares the endpoint's `usage.prompt_tokens` with it: under 85 %
