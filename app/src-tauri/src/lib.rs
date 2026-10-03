@@ -1,5 +1,6 @@
 //! DISCOnect desktop shell (Bet 7). Rust holds no business logic: every command is a thin
-//! relay to the Python core through [`sidecar`], and the webview draws what the core answers.
+//! relay to the core (Rust by default, Python via `--core hearthbeat`) through [`sidecar`], and the
+//! webview draws what the core answers.
 
 pub mod sidecar;
 

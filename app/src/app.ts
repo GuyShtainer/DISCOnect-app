@@ -389,6 +389,7 @@ async function screenKey(out: ParentNode): Promise<void> {
     if (cache !== mcp) {
       about.append(el("span", "", "To let it open your encrypted database without a passphrase, run this once in a terminal (it asks for your passphrase):"));
       about.append(el("pre", "mono caption", cache));
+      about.append(el("span", "caption muted", "If it reports an existing entry (error -25244), a different copy of the core made it: delete the “hearthbeat” item in Keychain Access, then run it again."));
     }
   }
   about.append(el("span", "caption muted", "If macOS refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));

@@ -1,4 +1,4 @@
-//! The bridge to the Python core (`hearthbeat serve`), protocol in
+//! The bridge to the core (`disconect-core` serve, or `hearthbeat-core` via `--core hearthbeat`), protocol in
 //! `projects/hearthbeat/docs/serve-protocol.md`. One long-lived child per app; JSON Lines over
 //! stdio; the webview and this process never hold the database key.
 //!

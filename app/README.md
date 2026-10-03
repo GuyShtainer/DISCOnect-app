@@ -28,8 +28,14 @@ tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build 
 tools/build-app.sh --rust-sidecar  # only the Rust sidecar (reuses the staged Python one)
 open src-tauri/target/release/bundle/macos/disconect-app.app
 open ...disconect-app.app --args --db /path/to/copy.db --screen trend   # a scratch copy, never the live DB
-open ...disconect-app.app --args --core hearthbeat                      # rollback: the Python core
+open -n ...disconect-app.app --args --core hearthbeat                   # rollback for one launch: the Python core
 ```
+Rollback caveats: argv reaches the app only from a terminal launch (`open -n`, or quit first) —
+Dock and Finder launches carry none, and `--args` sent to a running app is ignored. The Python
+core reads the keychain with the macOS prompt allowed on every screen change, so after a
+`hearthbeat key cache` from the venv it will prompt. The durable rollback is to remove
+`Contents/Resources/disconect-core` from the bundle and re-sign (`codesign --force --deep -s -`):
+the app then runs `hearthbeat-core` from Finder as before.
 `build-app.sh` builds `disconect-core` with `cargo build --release --locked`, paths remapped
 (`--remap-path-prefix` for `$HOME` and the repo root, passed as `RUSTFLAGS` because a committed
 `.cargo/config.toml` cannot name one machine's absolute paths and Cargo's `trim-paths` is nightly-only;
