@@ -35,6 +35,10 @@ pub enum WriterError {
     Compress(String),
 }
 
+/// Writes that must share the transaction of one record's write (the relay retires a conflict's
+/// loser with it); an error from the hook rolls the whole transaction back.
+pub type BeforeWrite<'a> = &'a dyn Fn(&Writer<'_>) -> rusqlite::Result<()>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
     Imported,
@@ -846,7 +850,7 @@ impl<'c> Writer<'c> {
             summary: &summary,
             origin,
         };
-        match self.store_and_write(&decoded, &raw) {
+        match self.store_and_write(&decoded, &raw, None) {
             Ok(Some(written)) => {
                 self.provenance(&decoded.stream, "write", true, None, None, written)?;
                 self.account(&decoded, written);
@@ -874,11 +878,31 @@ impl<'c> Writer<'c> {
         label: &str,
         origin: Option<(&str, &str)>,
     ) -> Result<WriteOutcome, WriterError> {
+        self.write_json_record_with(stream, source_key, record, decoded, label, origin, None)
+    }
+
+    /// [`Writer::write_json_record`] with the relay's conflict hook. `before_write` runs inside this
+    /// record's own transaction, ahead of the raw row and the canonical rows: it retires the stored
+    /// record the new one replaces, so a storage error anywhere rolls the whole swap back (`Failed`,
+    /// the old record untouched). With a hook the stored row is expected to exist, so the duplicate
+    /// pre-check is skipped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_json_record_with(
+        &mut self,
+        stream: &str,
+        source_key: &str,
+        record: &canon::Value,
+        decoded: &Decoded,
+        label: &str,
+        origin: Option<(&str, &str)>,
+        before_write: Option<BeforeWrite<'_>>,
+    ) -> Result<WriteOutcome, WriterError> {
         self.stats.files_seen += 1;
-        let duplicate = self
-            .conn
-            .prepare_cached("SELECT 1 FROM raw_records WHERE stream=? AND source_key=?")?
-            .exists(params![stream, source_key])?;
+        let duplicate = before_write.is_none()
+            && self
+                .conn
+                .prepare_cached("SELECT 1 FROM raw_records WHERE stream=? AND source_key=?")?
+                .exists(params![stream, source_key])?;
         if duplicate {
             self.stats.files_duplicate += 1;
             return Ok(WriteOutcome::Duplicate);
@@ -897,7 +921,7 @@ impl<'c> Writer<'c> {
             summary: &summary,
             origin,
         };
-        match self.store_and_write(decoded, &raw) {
+        match self.store_and_write(decoded, &raw, before_write) {
             Ok(Some(written)) => {
                 self.provenance(stream, "parse", true, None, None, 0)?;
                 self.provenance(stream, "write", true, None, None, written)?;
@@ -968,8 +992,16 @@ impl<'c> Writer<'c> {
     }
 
     /// One transaction: raw record, then canonical rows. None = the raw key was already stored (rolled back).
-    fn store_and_write(&mut self, decoded: &Decoded, raw: &RawInput) -> rusqlite::Result<Option<i64>> {
+    fn store_and_write(
+        &mut self,
+        decoded: &Decoded,
+        raw: &RawInput,
+        before_write: Option<BeforeWrite<'_>>,
+    ) -> rusqlite::Result<Option<i64>> {
         self.conn.execute_batch("BEGIN")?;
+        if let Some(hook) = before_write {
+            hook(self)?;
+        }
         let Some(raw_id) = self.store_raw(decoded, raw)? else {
             self.conn.execute_batch("ROLLBACK")?;
             return Ok(None);

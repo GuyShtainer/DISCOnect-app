@@ -55,6 +55,10 @@ pub enum SyncError {
     /// `OverflowError` on a huge epoch): the pull stops, its run is booked failed.
     #[error("{0}")]
     Abort(String),
+    /// A conflict's winner could not be stored: everything the decision wrote was rolled back and
+    /// the losing record is still in place. The bundle stays `applying`; the next pull reapplies it.
+    #[error("{0}")]
+    ConflictWriteFailed(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -401,16 +405,22 @@ fn insert_superseded(
     Ok(())
 }
 
-/// Same key, different bytes. Returns true when the incoming record should be written
-/// (`_resolve_conflict`). The incoming-wins path commits the delete of the loser in its own
-/// transaction, before the caller writes the winner.
-pub fn resolve_conflict(
+/// The decision on a same-key, different-bytes pair (`_decide_conflict`): pure, writes nothing.
+pub struct Conflict {
+    pub incoming_wins: bool,
+    rule: &'static str,
+    winner: String,
+    loser: String,
+    existing: Existing,
+}
+
+/// Same key, different bytes: who wins. `None` when no stored row differs from the incoming bytes
+/// (no row at all, or the very same bytes): nothing to decide.
+pub fn decide_conflict(
     conn: &Connection,
-    writer: &Writer<'_>,
     record: &RawRow,
     incoming: &Decoded,
-    bundle_name: &str,
-) -> Result<bool, SyncError> {
+) -> Result<Option<Conflict>, SyncError> {
     let existing: Option<Existing> = conn
         .query_row(
             "SELECT id, payload, payload_hash, payload_kind, transport, imported_at FROM raw_records \
@@ -429,10 +439,10 @@ pub fn resolve_conflict(
         )
         .optional()?;
     let Some(existing) = existing else {
-        return Ok(true);
+        return Ok(None);
     };
     if existing.payload_hash == record.payload_hash {
-        return Ok(false);
+        return Ok(None);
     }
     let (existing_observed, incoming_observed) = if export::is_batch_stream(&record.stream) {
         // a batch stream's record carries no time of its own: the protocol's rule is the hash alone
@@ -450,44 +460,44 @@ pub fn resolve_conflict(
         (record.payload_hash > existing.payload_hash, "payload_hash")
     };
     let (winner, loser) = if incoming_wins {
-        (record.payload_hash.as_str(), existing.payload_hash.as_str())
+        (record.payload_hash.clone(), existing.payload_hash.clone())
     } else {
-        (existing.payload_hash.as_str(), record.payload_hash.as_str())
+        (existing.payload_hash.clone(), record.payload_hash.clone())
     };
+    Ok(Some(Conflict {
+        incoming_wins,
+        rule,
+        winner,
+        loser,
+        existing,
+    }))
+}
+
+/// The incoming record lost: keep its bytes in `raw_superseded` with the decision, one transaction.
+fn record_incoming_loser(
+    conn: &Connection,
+    record: &RawRow,
+    conflict: &Conflict,
+    bundle_name: &str,
+) -> Result<(), SyncError> {
     conn.execute_batch("BEGIN")?;
     let decided = (|| -> rusqlite::Result<()> {
-        insert_conflict(conn, record, winner, loser, rule, bundle_name)?;
-        if incoming_wins {
-            let loser = Loser {
-                kind: &existing.payload_kind,
-                payload: &existing.payload,
-                hash: &existing.payload_hash,
-                transport: &existing.transport,
-                imported_at: &existing.imported_at,
-            };
-            insert_superseded(conn, record, &loser, bundle_name)?;
-            writer.delete_canonical_for_raw(existing.id)?;
-            // rows that point at the losing record (a past decode failure, relay bookkeeping) go first
-            conn.execute(
-                "DELETE FROM import_failures WHERE raw_record_id=?",
-                params![existing.id],
-            )?;
-            conn.execute(
-                "DELETE FROM relay_seen WHERE raw_record_id=?",
-                params![existing.id],
-            )?;
-            conn.execute("DELETE FROM raw_records WHERE id=?", params![existing.id])?;
-        } else {
-            let loser = Loser {
-                kind: &record.payload_kind,
-                payload: &record.payload,
-                hash: &record.payload_hash,
-                transport: &record.transport,
-                imported_at: &record.imported_at,
-            };
-            insert_superseded(conn, record, &loser, bundle_name)?;
-        }
-        Ok(())
+        insert_conflict(
+            conn,
+            record,
+            &conflict.winner,
+            &conflict.loser,
+            conflict.rule,
+            bundle_name,
+        )?;
+        let loser = Loser {
+            kind: &record.payload_kind,
+            payload: &record.payload,
+            hash: &record.payload_hash,
+            transport: &record.transport,
+            imported_at: &record.imported_at,
+        };
+        insert_superseded(conn, record, &loser, bundle_name)
     })();
     match decided {
         Ok(()) => conn.execute_batch("COMMIT")?,
@@ -496,7 +506,48 @@ pub fn resolve_conflict(
             return Err(error.into());
         }
     }
-    Ok(incoming_wins)
+    Ok(())
+}
+
+/// The pre-write hook of an incoming winner: every write that retires the stored loser. It runs
+/// inside `write_json_record_with`'s own transaction, before the winner's raw row and canonical
+/// rows, so a storage error anywhere rolls the decision back together with the winner's write.
+fn retire_loser(
+    conn: &Connection,
+    writer: &Writer<'_>,
+    record: &RawRow,
+    conflict: &Conflict,
+    bundle_name: &str,
+) -> rusqlite::Result<()> {
+    let existing = &conflict.existing;
+    insert_conflict(
+        conn,
+        record,
+        &conflict.winner,
+        &conflict.loser,
+        conflict.rule,
+        bundle_name,
+    )?;
+    let loser = Loser {
+        kind: &existing.payload_kind,
+        payload: &existing.payload,
+        hash: &existing.payload_hash,
+        transport: &existing.transport,
+        imported_at: &existing.imported_at,
+    };
+    insert_superseded(conn, record, &loser, bundle_name)?;
+    writer.delete_canonical_for_raw(existing.id)?;
+    // rows that point at the losing record (a past decode failure, relay bookkeeping) go first
+    conn.execute(
+        "DELETE FROM import_failures WHERE raw_record_id=?",
+        params![existing.id],
+    )?;
+    conn.execute(
+        "DELETE FROM relay_seen WHERE raw_record_id=?",
+        params![existing.id],
+    )?;
+    conn.execute("DELETE FROM raw_records WHERE id=?", params![existing.id])?;
+    Ok(())
 }
 
 fn conflict_recorded(
@@ -641,27 +692,59 @@ fn apply_pending(
                 result.records_invalid += 1;
                 continue;
             };
-            if !resolve_conflict(conn, writer, record, &facts, name)? {
-                if conflict_recorded(conn, name, record)? {
-                    result.conflicts += 1;
-                } else {
-                    result.records_duplicate += 1;
-                    mark_existing(conn, record, name)?;
-                }
+            let conflict = decide_conflict(conn, record, &facts)?;
+            if let Some(conflict) = conflict.as_ref().filter(|c| !c.incoming_wins) {
+                record_incoming_loser(conn, record, conflict, name)?;
+                result.conflicts += 1;
                 continue;
             }
-            if conflict_recorded(conn, name, record)? {
-                result.conflicts += 1;
+            if conflict.is_none() {
+                let stored = conn
+                    .prepare_cached("SELECT 1 FROM raw_records WHERE stream=? AND source_key=?")?
+                    .exists(params![record.stream, record.source_key])?;
+                if stored {
+                    // the same bytes are already here (a local import or an earlier bundle)
+                    if conflict_recorded(conn, name, record)? {
+                        result.conflicts += 1;
+                    } else {
+                        result.records_duplicate += 1;
+                        mark_existing(conn, record, name)?;
+                    }
+                    continue;
+                }
             }
             let before = writer.last_raw_id()?;
-            let outcome = writer.write_json_record(
-                &record.stream,
-                &record.source_key,
-                &record_value,
-                &facts,
-                &label,
-                Some((&record.transport, &record.imported_at)),
-            )?;
+            let outcome = match conflict.as_ref() {
+                Some(conflict) => {
+                    let hook = |w: &Writer<'_>| retire_loser(conn, w, record, conflict, name);
+                    writer.write_json_record_with(
+                        &record.stream,
+                        &record.source_key,
+                        &record_value,
+                        &facts,
+                        &label,
+                        Some((&record.transport, &record.imported_at)),
+                        Some(&hook),
+                    )?
+                }
+                None => writer.write_json_record(
+                    &record.stream,
+                    &record.source_key,
+                    &record_value,
+                    &facts,
+                    &label,
+                    Some((&record.transport, &record.imported_at)),
+                )?,
+            };
+            if conflict.is_some() {
+                if outcome != WriteOutcome::Imported {
+                    return Err(SyncError::ConflictWriteFailed(format!(
+                        "{} winner not stored ({outcome:?}); decision rolled back",
+                        record.stream
+                    )));
+                }
+                result.conflicts += 1;
+            }
             mark(conn, before, name, outcome, result)?;
         }
         for item in &ranges {

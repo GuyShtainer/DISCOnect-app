@@ -851,6 +851,140 @@ fn a_conflict_against_a_record_with_a_past_decode_failure_does_not_wedge() {
     assert!(again.applied.is_empty() && again.conflicts == 0);
 }
 
+/// Daily rows plus labels, no ids: what a reparse must leave exactly as it found it.
+fn daily_rows(device: &Device) -> BTreeSet<String> {
+    let mut stmt = device
+        .conn()
+        .prepare(
+            "SELECT 'm|' || date || '|' || metric || '|' || source_scope || '|' || value || '|' || COALESCE(observed_utc, '') \
+             FROM daily_metrics UNION ALL \
+             SELECT 'l|' || date || '|' || metric || '|' || source_scope || '|' || label || '|' || COALESCE(observed_utc, '') \
+             FROM daily_labels",
+        )
+        .expect("prepare");
+    stmt.query_map([], |r| r.get(0))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
+}
+
+fn pulled_statuses(device: &Device) -> Vec<String> {
+    let mut stmt = device
+        .conn()
+        .prepare("SELECT status FROM relay_bundles WHERE direction='pulled'")
+        .expect("prepare");
+    stmt.query_map([], |r| r.get(0))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect()
+}
+
+#[test]
+fn a_failed_winner_write_rolls_the_whole_conflict_back_and_the_next_pull_converges() {
+    let early = uds("2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let late = uds("2025-06-15", 8000, "2025-06-15T21:00:00.0");
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    import(&a, &export_with_uds(tmp.path(), "x", &early));
+    import(&b, &export_with_uds(tmp.path(), "y", &late));
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    push(&b, &relay);
+    let (incoming, loser) = (canonical_hash(&late), canonical_hash(&early));
+    a.conn()
+        .execute_batch(&format!(
+            "CREATE TEMP TRIGGER inject BEFORE INSERT ON raw_records WHEN NEW.payload_hash='{incoming}' \
+             BEGIN SELECT RAISE(ABORT,'injected'); END"
+        ))
+        .expect("trigger");
+    let error =
+        sync::pull(a.conn(), master(), &relay).expect_err("the pull reports the storage error");
+    assert!(
+        matches!(error, SyncError::ConflictWriteFailed(_)),
+        "{error:?}"
+    );
+    assert!(a.conn().is_autocommit(), "no transaction left open");
+    let stored: Vec<String> = {
+        let mut stmt = a
+            .conn()
+            .prepare("SELECT payload_hash FROM raw_records WHERE stream='json:uds'")
+            .expect("prepare");
+        stmt.query_map([], |r| r.get(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect()
+    };
+    assert_eq!(stored, vec![loser], "the loser is still stored");
+    assert_eq!(steps_of(&a), 4000.0, "and still feeds its daily row");
+    assert_eq!(count(a.conn(), "SELECT count(*) FROM sync_conflicts"), 0);
+    assert_eq!(count(a.conn(), "SELECT count(*) FROM raw_superseded"), 0);
+    assert_eq!(
+        count(
+            a.conn(),
+            &format!(
+                "SELECT count(*) FROM relay_seen s JOIN raw_records r ON r.id=s.raw_record_id \
+                 WHERE r.payload_hash='{incoming}'"
+            )
+        ),
+        0
+    );
+    assert_eq!(pulled_statuses(&a), vec!["applying".to_string()]);
+    a.conn().execute_batch("DROP TRIGGER inject").expect("drop");
+    let retry = pull(&a, &relay);
+    assert_eq!(
+        (retry.status, retry.conflicts, retry.applied.len()),
+        ("ok", 1, 1)
+    );
+    pull(&b, &relay);
+    assert_eq!(fingerprint(&a), fingerprint(&b));
+    assert_eq!(steps_of(&a), 8000.0);
+    assert_eq!(pulled_statuses(&a), vec!["applied".to_string()]);
+    let before = daily_rows(&a);
+    sources::reparse_all(a.conn(), None, false).expect("reparse");
+    assert_eq!(
+        daily_rows(&a),
+        before,
+        "a reparse of the converged store changes no daily row"
+    );
+}
+
+#[test]
+fn a_failed_loser_record_leaves_no_transaction_open() {
+    let early = uds("2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let late = uds("2025-06-15", 8000, "2025-06-15T21:00:00.0");
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    import(&a, &export_with_uds(tmp.path(), "x", &early));
+    import(&b, &export_with_uds(tmp.path(), "y", &late));
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    push(&b, &relay);
+    // b holds the winner: a's bundle brings the loser
+    b.conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER inject BEFORE INSERT ON raw_superseded BEGIN SELECT RAISE(ABORT,'injected'); END",
+        )
+        .expect("trigger");
+    assert!(sync::pull(b.conn(), master(), &relay).is_err());
+    assert!(
+        b.conn().is_autocommit(),
+        "the incoming-loses branch rolled back"
+    );
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM sync_conflicts"), 0);
+    assert_eq!(steps_of(&b), 8000.0);
+    b.conn().execute_batch("DROP TRIGGER inject").expect("drop");
+    b.conn()
+        .execute(
+            "INSERT INTO import_runs(started_at, transport, status) VALUES('now', 'probe', 'ok')",
+            [],
+        )
+        .expect("a following write works");
+    let again = pull(&b, &relay);
+    assert_eq!((again.conflicts, again.status), (1, "ok"));
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM sync_conflicts"), 1);
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_superseded"), 1);
+}
+
 #[test]
 fn the_conflict_rule_is_one_pure_function_of_the_two_rows() {
     // direct: an existing uds record, an incoming one with the same observed time and the same key
