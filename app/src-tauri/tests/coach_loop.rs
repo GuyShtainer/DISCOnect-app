@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use disconect_app_lib::coach::caps::{clamp, fit};
-use disconect_app_lib::coach::chat_loop::{ask_configured, Coach, CoachError, Conversation, Outcome, ToolCallError, MAX_ROUNDS};
+use disconect_app_lib::coach::chat_loop::{ask_configured, settings_gate, Coach, CoachError, Conversation, Outcome, ToolCallError, MAX_ROUNDS};
 use disconect_app_lib::coach::egress::{Egress, EgressError, Endpoint, Inbound, Outbound, Real};
 use disconect_app_lib::coach::prompt::system_prompt;
 use disconect_app_lib::coach::schema::validate;
@@ -617,6 +617,53 @@ fn provider_bodies_of(requests: &[Value]) -> Vec<Vec<u8>> {
 
 // ---- off mode and the key -----------------------------------------------------------------------
 
+#[test]
+fn switching_the_coach_off_mid_question_stops_the_next_request() {
+    // the model asks for a tool, the user switches the coach off while the tool runs: the request that would
+    // carry the tool result is refused, so nothing leaves after the switch
+    let provider = scripted(vec![Step::call("get_sleep_detail", "{}"), Step::text("never sent")]);
+    let runner = Runner::oracle();
+    let settings = local();
+    let checks = Cell::new(0);
+    let gate = || {
+        checks.set(checks.get() + 1);
+        if checks.get() > 1 { Err(CoachError::Off) } else { Ok(()) }
+    };
+    let call = |name: &str, args: Value| runner.call(name, args);
+    let mut conv = Conversation::new();
+    let outcome = Coach::new(&provider, &call, &settings, None).with_gate(&gate).ask(&mut conv, "How did I sleep?");
+    assert_eq!(outcome, Err(CoachError::Off));
+    assert_eq!(checks.get(), 2, "the gate runs before every request");
+    assert_eq!((provider.count(), conv.sends), (1, 1), "only round 1 was sent");
+    assert_eq!(provider.remaining(), 1, "the second scripted answer was never asked for");
+    assert!(conv.turns().is_empty(), "the question is rolled back");
+
+    // a gate that is closed from the start sends nothing at all
+    let provider = scripted(vec![Step::text("never sent")]);
+    let closed = || Err(CoachError::EndpointChanged);
+    let outcome = Coach::new(&provider, &call, &settings, None).with_gate(&closed).ask(&mut conv, "q");
+    assert_eq!(outcome, Err(CoachError::EndpointChanged));
+    assert_eq!((provider.count(), conv.sends), (0, 1));
+}
+
+#[test]
+fn the_settings_gate_refuses_off_and_a_changed_address_or_mode_and_nothing_else() {
+    let started = local();
+    assert_eq!(settings_gate(&started, &started), Ok(()));
+    assert_eq!(settings_gate(&started, &Settings { mode: Mode::Off, ..local() }), Err(CoachError::Off));
+    assert_eq!(settings_gate(&started, &Settings::default()), Err(CoachError::Off), "a missing or unreadable file reads as off");
+    let moved = Settings { base_url: "http://127.0.0.1:9999/v1".into(), ..local() };
+    assert_eq!(settings_gate(&started, &moved), Err(CoachError::EndpointChanged));
+    let other_mode = Settings { mode: Mode::Cloud, ..local() };
+    assert_eq!(settings_gate(&started, &other_mode), Err(CoachError::EndpointChanged));
+    // the model name and the points toggle do not matter to where the bytes go
+    let tweaked = Settings { model: "another".into(), include_points: true, ..local() };
+    assert_eq!(settings_gate(&started, &tweaked), Ok(()));
+    let error = CoachError::EndpointChanged;
+    assert_eq!(error.code(), "endpoint_changed");
+    assert!(!error.message().contains("127.0.0.1"));
+}
+
 struct Shared(Arc<Scripted>);
 impl Egress for Shared {
     fn send(&self, out: Outbound) -> Result<Inbound, EgressError> {
@@ -641,24 +688,24 @@ fn off_sends_nothing_builds_no_egress_and_never_reads_the_key() {
     let mut conv = Conversation::new();
 
     let off = Settings { mode: Mode::Off, ..local() };
-    assert_eq!(ask_configured(&off, make, key, &call, &mut conv, "hello"), Err(CoachError::Off));
+    assert_eq!(ask_configured(&off, make, key, &call, &|| Ok(()), &mut conv, "hello"), Err(CoachError::Off));
     assert_eq!((built.get(), key_reads.get(), provider.count(), provider.fake.count()), (0, 0, 0, 0));
     assert!(conv.turns().is_empty() && conv.sends == 0 && runner.calls().is_empty());
 
     // a cloud endpoint with no key stops before any send
     let cloud = Settings { mode: Mode::Cloud, base_url: "https://api.example/v1".into(), ..local() };
     let make_none_key = |_: &Settings| -> Option<Box<dyn Egress>> { Some(Box::new(Shared(provider.clone()))) };
-    assert_eq!(ask_configured(&cloud, make_none_key, || None, &call, &mut conv, "hello"), Err(CoachError::NoKey));
+    assert_eq!(ask_configured(&cloud, make_none_key, || None, &call, &|| Ok(()), &mut conv, "hello"), Err(CoachError::NoKey));
     assert_eq!(provider.count(), 0);
 
     // an address the egress rules refuse is an egress error with a fixed message, not a send
     let bad = Settings { mode: Mode::Cloud, base_url: "http://example.com".into(), ..local() };
-    let error = ask_configured(&bad, make_none_key, key, &call, &mut conv, "hello").expect_err("refused");
+    let error = ask_configured(&bad, make_none_key, key, &call, &|| Ok(()), &mut conv, "hello").expect_err("refused");
     assert_eq!(error, CoachError::Egress(EgressError::PlainHttpNeedsLocalIp));
     assert_eq!((provider.count(), key_reads.get()), (0, 0));
 
     // on: the egress is built once, the key read once, one request sent, and the key is a bearer (header only)
-    let text = ask_configured(&local(), make, key, &call, &mut conv, "hello").expect("answers");
+    let text = ask_configured(&local(), make, key, &call, &|| Ok(()), &mut conv, "hello").expect("answers");
     assert_eq!(text, "hi");
     assert_eq!((built.get(), key_reads.get(), provider.count()), (1, 1, 1));
     let sent = provider.fake.sent.lock().expect("lock");

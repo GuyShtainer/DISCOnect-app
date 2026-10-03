@@ -156,7 +156,8 @@ pub struct CoachReply {
 }
 
 /// Ask the model. Order matters: the settings are read and the gate runs first, so **off sends nothing and
-/// never reads the key**; the key is read only after the gate. The loop is synchronous, so it runs on a blocking
+/// never reads the key**; the key is read only after the gate, and the settings are read again before every
+/// later request of the question (the gate closure of [`ask_blocking`]). The loop is synchronous, so it runs on a blocking
 /// thread, and its tool runner calls the core's `tools.call` from there.
 #[tauri::command]
 pub async fn coach_ask(app: tauri::AppHandle, text: String) -> Result<CoachReply, CoachErrorDto> {
@@ -174,6 +175,12 @@ fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Resu
         let params = json!({"name": name, "arguments": arguments});
         tauri::async_runtime::block_on(core.call("tools.call", params)).map_err(|e| ToolCallError { code: e.code })
     };
+    // before every request of the question the saved settings are read again: switching the coach off (or
+    // changing the address) while a tool runs stops the next request. An unreadable file reads as off.
+    let send_gate = || {
+        let now = config_dir(app).map(|dir| settings::load(&dir)).unwrap_or_default();
+        chat_loop::settings_gate(settings, &now)
+    };
     let state = app.state::<CoachState>();
     let mut conversation = state.conversation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let answer = chat_loop::ask_configured(
@@ -181,6 +188,7 @@ fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Resu
         super::provider,
         || app.state::<KeyHolder>().resolve(),
         &call_tool,
+        &send_gate,
         &mut conversation,
         text,
     );

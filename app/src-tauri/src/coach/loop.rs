@@ -65,6 +65,9 @@ pub enum CoachError {
     /// The store is locked (for a caller that checks before asking; a locked tool call during a turn is told to
     /// the model as `{"error":"locked"}` and the turn goes on).
     Locked,
+    /// The saved provider address (or mode) changed while the question was running: the next request was not
+    /// sent. A closed variant with a fixed message; neither address appears in it.
+    EndpointChanged,
 }
 
 impl CoachError {
@@ -77,6 +80,7 @@ impl CoachError {
             CoachError::TooManyToolCalls => "too_many_tool_calls",
             CoachError::ToolTooLarge => "tool_too_large",
             CoachError::Locked => "locked",
+            CoachError::EndpointChanged => "endpoint_changed",
         }
     }
 
@@ -89,6 +93,7 @@ impl CoachError {
             CoachError::TooManyToolCalls => "the model asked for more tool calls than the coach allows",
             CoachError::ToolTooLarge => "a tool answer is too large to send, even after shrinking it",
             CoachError::Locked => "the store is locked",
+            CoachError::EndpointChanged => "the provider address was changed during the question; nothing more was sent",
         }
     }
 
@@ -223,6 +228,21 @@ pub fn gate(settings: &Settings) -> Result<Endpoint, CoachError> {
     }
 }
 
+/// The check that runs **before every request** of a question (see [`Coach::with_gate`]): the settings as they are
+/// saved now against the settings the question started with. Off now is [`CoachError::Off`] (the user switched
+/// the coach off mid-question: no more bytes leave); a different mode or provider address is
+/// [`CoachError::EndpointChanged`]. Everything else (the model name, the key toggle) may change without effect on
+/// the running question, which keeps the settings it started with.
+pub fn settings_gate(started_with: &Settings, now: &Settings) -> Result<(), CoachError> {
+    if now.mode == Mode::Off {
+        return Err(CoachError::Off);
+    }
+    if now.mode != started_with.mode || now.base_url != started_with.base_url {
+        return Err(CoachError::EndpointChanged);
+    }
+    Ok(())
+}
+
 /// The order a question is set up in, with every effect injected so a test can count it: the settings gate
 /// first (off returns before anything else), then the egress is built, then the key is read, then the loop
 /// runs. Off therefore builds no egress, reads no key and sends nothing.
@@ -231,6 +251,7 @@ pub fn ask_configured(
     make_egress: impl FnOnce(&Settings) -> Option<Box<dyn Egress>>,
     resolve_key: impl FnOnce() -> Option<Zeroizing<String>>,
     call_tool: &dyn Fn(&str, Value) -> Result<Value, ToolCallError>,
+    send_gate: &dyn Fn() -> Result<(), CoachError>,
     conv: &mut Conversation,
     user_text: &str,
 ) -> Result<String, CoachError> {
@@ -239,7 +260,7 @@ pub fn ask_configured(
         return Err(CoachError::Egress(EgressError::BadUrl));
     };
     let bearer = resolve_key();
-    Coach::new(egress.as_ref(), call_tool, settings, bearer).ask(conv, user_text)
+    Coach::new(egress.as_ref(), call_tool, settings, bearer).with_gate(send_gate).ask(conv, user_text)
 }
 
 /// Runs a question. Borrows everything: the egress (real or scripted), the tool runner (the core behind
@@ -252,6 +273,14 @@ pub struct Coach<'a> {
     pub bearer: Option<Zeroizing<String>>,
     /// The request budget (see [`DEFAULT_CONTEXT_BYTES`]).
     pub context_bytes: usize,
+    /// Called before **every** request (the first and each round after a tool exchange); an `Err` ends the
+    /// question without sending. The app passes a re-read of the saved settings ([`settings_gate`]), so
+    /// switching the coach off mid-question stops the bytes at the next request. Defaults to always open.
+    pub send_gate: &'a dyn Fn() -> Result<(), CoachError>,
+}
+
+fn always_open() -> Result<(), CoachError> {
+    Ok(())
 }
 
 fn shorten(name: &str) -> String {
@@ -265,7 +294,13 @@ impl<'a> Coach<'a> {
         settings: &'a Settings,
         bearer: Option<Zeroizing<String>>,
     ) -> Coach<'a> {
-        Coach { egress, call_tool, settings, bearer, context_bytes: DEFAULT_CONTEXT_BYTES }
+        Coach { egress, call_tool, settings, bearer, context_bytes: DEFAULT_CONTEXT_BYTES, send_gate: &always_open }
+    }
+
+    /// The same coach with a check that runs before every request (see [`Coach::send_gate`]).
+    pub fn with_gate(mut self, send_gate: &'a dyn Fn() -> Result<(), CoachError>) -> Coach<'a> {
+        self.send_gate = send_gate;
+        self
     }
 
     /// Ask one question. On success the user's words and the model's scrubbed answer (and the tool exchange in
@@ -295,6 +330,7 @@ impl<'a> Coach<'a> {
             let mut messages = vec![Message::System { content: system.clone() }];
             messages.extend(window(&conv.turns, turn_budget));
             let body = ChatRequest::new(&self.settings.model, messages).to_body()?;
+            (self.send_gate)()?;
             conv.sends += 1;
             let inbound = self.egress.send(Outbound { url: url.clone(), bearer: self.bearer.clone(), body })?;
             let reply = wire::parse_response(&inbound.body)?;
@@ -532,6 +568,7 @@ mod tests {
             CoachError::TooManyToolCalls,
             CoachError::ToolTooLarge,
             CoachError::Locked,
+            CoachError::EndpointChanged,
         ];
         for error in all {
             for shown in [error.message(), error.code()] {
