@@ -465,6 +465,8 @@ fn eval_5_provider_errors_are_closed_and_leave_the_conversation_consistent() {
     assert!(conv.turns().is_empty(), "no dangling tool call, no orphaned question");
     assert_eq!(conv.trace.len(), 1, "what was sent stays visible");
     assert_eq!(provider.count(), 2);
+    assert_eq!(conv.sent_trace().len(), 1, "the tool result of round 1 left before the 500");
+    assert_eq!(conv.question_sends, 2);
 
     let provider = scripted(vec![Step::Garbage]);
     let error = ask(&provider, &runner, &mut conv, &settings, "Again?").expect_err("not json");
@@ -644,6 +646,46 @@ fn switching_the_coach_off_mid_question_stops_the_next_request() {
     let outcome = Coach::new(&provider, &call, &settings, None).with_gate(&closed).ask(&mut conv, "q");
     assert_eq!(outcome, Err(CoachError::EndpointChanged));
     assert_eq!((provider.count(), conv.sends), (0, 1));
+}
+
+#[test]
+fn a_failed_question_still_reports_what_left_before_the_failure() {
+    let runner = Runner::oracle();
+    let settings = local();
+    let mut conv = Conversation::new();
+    let provider = scripted(vec![Step::call("get_sleep_detail", "{}"), Step::Status(500)]);
+    let error = ask(&provider, &runner, &mut conv, &settings, "How did I sleep?").expect_err("500");
+    assert_eq!(error, CoachError::Egress(EgressError::Status(500)));
+    assert!(conv.turns().is_empty(), "the turns are rolled back, the trace is not");
+    let sent = conv.sent_trace();
+    assert_eq!(sent.len(), 1, "round 1's tool result was in round 2's request, which went out");
+    let expected = oracle().expected("get_sleep_detail", "{}");
+    assert_eq!(sent[0].bytes_sent, expected.len(), "the bytes of round 1's tool result");
+    assert_eq!(sent[0].outcome, Outcome::Ok);
+    let body = &provider.requests()[1];
+    let last = body["messages"].as_array().expect("m").last().expect("last").clone();
+    assert_eq!(last["content"].as_str().map(str::len), Some(sent[0].bytes_sent), "the trace is what the request carried");
+    assert_eq!((conv.question_sends, conv.sends), (2, 2));
+
+    // a result whose request the gate refused did not leave, so it is not in the sent trace
+    let provider = scripted(vec![Step::call("get_sleep_detail", "{}"), Step::text("never")]);
+    let checks = Cell::new(0);
+    let gate = || {
+        checks.set(checks.get() + 1);
+        if checks.get() > 1 { Err(CoachError::Off) } else { Ok(()) }
+    };
+    let call = |name: &str, args: Value| runner.call(name, args);
+    let outcome = Coach::new(&provider, &call, &settings, None).with_gate(&gate).ask(&mut conv, "again");
+    assert_eq!(outcome, Err(CoachError::Off));
+    assert_eq!(conv.trace.len(), 1, "the call was made and projected");
+    assert!(conv.sent_trace().is_empty(), "but its request was refused");
+    assert_eq!(conv.question_sends, 1, "per question, not per conversation");
+
+    // a question that fails before any request shows nothing of the one before
+    let off = Settings { mode: Mode::Off, ..local() };
+    let provider = scripted(vec![]);
+    assert_eq!(ask(&provider, &runner, &mut conv, &off, "q"), Err(CoachError::Off));
+    assert!(conv.trace.is_empty() && conv.sent_trace().is_empty() && conv.question_sends == 0);
 }
 
 #[test]

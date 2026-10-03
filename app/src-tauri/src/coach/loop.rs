@@ -162,6 +162,11 @@ pub struct Conversation {
     pub trace: Vec<TraceEntry>,
     /// How many requests this conversation has sent (a refused or failed send counts).
     pub sends: usize,
+    /// How many requests the latest question sent (a failed send counts; one the gate refused does not).
+    pub question_sends: usize,
+    /// How many of [`Conversation::trace`]'s entries were in the request that was last sent: the others were
+    /// computed but their request never left (the gate refused it, or the question ended first).
+    left: usize,
 }
 
 impl Conversation {
@@ -176,6 +181,20 @@ impl Conversation {
     /// Forget everything.
     pub fn clear(&mut self) {
         *self = Conversation::default();
+    }
+
+    /// The start of a question: the trace and the per-question counts of the one before are dropped, so a
+    /// question that fails at once (off, no key) can never show the earlier question's trace.
+    pub fn begin_question(&mut self) {
+        self.trace.clear();
+        self.question_sends = 0;
+        self.left = 0;
+    }
+
+    /// The tool calls whose results were in a request that was actually sent. On success that is all of
+    /// [`Conversation::trace`]; after an error it is what left the machine before the error, nothing more.
+    pub fn sent_trace(&self) -> &[TraceEntry] {
+        &self.trace[..self.left.min(self.trace.len())]
     }
 }
 
@@ -255,6 +274,7 @@ pub fn ask_configured(
     conv: &mut Conversation,
     user_text: &str,
 ) -> Result<String, CoachError> {
+    conv.begin_question();
     gate(settings)?;
     let Some(egress) = make_egress(settings) else {
         return Err(CoachError::Egress(EgressError::BadUrl));
@@ -306,13 +326,13 @@ impl<'a> Coach<'a> {
     /// Ask one question. On success the user's words and the model's scrubbed answer (and the tool exchange in
     /// between) are in `conv`; on failure `conv`'s turns are as they were.
     pub fn ask(&self, conv: &mut Conversation, user_text: &str) -> Result<String, CoachError> {
+        conv.begin_question();
         let endpoint = gate(self.settings)?;
         if self.settings.mode == Mode::Cloud && self.bearer.is_none() {
             return Err(CoachError::NoKey);
         }
         let url = endpoint.join(CHAT_PATH)?;
         let rollback_to = conv.turns.len();
-        conv.trace.clear();
         conv.turns.push(Message::User { content: user_text.to_string() });
         let outcome = self.rounds(conv, &url);
         if outcome.is_err() {
@@ -332,6 +352,8 @@ impl<'a> Coach<'a> {
             let body = ChatRequest::new(&self.settings.model, messages).to_body()?;
             (self.send_gate)()?;
             conv.sends += 1;
+            conv.question_sends += 1;
+            conv.left = conv.trace.len();
             let inbound = self.egress.send(Outbound { url: url.clone(), bearer: self.bearer.clone(), body })?;
             let reply = wire::parse_response(&inbound.body)?;
             let calls = reply.tool_calls();

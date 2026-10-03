@@ -443,7 +443,7 @@ async function screenKey(out: ParentNode): Promise<void> {
 type Turn =
   | { role: "user"; text: string }
   | { role: "coach"; text: string; trace: core.CoachTrace[]; host: string }
-  | { role: "error"; text: string };
+  | { role: "error"; text: string; trace: core.CoachTrace[]; host: string };
 let conversation: Turn[] = [];
 let coachDraft = "";
 let coachIntroSeen = false; // this session only: a module variable, never storage
@@ -472,11 +472,12 @@ function outcomeWord(o: core.CoachOutcome): string {
   }
 }
 
-function drawer(trace: core.CoachTrace[], host: string): HTMLElement {
+function drawer(trace: core.CoachTrace[], host: string, failed = false): HTMLElement {
   const results = trace.filter((t) => t.outcome.kind === "ok").length;
   const bytes = trace.reduce((n, t) => n + t.bytes_sent, 0);
   const box = el("details", "drawer");
-  box.append(el("summary", "caption", `What the model can see · Sent to ${host}: ${results} tool ${results === 1 ? "result" : "results"}, ${bytes} bytes`));
+  const sent = `Sent to ${host}${failed ? " before the error" : ""}: ${results} tool ${results === 1 ? "result" : "results"}, ${bytes} bytes`;
+  box.append(el("summary", "caption", `What the model can see · ${sent}`));
   box.append(el("p", "caption muted", "Each answer below is exactly what the model received from one tool. The app's own instructions and the words you typed are sent with it."));
   for (const t of trace) {
     const entry = el("details");
@@ -493,6 +494,8 @@ function bubble(turn: Turn): HTMLElement {
   // neutralText runs here, at the one place model text is drawn
   wrap.append(el("p", `bubble ${turn.role}`, turn.role === "coach" ? neutralText(turn.text) : turn.text));
   if (turn.role === "coach") wrap.append(drawer(turn.trace, turn.host));
+  // a failed question still shows what had already left before the error
+  if (turn.role === "error" && turn.trace.length) wrap.append(drawer(turn.trace, turn.host, true));
   return wrap;
 }
 
@@ -509,7 +512,7 @@ async function sendQuestion(): Promise<void> {
     const reply = await core.coachAsk(text);
     conversation.push({ role: "coach", text: reply.text, trace: reply.trace, host });
   } catch (e) {
-    conversation.push({ role: "error", text: core.coachErrorText(e) });
+    conversation.push({ role: "error", text: core.coachErrorText(e), trace: core.coachErrorTrace(e), host });
   } finally {
     coachSending = null;
     renderNav();

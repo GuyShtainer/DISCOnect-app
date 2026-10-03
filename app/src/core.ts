@@ -49,8 +49,9 @@ export function mcpCommand(): Promise<string> {
 
 export type CoachMode = "off" | "local" | "cloud";
 export type CoachSettings = { mode: CoachMode; base_url: string; model: string; key_in_keychain: boolean; include_points: boolean };
-/** What a failed coach command rejects with: two fixed strings from closed enums and, for an error status, its number. */
-export type CoachError = { code: string; message: string; status: number | null };
+/** What a failed coach command rejects with: two fixed strings from closed enums and, for an error status, its number.
+ *  A failed question also carries what had already left before it: the tool calls in a request that was sent. */
+export type CoachError = { code: string; message: string; status: number | null; trace?: CoachTrace[]; sends?: number };
 export type CoachKeyState = "absent" | "cached" | "stale" | "session_only";
 export type CoachOutcome = { kind: "ok" } | { kind: "rejected"; detail: string } | { kind: "too_large" } | { kind: "tool_error"; detail: string };
 export type CoachTrace = { tool: string; arguments_sent: unknown; bytes_sent: number; projected: unknown; outcome: CoachOutcome };
@@ -95,6 +96,12 @@ export function coachKeyForget(): Promise<CoachKeyState> {
 
 export function coachKeyState(): Promise<CoachKeyState> {
   return invoke<CoachKeyState>("coach_key_state");
+}
+
+/** What a failed question had already sent: the trace entries of the error (empty for any other failure). */
+export function coachErrorTrace(e: unknown): CoachTrace[] {
+  const trace = typeof e === "object" && e !== null ? (e as CoachError).trace : undefined;
+  return Array.isArray(trace) ? trace : [];
 }
 
 /** `code: message` from a coach error, and only that (plus the status number): never any other text. */

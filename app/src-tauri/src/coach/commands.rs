@@ -17,12 +17,32 @@ use super::key::{self, KeyError, KeyHolder, KeyState};
 use super::probe::{self, ProbeReport};
 use super::settings::{self, Mode, Settings, SettingsError};
 
-/// What a failed coach command tells the webview. Both strings come from closed enums.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// What a failed coach command tells the webview. Both strings come from closed enums. A failed question also
+/// carries what already left the machine before the failure: the tool calls whose results were in a request
+/// that was sent (`trace`, the same entries a good answer's drawer shows) and how many requests went out
+/// (`sends`). Both are empty for every other failure.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CoachError {
     pub code: &'static str,
     pub message: &'static str,
     pub status: Option<u16>,
+    pub trace: Vec<TraceEntry>,
+    pub sends: usize,
+}
+
+impl CoachError {
+    fn plain(code: &'static str, message: &'static str, status: Option<u16>) -> CoachError {
+        CoachError { code, message, status, trace: Vec::new(), sends: 0 }
+    }
+
+    /// A failed question: the error and what had left before it.
+    fn with_sent(error: chat_loop::CoachError, conversation: &Conversation) -> CoachError {
+        CoachError {
+            trace: conversation.sent_trace().to_vec(),
+            sends: conversation.question_sends,
+            ..CoachError::from(error)
+        }
+    }
 }
 
 /// The name the loop's commands use for [`CoachError`] on the wire.
@@ -30,19 +50,19 @@ pub type CoachErrorDto = CoachError;
 
 impl From<chat_loop::CoachError> for CoachError {
     fn from(e: chat_loop::CoachError) -> Self {
-        CoachError { code: e.code(), message: e.message(), status: e.status() }
+        CoachError::plain(e.code(), e.message(), e.status())
     }
 }
 
 impl From<EgressError> for CoachError {
     fn from(e: EgressError) -> Self {
-        CoachError { code: e.code(), message: e.message(), status: e.status() }
+        CoachError::plain(e.code(), e.message(), e.status())
     }
 }
 
 impl From<KeyError> for CoachError {
     fn from(e: KeyError) -> Self {
-        CoachError { code: e.code(), message: e.message(), status: None }
+        CoachError::plain(e.code(), e.message(), None)
     }
 }
 
@@ -52,7 +72,7 @@ impl From<SettingsError> for CoachError {
             SettingsError::Url(inner) => inner.status(),
             _ => None,
         };
-        CoachError { code: e.code(), message: e.message(), status }
+        CoachError::plain(e.code(), e.message(), status)
     }
 }
 
@@ -193,7 +213,7 @@ fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Resu
         text,
     );
     let trace = conversation.trace.clone();
-    answer.map(|text| CoachReply { text, trace }).map_err(CoachError::from)
+    answer.map(|text| CoachReply { text, trace }).map_err(|error| CoachError::with_sent(error, &conversation))
 }
 
 /// Test the endpoint (slice 6): two synthetic requests, no tool, no core call, so a locked store is fine. The
@@ -236,5 +256,16 @@ mod tests {
         assert_eq!(s.code, "plain_http_needs_local_ip");
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"status\":null"));
+        assert!(json.contains("\"trace\":[]") && json.contains("\"sends\":0"), "{json}");
+    }
+
+    #[test]
+    fn a_failed_question_carries_its_sent_trace_and_send_count() {
+        let mut conversation = Conversation::new();
+        let e = CoachError::with_sent(chat_loop::CoachError::Egress(EgressError::Status(500)), &conversation);
+        assert_eq!((e.code, e.status, e.trace.len(), e.sends), ("status", Some(500), 0, 0));
+        conversation.question_sends = 3;
+        let e = CoachError::with_sent(chat_loop::CoachError::Off, &conversation);
+        assert_eq!((e.code, e.sends), ("off", 3));
     }
 }
