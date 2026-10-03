@@ -2,7 +2,7 @@
 // Rules: every value carries its source word; a missing day is drawn as absence; the UI never
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
-import { NOTICE, PRODUCT, metricLabel, scopeWord } from "./identity";
+import { DISCLAIMER, NOTICE, PRODUCT, metricLabel, neutralText, scopeWord } from "./identity";
 import { disposeCharts, drawTrend, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
@@ -28,6 +28,8 @@ const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
   { id: "trend", title: "Trends" },
   { id: "health", title: "Data health" },
+  { id: "coach", title: "Coach" },
+  { id: "coach-settings", title: "Coach settings" },
   { id: "key", title: "Your key" },
 ];
 
@@ -35,6 +37,9 @@ const nav = document.getElementById("nav") as HTMLElement;
 const main = document.getElementById("main") as HTMLElement;
 let keyStatus: KeyStatus | null = null;
 let banner: string | null = null;
+let coachSettings: core.CoachSettings | null = null;
+/** The endpoint host while a coach request is out (set before the call, cleared in finally). */
+let coachSending: string | null = null;
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text = ""): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -61,6 +66,29 @@ function current(): string {
   return location.hash.replace(/^#\/?/, "") || "today";
 }
 
+/** The Coach entry's indicator: grey dot "off", hollow dot "ready", red dot and the host while a request is out. */
+function coachFlag(): HTMLElement {
+  const flag = el("span", "flag");
+  const dot = el("span", "dot");
+  const word = el("span", "caption");
+  if (coachSending) {
+    dot.classList.add("sending");
+    word.textContent = coachSending;
+    word.classList.add("error");
+    flag.title = `Sending to ${coachSending}`;
+  } else if (coachSettings && coachSettings.mode !== "off") {
+    dot.classList.add("ready");
+    word.textContent = "ready";
+    word.classList.add("muted");
+  } else {
+    dot.classList.add("off");
+    word.textContent = "off";
+    word.classList.add("muted");
+  }
+  flag.append(dot, word);
+  return flag;
+}
+
 function renderNav(): void {
   nav.replaceChildren();
   nav.append(el("div", "brand", PRODUCT));
@@ -68,6 +96,7 @@ function renderNav(): void {
     const a = el("a", "", s.title) as HTMLAnchorElement;
     a.href = `#/${s.id}`;
     if (current() === s.id) a.setAttribute("aria-current", "page");
+    if (s.id === "coach") a.append(coachFlag());
     nav.append(a);
   }
   nav.append(el("div", "spacer"));
@@ -95,6 +124,14 @@ function locked(): boolean {
   return !!keyStatus && keyStatus.encrypted && !keyStatus.unlocked;
 }
 
+async function refreshCoach(): Promise<void> {
+  try {
+    coachSettings = await core.coachSettingsGet();
+  } catch {
+    coachSettings = null;
+  }
+}
+
 let generation = 0;
 type Later = (fn: () => void) => void;
 
@@ -102,10 +139,12 @@ type Later = (fn: () => void) => void;
 async function route(): Promise<void> {
   const mine = ++generation;
   await refreshKey();
+  await refreshCoach();
   if (mine !== generation) return;
   renderNav();
   const id = current();
-  if (locked() && id !== "key") {
+  // the coach settings need no data from the store (the probe works on a locked one), so they stay reachable
+  if (locked() && id !== "key" && id !== "coach-settings") {
     location.hash = "#/key"; // hashchange re-enters route()
     return;
   }
@@ -120,6 +159,8 @@ async function route(): Promise<void> {
     if (id === "today") await screenToday(out);
     else if (id === "trend") await screenTrend(out, later);
     else if (id === "health") await screenHealth(out);
+    else if (id === "coach") screenCoach(out, later);
+    else if (id === "coach-settings") await screenCoachSettings(out);
     else await screenKey(out);
   } catch (e) {
     if (core.isCoreError(e) && e.code === "locked") {
@@ -394,6 +435,321 @@ async function screenKey(out: ParentNode): Promise<void> {
   }
   about.append(el("span", "caption muted", "If macOS refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
   out.append(about);
+}
+
+// ---- Coach (Bet 15) ---------------------------------------------------------------------
+// Everything the model says is drawn with textContent only: no markup, no links, no images. The conversation
+// lives in this module (not in storage); the shell keeps the model's side of it until "New conversation".
+type Turn =
+  | { role: "user"; text: string }
+  | { role: "coach"; text: string; trace: core.CoachTrace[]; host: string }
+  | { role: "error"; text: string };
+let conversation: Turn[] = [];
+let coachDraft = "";
+let coachIntroSeen = false; // this session only: a module variable, never storage
+
+function hostOf(base: string): string {
+  try {
+    return new URL(base).host || "the endpoint";
+  } catch {
+    return "the endpoint";
+  }
+}
+
+function tierSentence(s: core.CoachSettings): string {
+  const host = hostOf(s.base_url);
+  return s.mode === "local"
+    ? `Day-level summaries of your data go to ${host}, an address you chose on this computer or your network. They stay on your network.`
+    : `Day-level summaries of your data go over the internet to ${host}, a service you chose, and nowhere else.`;
+}
+
+function outcomeWord(o: core.CoachOutcome): string {
+  switch (o.kind) {
+    case "ok": return "sent";
+    case "rejected": return `withheld (${o.detail})`;
+    case "too_large": return "too large, nothing sent";
+    default: return `failed (${o.detail})`;
+  }
+}
+
+function drawer(trace: core.CoachTrace[], host: string): HTMLElement {
+  const results = trace.filter((t) => t.outcome.kind === "ok").length;
+  const bytes = trace.reduce((n, t) => n + t.bytes_sent, 0);
+  const box = el("details", "drawer");
+  box.append(el("summary", "caption", `What the model can see · Sent to ${host}: ${results} tool ${results === 1 ? "result" : "results"}, ${bytes} bytes`));
+  box.append(el("p", "caption muted", "Each answer below is exactly what the model received from one tool. The app's own instructions and the words you typed are sent with it."));
+  for (const t of trace) {
+    const entry = el("details");
+    entry.append(el("summary", "caption mono", `${t.tool} ${JSON.stringify(t.arguments_sent)} · ${t.bytes_sent} bytes · ${outcomeWord(t.outcome)}`));
+    entry.append(el("pre", "mono caption", JSON.stringify(t.projected, null, 2)));
+    box.append(entry);
+  }
+  if (!trace.length) box.append(el("p", "caption muted", "No tool was called for this answer."));
+  return box;
+}
+
+function bubble(turn: Turn): HTMLElement {
+  const wrap = el("div", `turn ${turn.role === "user" ? "user" : "coach"}`);
+  // neutralText runs here, at the one place model text is drawn
+  wrap.append(el("p", `bubble ${turn.role}`, turn.role === "coach" ? neutralText(turn.text) : turn.text));
+  if (turn.role === "coach") wrap.append(drawer(turn.trace, turn.host));
+  return wrap;
+}
+
+async function sendQuestion(): Promise<void> {
+  const text = coachDraft.trim();
+  if (!text || coachSending || !coachSettings) return;
+  const host = hostOf(coachSettings.base_url);
+  conversation.push({ role: "user", text });
+  coachDraft = "";
+  coachSending = host;
+  renderNav();
+  void route();
+  try {
+    const reply = await core.coachAsk(text);
+    conversation.push({ role: "coach", text: reply.text, trace: reply.trace, host });
+  } catch (e) {
+    conversation.push({ role: "error", text: core.coachErrorText(e) });
+  } finally {
+    coachSending = null;
+    renderNav();
+  }
+  if (current() === "coach") void route();
+}
+
+function screenCoach(out: ParentNode, later: Later): void {
+  header(out, "Coach", "Questions about your own days");
+  out.append(el("p", "caption muted", DISCLAIMER)); // every visit, not dismissible
+  const s = coachSettings;
+  if (!s || s.mode === "off") {
+    const card = el("div", "card");
+    card.append(el("h2", "heading", "Coaching is off"));
+    card.append(el("p", "body", "Nothing leaves this computer while it is off. Turning it on means this: day-level summaries of your data, and the words you type, go to the endpoint you choose. Nothing else is sent, and this app stores no conversation."));
+    const link = el("a", "", "Open Coach settings") as HTMLAnchorElement;
+    link.href = "#/coach-settings";
+    card.append(link);
+    out.append(card);
+    return;
+  }
+  const host = hostOf(s.base_url);
+  if (!coachIntroSeen) {
+    const card = el("div", "card");
+    card.append(el("h2", "heading", "Before you ask"));
+    card.append(el("p", "body", tierSentence(s)));
+    card.append(el("p", "body", `Your typed words also leave: everything you write in the box below is sent to ${host} too.`));
+    card.append(el("p", "body", DISCLAIMER));
+    const got = el("button", "", "Got it") as HTMLButtonElement;
+    got.onclick = () => { coachIntroSeen = true; void route(); };
+    card.append(got);
+    out.append(card);
+  }
+  const thread = el("div", "thread");
+  thread.setAttribute("aria-live", "polite");
+  for (const turn of conversation) thread.append(bubble(turn));
+  if (coachSending) {
+    const waiting = el("div", "turn coach");
+    waiting.append(el("p", "bubble coach waiting", `Waiting for ${coachSending}\u2026`));
+    thread.append(waiting);
+  }
+  if (!conversation.length && !coachSending) thread.append(el("p", "muted body", "No questions yet. Ask about a metric, a week, or a night."));
+  out.append(thread);
+
+  const form = el("form", "card") as HTMLFormElement;
+  const box = el("textarea") as HTMLTextAreaElement;
+  box.placeholder = "Ask about your own days, for example: how did my sleep change this week?";
+  box.setAttribute("aria-label", "Your question");
+  box.value = coachDraft;
+  box.disabled = !!coachSending;
+  box.oninput = () => { coachDraft = box.value; };
+  box.onkeydown = (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      form.requestSubmit();
+    }
+  };
+  const actions = el("div", "actions");
+  const ask = el("button", "", "Ask") as HTMLButtonElement;
+  ask.type = "submit";
+  ask.disabled = !!coachSending;
+  const fresh = el("button", "secondary", "New conversation") as HTMLButtonElement;
+  fresh.type = "button";
+  fresh.disabled = !!coachSending;
+  fresh.onclick = async () => {
+    fresh.disabled = true;
+    try { await core.coachReset(); } catch { /* the in-memory turns below are dropped either way */ }
+    conversation = [];
+    void route();
+  };
+  actions.append(ask, fresh, el("span", "caption muted", "Enter sends, Shift+Enter starts a new line."));
+  form.append(box, actions);
+  form.onsubmit = (ev) => { ev.preventDefault(); void sendQuestion(); };
+  out.append(form);
+  later(() => {
+    if (!coachSending) box.focus();
+    thread.lastElementChild?.scrollIntoView({ block: "nearest" });
+  });
+}
+
+// ---- Coach settings ---------------------------------------------------------------------
+const KEY_WORDS: Record<core.CoachKeyState, string> = {
+  absent: "No key is stored.",
+  cached: "The key is in this device's keychain.",
+  stale: "A key is in the keychain that this build cannot read without asking. Enter it again.",
+  session_only: "The key is held for this session only; quitting the app forgets it.",
+};
+
+function badge(text: string, kind: "good" | "warn" | "bad"): HTMLElement {
+  return el("span", `badge ${kind}`, text);
+}
+
+/** Only a short lowercase code is ever shown from a probe report. */
+function codeWord(code: string | null): string {
+  return code !== null && /^[a-z_]{1,40}$/.test(code) ? code : "unknown";
+}
+
+function probeBadges(r: core.ProbeReport): HTMLElement {
+  const row = el("div", "badges");
+  row.append(r.reachable ? badge("reachable", "good") : badge(`unreachable (${codeWord(r.error)})`, "bad"));
+  if (r.error === "unauthorised") row.append(badge("unauthorised", "bad"));
+  else if (r.reachable && r.error === "status") row.append(badge(`error status ${r.status ?? "unknown"}`, "bad"));
+  else if (r.reachable && r.error) row.append(badge(`unreadable answer (${codeWord(r.error)})`, "warn"));
+  const tools = { yes: "good", no: "bad", unknown: "warn" } as const;
+  const context = { ok: "good", too_small: "bad", unknown: "warn" } as const;
+  row.append(badge(`tools: ${r.tools}`, tools[r.tools]));
+  const read = r.measured_prompt_tokens === null ? "" : ` (${r.measured_prompt_tokens} tokens read)`;
+  row.append(badge(`context: ${r.context.replace("_", " ")}${read}`, context[r.context]));
+  return row;
+}
+
+async function screenCoachSettings(out: ParentNode): Promise<void> {
+  const s = await core.coachSettingsGet();
+  let keyState = await core.coachKeyState();
+  header(out, "Coach settings", "Which model answers, and where your questions go");
+
+  const card = el("div", "card");
+  card.append(el("h2", "heading", "Endpoint"));
+  const group = el("div");
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", "Coach mode");
+  const radios: [core.CoachMode, string][] = [["off", "Off"], ["local", "Local endpoint"], ["cloud", "Cloud endpoint"]];
+  let mode: core.CoachMode = s.mode;
+  const url = el("input") as HTMLInputElement;
+  const placeholder = (m: core.CoachMode): string => (m === "cloud" ? "https://…/v1" : "http://127.0.0.1:11434/v1");
+  for (const [value, label] of radios) {
+    const row = el("label", "choice body") as HTMLLabelElement;
+    const radio = el("input") as HTMLInputElement;
+    radio.type = "radio"; radio.name = "coach-mode"; radio.value = value; radio.checked = value === mode;
+    radio.onchange = () => { mode = value; url.placeholder = placeholder(mode); };
+    row.append(radio, el("span", "", label));
+    group.append(row);
+  }
+  card.append(group);
+  card.append(el("p", "caption muted", "Local: an address on this computer or your network, over plain http. Cloud: https only, with your own key. Off sends nothing."));
+  url.type = "text"; url.value = s.base_url; url.placeholder = placeholder(mode); url.autocomplete = "off";
+  url.setAttribute("aria-label", "Endpoint address");
+  const model = el("input") as HTMLInputElement;
+  model.type = "text"; model.value = s.model; model.placeholder = "model name"; model.autocomplete = "off";
+  model.setAttribute("aria-label", "Model name");
+  const addressField = el("label", "field body");
+  addressField.append(el("span", "", "Address"), url);
+  const modelField = el("label", "field body");
+  modelField.append(el("span", "", "Model"), model);
+  card.append(addressField, modelField);
+  const points = el("label", "switch body") as HTMLLabelElement;
+  points.append(el("span", "", "Include day-by-day points in facts"));
+  const pointsBox = el("input") as HTMLInputElement;
+  pointsBox.type = "checkbox"; pointsBox.checked = s.include_points; pointsBox.setAttribute("role", "switch");
+  points.append(pointsBox);
+  card.append(points);
+  card.append(el("p", "caption muted", "Off: the coach receives facts and daily summaries. On: it also receives the value for each day."));
+  const save = el("button", "", "Save") as HTMLButtonElement;
+  const saved = el("span", "caption");
+  save.onclick = async () => {
+    save.disabled = true; saved.textContent = ""; saved.className = "caption";
+    try {
+      coachSettings = await core.coachSettingsSet({ mode, base_url: url.value.trim(), model: model.value.trim(), key_in_keychain: s.key_in_keychain, include_points: pointsBox.checked });
+      saved.textContent = "Saved."; saved.classList.add("muted");
+      renderNav();
+    } catch (e) {
+      saved.textContent = core.coachErrorText(e); saved.classList.add("error");
+    } finally {
+      save.disabled = false;
+    }
+  };
+  const saveRow = el("div", "actions");
+  saveRow.append(save, saved);
+  card.append(saveRow);
+  out.append(card);
+
+  const keyCard = el("div", "card");
+  keyCard.append(el("h2", "heading", "Provider key"));
+  const state = el("p", "body", KEY_WORDS[keyState]);
+  const keyForm = el("form", "field") as HTMLFormElement;
+  const keyInput = el("input") as HTMLInputElement;
+  keyInput.type = "password"; keyInput.autocomplete = "off"; keyInput.placeholder = "Provider key"; keyInput.setAttribute("aria-label", "Provider key");
+  const remember = el("label", "switch body") as HTMLLabelElement;
+  remember.append(el("span", "", "Remember in this device's keychain"));
+  const rememberBox = el("input") as HTMLInputElement;
+  rememberBox.type = "checkbox"; rememberBox.checked = s.key_in_keychain; rememberBox.setAttribute("role", "switch");
+  remember.append(rememberBox);
+  const keyActions = el("div", "actions");
+  const saveKey = el("button", "", "Save key") as HTMLButtonElement;
+  saveKey.type = "submit";
+  const forget = el("button", "secondary", "Forget key") as HTMLButtonElement;
+  forget.type = "button";
+  const keyNote = el("span", "caption");
+  const showKey = (next: core.CoachKeyState) => { keyState = next; state.textContent = KEY_WORDS[keyState]; };
+  keyForm.onsubmit = async (ev) => {
+    ev.preventDefault();
+    saveKey.disabled = true; keyNote.textContent = ""; keyNote.className = "caption";
+    // the key is handed over and the field emptied in the same breath: it is never held in a variable here
+    const pending = core.coachKeySet(keyInput.value, rememberBox.checked);
+    keyInput.value = "";
+    try {
+      showKey(await pending);
+    } catch (e) {
+      keyNote.textContent = core.coachErrorText(e); keyNote.classList.add("error");
+    } finally {
+      saveKey.disabled = false;
+    }
+  };
+  forget.onclick = async () => {
+    keyNote.textContent = ""; keyNote.className = "caption";
+    try {
+      showKey(await core.coachKeyForget());
+      rememberBox.checked = false;
+    } catch (e) {
+      keyNote.textContent = core.coachErrorText(e); keyNote.classList.add("error");
+    }
+  };
+  keyActions.append(saveKey, forget, keyNote);
+  keyForm.append(keyInput, remember, keyActions);
+  keyCard.append(state, keyForm);
+  keyCard.append(el("p", "caption muted", "A local endpoint usually needs no key. A cloud endpoint does."));
+  out.append(keyCard);
+
+  const testCard = el("div", "card");
+  testCard.append(el("h2", "heading", "Test the endpoint"));
+  testCard.append(el("p", "caption muted", "Sends two short made-up requests to the saved address, with none of your data: one asks for a tool call, one measures how much of a long prompt the model reads. Save first."));
+  const results = el("div");
+  const test = el("button", "secondary", "Test endpoint") as HTMLButtonElement;
+  test.onclick = async () => {
+    test.disabled = true; results.replaceChildren();
+    try {
+      const report = await core.coachProbe();
+      results.append(probeBadges(report));
+      if (report.context === "too_small") results.append(el("p", "caption", "The model read only part of a long prompt. Raise its context window (for Ollama, num_ctx) or choose another model."));
+      if (report.tools === "no") results.append(el("p", "caption", "The model did not call a tool. The coach needs a model that supports tool calls."));
+    } catch (e) {
+      results.append(el("span", "caption error", core.coachErrorText(e)));
+    } finally {
+      test.disabled = false;
+    }
+  };
+  testCard.append(test, results);
+  out.append(testCard);
+
+  out.append(el("p", "caption muted", "These settings are saved in a small file named coach.json in this app's configuration folder, on this computer. The provider key is never written to it."));
 }
 
 // ---- Boot -------------------------------------------------------------------------------

@@ -92,3 +92,49 @@ export function metricLabel(id: string): string {
 export function scopeWord(id: string): string {
   return SCOPE_WORD[id] ?? id;
 }
+
+// ---- what the coach's words are scrubbed with before they are drawn (Bet 15) -----------------------------
+// Mirrors identity.rs::neutral_text (the maker's name becomes a placeholder), then replaces the score names
+// CLAIMS-POLICY.md marks with plain words. The names are spelled in two fragments so that no authored string
+// and no built bundle carries one; tests/test_claims_policy.py joins the fragments back and checks that the
+// keys are exactly the policy's `score-marks` and `score-names` lists.
+const mark = (head: string, tail: string): string => head + tail;
+
+/** Multi-word marks, matched in any letter case (the policy's `score-marks`). */
+export const SCORE_MARKS: [string, string][] = [
+  [mark("Body Bat", "tery"), "energy level"],
+  [mark("Recov", "ery score"), "rest estimate"],
+  [mark("Training Read", "iness"), "daily preparedness"],
+];
+/** Single names, matched as whole words in exactly this case (the policy's `score-names`). */
+export const SCORE_NAMES: [string, string][] = [
+  [mark("Read", "iness"), "daily preparedness"],
+  [mark("Recov", "ery"), "rest"],
+  [mark("T", "SS"), "training stress total"],
+  [mark("C", "TL"), "long-term training load"],
+  [mark("A", "TL"), "short-term training load"],
+  [mark("T", "SB"), "training balance"],
+];
+
+// identity.rs: the name with an optional " connect"; Python's ignore-case also folds U+0130 and U+0131 to i.
+const MAKER = new RegExp(["gar", "m", "[i\u0130\u0131]", "n", "(?: connect)?"].join(""), "gi");
+const VENDOR_PLACEHOLDER = "{vendor}";
+
+function startsSentence(text: string, at: number): boolean {
+  return /(^|[.!?]\s+|\n)$/.test(text.slice(0, at));
+}
+
+function plain(text: string, key: string, words: string, flags: string): string {
+  const pattern = new RegExp(`\\b${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, flags);
+  return text.replace(pattern, (_hit: string, at: number) => {
+    return startsSentence(text, at) ? words.charAt(0).toUpperCase() + words.slice(1) : words;
+  });
+}
+
+/** The coach's text as it may be drawn: the maker's name scrubbed, score names in plain words. */
+export function neutralText(text: string): string {
+  let out = text.replace(MAKER, VENDOR_PLACEHOLDER);
+  for (const [key, words] of SCORE_MARKS) out = plain(out, key, words, "gi");
+  for (const [key, words] of SCORE_NAMES) out = plain(out, key, words, "g");
+  return out;
+}

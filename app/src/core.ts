@@ -44,3 +44,64 @@ export function launchArgs(): Promise<string[]> {
 export function mcpCommand(): Promise<string> {
   return invoke<string>("mcp_command");
 }
+
+// ---- the coach (Bet 15). Every coach command goes through here: no other file calls invoke. ------------
+
+export type CoachMode = "off" | "local" | "cloud";
+export type CoachSettings = { mode: CoachMode; base_url: string; model: string; key_in_keychain: boolean; include_points: boolean };
+/** What a failed coach command rejects with: two fixed strings from closed enums and, for an error status, its number. */
+export type CoachError = { code: string; message: string; status: number | null };
+export type CoachKeyState = "absent" | "cached" | "stale" | "session_only";
+export type CoachOutcome = { kind: "ok" } | { kind: "rejected"; detail: string } | { kind: "too_large" } | { kind: "tool_error"; detail: string };
+export type CoachTrace = { tool: string; arguments_sent: unknown; bytes_sent: number; projected: unknown; outcome: CoachOutcome };
+export type CoachReply = { text: string; trace: CoachTrace[] };
+export type ProbeReport = {
+  reachable: boolean;
+  tools: "yes" | "no" | "unknown";
+  context: "ok" | "too_small" | "unknown";
+  measured_prompt_tokens: number | null;
+  status: number | null;
+  error: string | null;
+};
+
+export function coachAsk(text: string): Promise<CoachReply> {
+  return invoke<CoachReply>("coach_ask", { text });
+}
+
+export function coachReset(): Promise<void> {
+  return invoke("coach_reset");
+}
+
+export function coachProbe(): Promise<ProbeReport> {
+  return invoke<ProbeReport>("coach_probe");
+}
+
+export function coachSettingsGet(): Promise<CoachSettings> {
+  return invoke<CoachSettings>("coach_settings_get");
+}
+
+export function coachSettingsSet(settings: CoachSettings): Promise<CoachSettings> {
+  return invoke<CoachSettings>("coach_settings_set", { settings });
+}
+
+/** The provider key goes straight to the shell; never keep it in a variable longer than this call. */
+export function coachKeySet(key: string, remember: boolean): Promise<CoachKeyState> {
+  return invoke<CoachKeyState>("coach_key_set", { key, remember });
+}
+
+export function coachKeyForget(): Promise<CoachKeyState> {
+  return invoke<CoachKeyState>("coach_key_forget");
+}
+
+export function coachKeyState(): Promise<CoachKeyState> {
+  return invoke<CoachKeyState>("coach_key_state");
+}
+
+/** `code: message` from a coach error, and only that (plus the status number): never any other text. */
+export function coachErrorText(e: unknown): string {
+  if (typeof e === "object" && e !== null && typeof (e as CoachError).code === "string" && typeof (e as CoachError).message === "string") {
+    const err = e as CoachError;
+    return `${err.code}: ${err.message}${typeof err.status === "number" ? ` (status ${err.status})` : ""}`;
+  }
+  return "coach_failed: the request did not complete";
+}

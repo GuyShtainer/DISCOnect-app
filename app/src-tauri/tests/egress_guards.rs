@@ -312,13 +312,16 @@ fn the_frontend_has_no_network_or_navigation_primitive() {
         "sendBeacon",
         "EventSource",
         "navigator.serviceWorker",
-        "window.open(",
+        "window.open",
         "location.href =",
         "location.assign",
         "<a href=\"http",
+        "target=\"_blank\"",
+        "_blank",
     ];
-    let sources = files_under(&app_dir().join("src"), "ts");
+    let mut sources = files_under(&app_dir().join("src"), "ts");
     assert!(sources.len() >= 4, "the TypeScript sources are where the test looks: {sources:?}");
+    sources.push(app_dir().join("index.html"));
     for path in sources {
         let code = text(&path);
         for word in words {
