@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deterministic facts: a recent window of one person's data against their own history. The twin of
-//! `disconect/insight.py`'s `period_facts` for what `data.facts` needs: `window_days` and
-//! `baseline_days`. The MCP-only parameters (`end_date`, `metrics`, `source_scope`, `include_points`)
-//! and `metric_series` / `sleep_detail` / `list_activities` belong to the Rust-MCP bet; [`FactsQuery`]
-//! is where they will go.
+//! `disconect/insight.py`'s `period_facts`, with every option: `window_days` and `baseline_days` (what
+//! `data.facts` sends) and the MCP-only `end_date`, `metrics`, `source_scope` and `include_points`
+//! (Bet 11e, slice 1), all in [`FactsQuery`]. [`period_facts_ordered`] answers with the ordered,
+//! type-exact [`Json`] the MCP writes; [`period_facts`] is the same answer as a `serde_json` value for
+//! `serve`.
 //!
 //! The layer emits facts, evidence and confidence and never a sentence. Three rules, as in the oracle:
 //! compare only against the person's own history; thin evidence says so (`insufficient`, no
@@ -17,13 +18,13 @@
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
-use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
 use super::ReadError;
 use super::numerics::{fmean, stdev};
 use super::queries::{self, iso, parse_date, round2, shift};
 use crate::contract::{Contract, MetricContract};
+use crate::wirejson::{Json, PyStr};
 
 pub const DEFAULT_WINDOW_DAYS: i64 = 7;
 pub const DEFAULT_BASELINE_DAYS: i64 = 28;
@@ -35,11 +36,17 @@ pub const INSUFFICIENT: &str = "insufficient";
 /// `CADENCE_DAILY` and `CADENCE_SAMPLE` of the contract.
 const CADENCE_DAILY: &str = "daily";
 
-/// What `period_facts` is asked. New fields (the MCP parameters) are added here with defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What `period_facts` is asked. `None` and an empty list/text are different only where Python tells
+/// them apart: `source_scope = ""` is an error, `end_date = ""` means "latest stored", `metrics = []`
+/// means "all".
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactsQuery {
     pub window_days: i64,
     pub baseline_days: i64,
+    pub end_date: Option<PyStr>,
+    pub metrics: Option<Vec<PyStr>>,
+    pub source_scope: Option<PyStr>,
+    pub include_points: bool,
 }
 
 impl Default for FactsQuery {
@@ -47,6 +54,10 @@ impl Default for FactsQuery {
         FactsQuery {
             window_days: DEFAULT_WINDOW_DAYS,
             baseline_days: DEFAULT_BASELINE_DAYS,
+            end_date: None,
+            metrics: None,
+            source_scope: None,
+            include_points: false,
         }
     }
 }
@@ -62,7 +73,7 @@ pub fn confidence_for(contract: &Contract, baseline_days_with_data: usize) -> &s
 }
 
 /// `Comparison`; field order is the oracle's `dataclasses.asdict` order.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Comparison {
     pub baseline_mean: f64,
     pub baseline_sd: Option<f64>,
@@ -72,18 +83,28 @@ pub struct Comparison {
     pub direction: &'static str,
 }
 
-/// The `evidence` dict of a fact built from data (the oracle's `include_points` adds a key later).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Evidence {
-    pub window_dates: Vec<String>,
-    pub baseline_from: String,
-    pub baseline_to: String,
-    pub baseline_days_with_data: usize,
-    pub aggregation: &'static str,
+/// A float or `None` as the JSON value Python's `asdict` leaves.
+fn optional(value: Option<f64>) -> Json {
+    value.map_or(Json::Null, Json::Float)
 }
 
-/// `Fact`: one metric in one window for one source scope, with its evidence.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+impl Comparison {
+    fn to_json(&self) -> Json {
+        let mut out = Json::dict();
+        out.set("baseline_mean", Json::Float(self.baseline_mean));
+        out.set("baseline_sd", optional(self.baseline_sd));
+        out.set("delta", Json::Float(self.delta));
+        out.set("delta_percent", optional(self.delta_percent));
+        out.set("z_score", optional(self.z_score));
+        out.set("direction", Json::text(self.direction));
+        out
+    }
+}
+
+/// `Fact`: one metric in one window for one source scope, with its evidence. `evidence` is built where
+/// the fact is, because its keys differ: a fact from data has the window's dates (and, when asked, its
+/// points); a `no_data` fact has only the baseline bounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
     pub fact_id: String,
     pub metric: String,
@@ -98,7 +119,38 @@ pub struct Fact {
     pub comparison: Option<Comparison>,
     pub confidence: String,
     pub reason_code: &'static str,
-    pub evidence: Evidence,
+    pub evidence: Json,
+}
+
+impl Fact {
+    /// `Fact.as_dict()`: `dataclasses.asdict`, in field order.
+    fn to_json(&self) -> Json {
+        let mut out = Json::dict();
+        out.set("fact_id", Json::text(&self.fact_id));
+        out.set("metric", Json::text(&self.metric));
+        out.set("unit", Json::text(&self.unit));
+        out.set("cadence", Json::text(&self.cadence));
+        out.set("source_scope", Json::text(&self.source_scope));
+        out.set("value", optional(self.value));
+        out.set("window_min", optional(self.window_min));
+        out.set("window_max", optional(self.window_max));
+        out.set(
+            "window_days_with_data",
+            Json::count(self.window_days_with_data),
+        );
+        out.set(
+            "baseline_days_with_data",
+            Json::count(self.baseline_days_with_data),
+        );
+        out.set(
+            "comparison",
+            self.comparison.as_ref().map_or(Json::Null, Comparison::to_json),
+        );
+        out.set("confidence", Json::text(&self.confidence));
+        out.set("reason_code", Json::text(self.reason_code));
+        out.set("evidence", self.evidence.clone());
+        out
+    }
 }
 
 /// One day's value for one metric and scope.
@@ -132,7 +184,7 @@ fn finite_all(values: &[f64]) -> Result<(), ReadError> {
 
 fn mean_of(values: &[f64]) -> Result<f64, ReadError> {
     finite_all(values)?;
-    fmean(values).ok_or(ReadError::Unexpected("OverflowError"))
+    fmean(values).ok_or(ReadError::Overflow)
 }
 
 fn min_of(values: &[f64]) -> f64 {
@@ -186,20 +238,39 @@ fn build_fact(
     window: &[Point],
     baseline: &[Point],
     bounds: &Bounds,
+    include_points: bool,
 ) -> Result<Fact, ReadError> {
     let window_values: Vec<f64> = window.iter().map(|p| p.value).collect();
     let baseline_values: Vec<f64> = baseline.iter().map(|p| p.value).collect();
-    let evidence = Evidence {
-        window_dates: window.iter().map(|p| p.date.clone()).collect(),
-        baseline_from: bounds.baseline_from.clone(),
-        baseline_to: bounds.baseline_to.clone(),
-        baseline_days_with_data: baseline_values.len(),
-        aggregation: if metric.cadence == CADENCE_DAILY {
+    let mut evidence = Json::dict();
+    evidence.set(
+        "window_dates",
+        Json::Array(window.iter().map(|p| Json::text(&p.date)).collect()),
+    );
+    evidence.set("baseline_from", Json::text(&bounds.baseline_from));
+    evidence.set("baseline_to", Json::text(&bounds.baseline_to));
+    evidence.set(
+        "baseline_days_with_data",
+        Json::count(baseline_values.len()),
+    );
+    evidence.set(
+        "aggregation",
+        Json::text(if metric.cadence == CADENCE_DAILY {
             "mean of the window's daily values"
         } else {
             "mean of per-day means of samples"
-        },
-    };
+        }),
+    );
+    if include_points {
+        let mut points = Vec::new();
+        for point in window {
+            let mut entry = Json::dict();
+            entry.set("date", Json::text(&point.date));
+            entry.set("value", Json::Float(finite(round2(point.value))?));
+            points.push(entry);
+        }
+        evidence.set("window_points", Json::Array(points));
+    }
     let mut fact = Fact {
         fact_id: format!("period.{}", metric.metric),
         metric: metric.metric.clone(),
@@ -233,7 +304,7 @@ fn build_fact(
     }
     let baseline_mean = mean_of(&baseline_values)?;
     let baseline_sd = if baseline_values.len() > 1 {
-        Some(stdev(&baseline_values).ok_or(ReadError::Unexpected("OverflowError"))?)
+        Some(stdev(&baseline_values).ok_or(ReadError::Overflow)?)
     } else {
         None
     };
@@ -245,13 +316,13 @@ fn build_fact(
     } else {
         "lower"
     };
-    let optional = |x: Option<f64>| x.map(round2).map(finite).transpose();
+    let rounded = |x: Option<f64>| x.map(round2).map(finite).transpose();
     fact.comparison = Some(Comparison {
         baseline_mean: finite(round2(baseline_mean))?,
-        baseline_sd: optional(baseline_sd)?,
+        baseline_sd: rounded(baseline_sd)?,
         delta: finite(round2(delta))?,
-        delta_percent: optional((baseline_mean != 0.0).then(|| delta / baseline_mean * 100.0))?,
-        z_score: optional(baseline_sd.filter(|sd| *sd != 0.0).map(|sd| delta / sd))?,
+        delta_percent: rounded((baseline_mean != 0.0).then(|| delta / baseline_mean * 100.0))?,
+        z_score: rounded(baseline_sd.filter(|sd| *sd != 0.0).map(|sd| delta / sd))?,
         direction,
     });
     fact.confidence = confidence_for(contract, baseline_values.len()).to_string();
@@ -259,21 +330,56 @@ fn build_fact(
     Ok(fact)
 }
 
-/// `period_facts(conn, window_days, baseline_days)`: facts for every metric with data, the last
-/// `window_days` against the `baseline_days` before them. `as_of` is the latest date the store holds
-/// (never the clock), so an old archive still answers. Metrics without data in either range are
-/// omitted. The result carries the full oracle shape, `sources` included (`serve` drops it).
+/// `period_facts` as a `serde_json` value (keys sorted), for `serve`'s `data.facts`: the same answer as
+/// [`period_facts_ordered`]. The result carries the full oracle shape, `sources` included (`serve` drops it).
 pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, ReadError> {
+    period_facts_ordered(conn, query)?
+        .to_serde()
+        .ok_or_else(|| ReadError::Value(NOT_JSON.into()))
+}
+
+/// `period_facts`: facts for every metric with data, the last `window_days` against the `baseline_days`
+/// before them, ending on `end_date` (empty or absent: the latest date the store holds, never the clock, so
+/// an old archive still answers). `metrics` are answered in request order, each once; a requested metric with
+/// no data in either range is a `no_data` fact, an unrequested one is omitted; a name the contract does not
+/// know (a label included) is listed in `ignored_metrics`. Errors, in Python's order: `source_scope`,
+/// `end_date` (`ValueError`), then the window arithmetic and the sample over-fetch (`OverflowError`).
+pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Json, ReadError> {
     let contract = Contract::get()?;
     let window_days = query.window_days.clamp(1, MAX_WINDOW_DAYS);
     let baseline_days = query.baseline_days.clamp(1, MAX_BASELINE_DAYS);
-    let scopes = &contract.source_scopes;
-    let rules: Vec<&String> = contract.insight.rules.iter().collect();
-    let Some(as_of) = queries::latest_stored_date(conn)? else {
-        return Ok(json!({
-            "as_of": null, "facts": [], "ignored_metrics": [],
-            "reason": "nothing stored yet", "rules": rules,
-        }));
+    let scopes = &queries::scopes_for(contract, query.source_scope.as_ref())?;
+    let end_date = query.end_date.as_ref().filter(|text| !text.is_empty());
+    if let Some(text) = end_date {
+        queries::parse_day(text, "end_date")?;
+    }
+    let requested: &[PyStr] = query.metrics.as_deref().unwrap_or_default();
+    let rules = || {
+        Json::Array(
+            contract
+                .insight
+                .rules
+                .iter()
+                .map(|rule| Json::text(rule))
+                .collect(),
+        )
+    };
+    let as_of = match end_date {
+        // `parse_day` accepted it: plain ASCII
+        Some(text) => Some(text.to_text().unwrap_or_default()),
+        None => queries::latest_stored_date(conn)?,
+    };
+    let Some(as_of) = as_of else {
+        let mut out = Json::dict();
+        out.set("as_of", Json::Null);
+        out.set("facts", Json::Array(Vec::new()));
+        out.set(
+            "ignored_metrics",
+            Json::Array(requested.iter().cloned().map(Json::Str).collect()),
+        );
+        out.set("reason", Json::text("nothing stored yet"));
+        out.set("rules", rules());
+        return Ok(out);
     };
     let end = parse_date(&as_of)?;
     let window_start = shift(end, 1 - window_days)?;
@@ -286,9 +392,34 @@ pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, Read
         baseline_to: iso(baseline_end),
     };
 
+    let wanted: Vec<PyStr> = if requested.is_empty() {
+        contract
+            .metrics
+            .iter()
+            .map(|item| PyStr::from_text(&item.metric))
+            .collect()
+    } else {
+        let mut once: Vec<PyStr> = Vec::new();
+        for name in requested {
+            if !once.contains(name) {
+                once.push(name.clone());
+            }
+        }
+        once
+    };
+    let known: Vec<Option<&MetricContract>> = wanted
+        .iter()
+        .map(|name| name.to_text().and_then(|text| contract.metric(&text)))
+        .collect();
+    let ignored: Vec<Json> = wanted
+        .iter()
+        .zip(&known)
+        .filter(|(_, item)| item.is_none())
+        .map(|(name, _)| Json::Str(name.clone()))
+        .collect();
     let offsets = queries::load_offsets(conn)?;
     let mut facts: Vec<Fact> = Vec::new();
-    for item in &contract.metrics {
+    for item in known.into_iter().flatten() {
         let by_scope: BTreeMap<String, Vec<Point>> = if item.cadence == CADENCE_DAILY {
             daily_points(conn, &item.metric, &bounds.baseline_from, &as_of, scopes)?
         } else {
@@ -313,7 +444,13 @@ pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, Read
             })
             .collect()
         };
-        for scope in scopes {
+        if by_scope.is_empty() {
+            if !requested.is_empty() {
+                facts.push(no_data_fact(item, query.source_scope.as_ref(), &bounds));
+            }
+            continue;
+        }
+        for scope in &contract.source_scopes {
             let Some(points) = by_scope.get(scope).filter(|p| !p.is_empty()) else {
                 continue;
             };
@@ -328,47 +465,74 @@ pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, Read
                 .cloned()
                 .collect();
             facts.push(build_fact(
-                contract, item, scope, &window, &baseline, &bounds,
+                contract,
+                item,
+                scope,
+                &window,
+                &baseline,
+                &bounds,
+                query.include_points,
             )?);
         }
     }
 
-    let confidence_bands: Map<String, Value> = contract
-        .insight
-        .confidence_bands
-        .iter()
-        .map(|band| {
-            (
-                band.label.clone(),
-                Value::String(format!(">= {} baseline days", band.min_days)),
-            )
-        })
-        .collect();
-    let mut out = Map::new();
-    out.insert("as_of".into(), json!(as_of));
-    out.insert(
-        "window".into(),
-        json!({"from": bounds.window_from, "to": bounds.window_to, "days": window_days}),
+    let mut confidence_bands = Json::dict();
+    for band in &contract.insight.confidence_bands {
+        confidence_bands.set(
+            &band.label,
+            Json::text(&format!(">= {} baseline days", band.min_days)),
+        );
+    }
+    let mut window = Json::dict();
+    window.set("from", Json::text(&bounds.window_from));
+    window.set("to", Json::text(&bounds.window_to));
+    window.set("days", Json::int(window_days));
+    let mut baseline = Json::dict();
+    baseline.set("from", Json::text(&bounds.baseline_from));
+    baseline.set("to", Json::text(&bounds.baseline_to));
+    baseline.set("days", Json::int(baseline_days));
+    baseline.set("min_days_with_data", Json::count(MIN_BASELINE_DAYS));
+    baseline.set("confidence_bands", confidence_bands);
+    let mut out = Json::dict();
+    out.set("as_of", Json::text(&as_of));
+    out.set("window", window);
+    out.set("baseline", baseline);
+    out.set("facts", Json::Array(facts.iter().map(Fact::to_json).collect()));
+    out.set("ignored_metrics", Json::Array(ignored));
+    out.set("rules", rules());
+    out.set(
+        "missing_values",
+        Json::text(&contract.conventions.missing_values),
     );
-    out.insert(
-        "baseline".into(),
-        json!({
-            "from": bounds.baseline_from, "to": bounds.baseline_to, "days": baseline_days,
-            "min_days_with_data": MIN_BASELINE_DAYS, "confidence_bands": confidence_bands,
-        }),
-    );
-    out.insert(
-        "facts".into(),
-        serde_json::to_value(&facts).map_err(|_| ReadError::Unexpected("TypeError"))?,
-    );
-    out.insert("ignored_metrics".into(), json!([]));
-    out.insert("rules".into(), json!(rules));
-    out.insert(
-        "missing_values".into(),
-        json!(contract.conventions.missing_values),
-    );
-    out.insert("sources".into(), json!(contract.conventions.sources));
-    Ok(Value::Object(out))
+    out.set("sources", Json::text(&contract.conventions.sources));
+    Ok(out)
+}
+
+/// The fact for a requested metric the store has nothing of in the scopes asked: `no_data`, the scope as
+/// asked (`source_scope or "any"`), and an evidence block of only the baseline bounds.
+fn no_data_fact(item: &MetricContract, source_scope: Option<&PyStr>, bounds: &Bounds) -> Fact {
+    let mut evidence = Json::dict();
+    evidence.set("baseline_from", Json::text(&bounds.baseline_from));
+    evidence.set("baseline_to", Json::text(&bounds.baseline_to));
+    Fact {
+        fact_id: format!("period.{}", item.metric),
+        metric: item.metric.clone(),
+        unit: item.unit.clone(),
+        cadence: item.cadence.clone(),
+        // a scope that reached here named a contract scope, so it is plain text
+        source_scope: source_scope
+            .and_then(PyStr::to_text)
+            .unwrap_or_else(|| "any".to_string()),
+        value: None,
+        window_min: None,
+        window_max: None,
+        window_days_with_data: 0,
+        baseline_days_with_data: 0,
+        comparison: None,
+        confidence: INSUFFICIENT.to_string(),
+        reason_code: "no_data",
+        evidence,
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +604,7 @@ mod tests {
             &points(window),
             &points(baseline),
             &bounds,
+            false,
         ) {
             Ok(fact) => fact,
             Err(e) => unreachable!("fact: {e}"),
@@ -518,6 +683,7 @@ mod tests {
             &points(&[f64::INFINITY]),
             &[],
             &bounds,
+            false,
         );
         assert!(matches!(failed, Err(ReadError::Value(m)) if m == NOT_JSON));
     }

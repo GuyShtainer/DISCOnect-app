@@ -63,6 +63,11 @@ impl PyInt {
         &self.0
     }
 
+    /// An `i64` as the integer Python would hold.
+    pub fn from_i64(value: i64) -> PyInt {
+        PyInt(value.to_string())
+    }
+
     /// The value when it fits an `i64`.
     pub fn to_i64(&self) -> Option<i64> {
         self.0.parse().ok()
@@ -90,6 +95,58 @@ pub enum Json {
 }
 
 impl Json {
+    /// A `str` value.
+    pub fn text(text: &str) -> Json {
+        Json::Str(PyStr::from_text(text))
+    }
+
+    /// An `int` value.
+    pub fn int(value: i64) -> Json {
+        Json::Int(PyInt::from_i64(value))
+    }
+
+    /// An `int` value from a count.
+    pub fn count(value: usize) -> Json {
+        Json::int(i64::try_from(value).unwrap_or(i64::MAX))
+    }
+
+    /// An empty `dict`; fill it with [`Json::set`] to keep Python's insertion order.
+    pub fn dict() -> Json {
+        Json::Object(Vec::new())
+    }
+
+    /// `dict[key] = value`: a new key goes last, an existing key keeps its place. Does nothing to a
+    /// value that is not an object.
+    pub fn set(&mut self, key: &str, value: Json) {
+        if let Json::Object(pairs) = self {
+            match pairs.iter_mut().find(|(name, _)| name.equals(key)) {
+                Some(slot) => slot.1 = value,
+                None => pairs.push((PyStr::from_text(key), value)),
+            }
+        }
+    }
+
+    /// The same tree as a `serde_json` value (objects sorted by key, a lone surrogate replaced), or
+    /// `None` where it holds a float JSON cannot carry or an integer beyond 64 bits.
+    pub fn to_serde(&self) -> Option<Value> {
+        Some(match self {
+            Json::Null => Value::Null,
+            Json::Bool(flag) => Value::Bool(*flag),
+            Json::Int(int) => Value::from(int.to_i64()?),
+            Json::Float(number) => Value::Number(serde_json::Number::from_f64(*number)?),
+            Json::Str(text) => Value::String(text.units_lossy()),
+            Json::Array(items) => Value::Array(
+                items.iter().map(Json::to_serde).collect::<Option<Vec<_>>>()?,
+            ),
+            Json::Object(pairs) => Value::Object(
+                pairs
+                    .iter()
+                    .map(|(key, item)| Some((key.units_lossy(), item.to_serde()?)))
+                    .collect::<Option<serde_json::Map<_, _>>>()?,
+            ),
+        })
+    }
+
     /// `dict.get`: the last value stored under `key`.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
@@ -276,8 +333,17 @@ impl Reader<'_> {
                     }
                 }
                 _ => {
-                    // valid UTF-8 by construction (the input is a `&str`): copy one scalar
-                    let rest = std::str::from_utf8(&self.bytes[self.at..]).map_err(|_| NotJson)?;
+                    // valid UTF-8 by construction (the input is a `&str`): copy one scalar, looking at
+                    // its own bytes only (validating the whole rest of the text per character is
+                    // quadratic: a 3 MB fixture took a minute)
+                    let width = match byte {
+                        0xc0..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xff => 4,
+                        _ => 1,
+                    };
+                    let scalar = self.bytes.get(self.at..self.at + width).ok_or(NotJson)?;
+                    let rest = std::str::from_utf8(scalar).map_err(|_| NotJson)?;
                     let c = rest.chars().next().ok_or(NotJson)?;
                     let mut buffer = [0u16; 2];
                     units.extend_from_slice(c.encode_utf16(&mut buffer));

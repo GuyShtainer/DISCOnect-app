@@ -191,6 +191,7 @@ fn read_parts(error: &ReadError) -> (&'static str, String) {
         ReadError::Value(message) => ("bad_params", message.clone()),
         ReadError::Db(inner) => ("database", format!("database error: {inner}")),
         ReadError::Unexpected(name) => ("internal", format!("unexpected {name}")),
+        ReadError::Overflow => ("internal", "unexpected OverflowError".into()),
         ReadError::Contract(_) => ("internal", "unexpected ContractError".into()),
     }
 }
@@ -630,6 +631,7 @@ fn data_facts(session: &mut Session, call: &Call) -> Result<Value, Failure> {
         &FactsQuery {
             window_days,
             baseline_days,
+            ..FactsQuery::default()
         },
     )?;
     if let Some(object) = facts.as_object_mut() {

@@ -84,7 +84,7 @@ impl Window {
     }
 
     fn day(&self, position: usize) -> Result<String, ReadError> {
-        let offset = i64::try_from(position).map_err(|_| ReadError::Unexpected("OverflowError"))?;
+        let offset = i64::try_from(position).map_err(|_| ReadError::Overflow)?;
         shift(self.first, offset).map(iso)
     }
 }

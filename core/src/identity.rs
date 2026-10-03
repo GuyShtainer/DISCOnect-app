@@ -5,6 +5,8 @@
 //! A drift test (`tests/test_identity_drift.py`) fails when the three files stop agreeing, and it
 //! also pins [`MANUFACTURER_PATTERN`] to `serve._MANUFACTURER` (the Python source of the scrub).
 
+use crate::wirejson::{Json, PyStr};
+
 pub const PRODUCT: &str = "DISCOnect";
 pub const NOTICE: &str = "Not affiliated with or endorsed by any watch manufacturer.";
 
@@ -87,10 +89,58 @@ pub fn neutral(node: &mut serde_json::Value) {
     }
 }
 
+/// [`neutral_text`] over a Python string, a lone surrogate included: the pattern holds no surrogate, so a
+/// match never spans one, and each run of ordinary text between two of them is scrubbed on its own.
+pub fn neutral_py(text: &PyStr) -> PyStr {
+    let mut units: Vec<u16> = Vec::new();
+    let mut run = String::new();
+    for piece in char::decode_utf16(text.units()) {
+        match piece {
+            Ok(ch) => run.push(ch),
+            Err(lone) => {
+                units.extend(neutral_text(&run).encode_utf16());
+                run.clear();
+                units.push(lone.unpaired_surrogate());
+            }
+        }
+    }
+    units.extend(neutral_text(&run).encode_utf16());
+    PyStr::from_units(units)
+}
+
+/// [`neutral`] for the ordered value type the Rust-MCP read paths return: every string value is
+/// scrubbed, keys are kept.
+pub fn neutral_json(node: &mut Json) {
+    match node {
+        Json::Object(pairs) => pairs.iter_mut().for_each(|(_, value)| neutral_json(value)),
+        Json::Array(items) => items.iter_mut().for_each(neutral_json),
+        Json::Str(text) => *text = neutral_py(text),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_scrub_reaches_a_python_string_with_a_lone_surrogate() {
+        let mut units: Vec<u16> = "Garmin ".encode_utf16().collect();
+        units.push(0xD800);
+        units.extend(" garmin connect".encode_utf16());
+        let scrubbed = neutral_py(&PyStr::from_units(units));
+        let mut want: Vec<u16> = "{vendor} ".encode_utf16().collect();
+        want.push(0xD800);
+        want.extend(" {vendor}".encode_utf16());
+        assert_eq!(scrubbed, PyStr::from_units(want));
+        let mut tree = Json::Array(vec![Json::text("a GARMIN"), Json::Null, Json::int(1)]);
+        neutral_json(&mut tree);
+        assert_eq!(
+            tree,
+            Json::Array(vec![Json::text("a {vendor}"), Json::Null, Json::int(1)])
+        );
+    }
 
     #[test]
     fn scrub_matches_the_pythons_ignorecase_pattern() {

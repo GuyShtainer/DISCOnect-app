@@ -233,7 +233,7 @@ pub fn data_health(
     let since = Duration::try_days(window_days)
         .and_then(|delta| now.checked_sub_signed(delta))
         .map(|then| iso(then.date_naive()))
-        .ok_or(ReadError::Unexpected("OverflowError"))?;
+        .ok_or(ReadError::Overflow)?;
     let mut late = Late::default();
 
     let mut streams = Map::new();

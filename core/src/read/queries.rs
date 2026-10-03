@@ -122,12 +122,71 @@ pub fn parse_date_py(text: &PyStr) -> Result<NaiveDate, ReadError> {
     }
 }
 
+/// `parse_day`: `YYYY-MM-DD` and nothing else, as a request's own text (which may hold a lone
+/// surrogate). Any other text, and a shape-correct day that is not on the calendar, is
+/// `ValueError("<name> must be YYYY-MM-DD")`. It never overflows: `9999-12-31` and `0001-01-01` parse;
+/// the `OverflowError` comes later, from the date arithmetic ([`window`], [`sample_day_aggregates`]).
+pub fn parse_day(text: &PyStr, name: &str) -> Result<NaiveDate, ReadError> {
+    text.to_text()
+        .and_then(|plain| parse_date(&plain).ok())
+        .ok_or_else(|| ReadError::Value(format!("{name} must be YYYY-MM-DD")))
+}
+
+/// `_today()`: the UTC date of the clock (not [`local_today`]: the series windows ignore the watch's offset).
+pub fn today_utc() -> NaiveDate {
+    now_instant().date_naive()
+}
+
+/// `_window`: `(from, to)` of the `days` (clamped to `1..=cap`) ending on `end_date`, or on today's UTC date
+/// when it is absent or empty. `OverflowError` where the start leaves Python's date range.
+pub fn window(
+    days: i64,
+    end_date: Option<&PyStr>,
+    cap: i64,
+) -> Result<(String, String), ReadError> {
+    let days = days.clamp(1, cap);
+    let end = match end_date.filter(|text| !text.is_empty()) {
+        Some(text) => parse_day(text, "end_date")?,
+        None => today_utc(),
+    };
+    let start = shift(end, 1 - days)?;
+    Ok((iso(start), iso(end)))
+}
+
+/// `source_scope not in contract.SOURCE_SCOPES` -> `ValueError`, else the scopes to read: the one named,
+/// or all of them (an empty text is not a scope: it fails the check).
+pub fn scopes_for(
+    contract: &Contract,
+    source_scope: Option<&PyStr>,
+) -> Result<Vec<String>, ReadError> {
+    let Some(requested) = source_scope else {
+        return Ok(contract.source_scopes.clone());
+    };
+    match requested
+        .to_text()
+        .filter(|name| contract.source_scopes.contains(name))
+    {
+        Some(name) => Ok(vec![name]),
+        None => {
+            let names: Vec<String> = contract
+                .source_scopes
+                .iter()
+                .map(|name| pyrepr::repr_str(name))
+                .collect();
+            Err(ReadError::Value(format!(
+                "source_scope must be one of ({})",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
 /// `date + timedelta(days=days)`, with Python's range: years 1 to 9999, else `OverflowError`.
 pub fn shift(date: NaiveDate, days: i64) -> Result<NaiveDate, ReadError> {
     Duration::try_days(days)
         .and_then(|delta| date.checked_add_signed(delta))
         .filter(|moved| (1..=9999).contains(&moved.year()))
-        .ok_or(ReadError::Unexpected("OverflowError"))
+        .ok_or(ReadError::Overflow)
 }
 
 /// `date.isoformat()`.
@@ -164,7 +223,7 @@ pub(crate) fn local_day(
 ) -> Result<String, ReadError> {
     offsets
         .local_date_checked(moment, before)
-        .ok_or(ReadError::Unexpected("OverflowError"))
+        .ok_or(ReadError::Overflow)
 }
 
 /// A float that goes into a response: Python's encoder refuses a non-finite one (`ValueError`).

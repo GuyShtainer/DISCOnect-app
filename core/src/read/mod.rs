@@ -18,6 +18,7 @@ use crate::contract::ContractError;
 pub mod coverage;
 pub mod health;
 pub mod insight;
+pub mod mcp_paths;
 pub mod numerics;
 pub mod pyrepr;
 pub mod queries;
@@ -35,6 +36,10 @@ pub enum ReadError {
     /// Python raised something unexpected here (`internal`, reported as `unexpected <name>`).
     #[error("unexpected {0}")]
     Unexpected(&'static str),
+    /// Python raised an `OverflowError` here (`date value out of range`, a float too large): `serve`
+    /// reports `unexpected OverflowError`; the Rust MCP shows `Error executing tool <name>` and no text.
+    #[error("unexpected OverflowError")]
+    Overflow,
     #[error(transparent)]
     Contract(#[from] ContractError),
 }
