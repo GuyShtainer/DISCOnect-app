@@ -290,6 +290,29 @@ fn network_types_appear_only_in_the_coach_egress_module() {
 }
 
 #[test]
+fn child_processes_are_spawned_only_by_the_sidecar_module() {
+    // `std::process::id()` (a unique temp-folder name) is not a spawn; naming `Command` or `Stdio` is.
+    // Verified when this test was written: `src/sidecar.rs` is the only file that names `Command` (it starts the
+    // bundled core); `lib.rs` and `inproc.rs` do not. `tests/inproc.rs` spawns the CLI, but a test file is not
+    // shipped code and is outside `src/`.
+    let src = manifest().join("src");
+    let sidecar = src.join("sidecar.rs");
+    assert!(sidecar.is_file(), "the one spawning file exists");
+    let files = files_under(&src, "rs");
+    assert!(files.len() >= 6, "the sources are where the test looks: {files:?}");
+    for path in files {
+        if path == sidecar {
+            continue;
+        }
+        let code = text(&path);
+        for word in ["Command::new", "process::Command", "std::process::{", "process::{", "Stdio::", "tokio::process"] {
+            assert!(!code.contains(word), "{} names `{word}` outside sidecar.rs", path.display());
+        }
+    }
+    assert!(text(&sidecar).contains("Command::new("), "the pin would be empty if the sidecar stopped spawning");
+}
+
+#[test]
 fn the_coach_module_never_prints_logs_or_formats_with_debug() {
     let coach = manifest().join("src").join("coach");
     let files = files_under(&coach, "rs");
