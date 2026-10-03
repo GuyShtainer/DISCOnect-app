@@ -57,6 +57,24 @@ error that never repeats the value) and `caps::fit` (a byte budget per tool, wit
 The contract answer is never sent. The table of kept and dropped fields, tool by tool, is the module doc of
 `src-tauri/src/coach/views.rs`; the drawer that shows the user what the model can see cites it.
 
+## Coach egress
+
+The coach is **off by default**, and while it is off no network client exists. When it is on, every byte that leaves
+goes through one function, `egress::send` in `src-tauri/src/coach/egress.rs` (source and dependency guards in
+`tests/egress_guards.rs` fail the build if anything else names a network type). The rules: `https://` to any host;
+plain `http://` only to `localhost` or a literal loopback or private IP (127/8, ::1, 10/8, 172.16/12, 192.168/16,
+fc00::/7, fe80::/10), so a DNS name over plain http is refused, which closes DNS rebinding without pinning an
+address; a URL with a user name or password is refused; no proxy (`HTTP_PROXY` is never read); no redirects (a
+3xx is an error); 10 s to connect, 120 s overall; requests up to 1 MiB, answers up to 4 MiB; the request carries
+`Content-Type`, the bearer key when there is one, and ureq's `Host`, `User-Agent` (`disconect-coach/<version>`) and
+`Accept`, nothing else (`tests/coach_egress.rs` reads them off a real loopback socket). TLS is `rustls` with the
+operating system's trust store. Errors are a closed set with fixed messages: a status number at most, never the
+provider's text, the address or the key. **The key** is in the macOS keychain under the service `disconect-coach`
+(a quiet read, never a dialog; after a rebuild the old item reads as stale and the key is asked for again) or
+only in memory for the session; it is never in a file. **The settings file** is `coach.json` in the app config folder
+(never the data folder): mode, address, model name, whether a key is in the keychain, whether data points may be
+shared; nothing secret.
+
 ## Build and run
 ```sh
 tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build -> .app -> ad-hoc sign
