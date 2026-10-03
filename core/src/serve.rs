@@ -813,9 +813,13 @@ fn import_worker(job: ImportJob) {
     if let Some(gate) = &job.hold {
         let _ = gate.recv();
     }
-    let line = match run_import(&job) {
-        Ok(result) => result_line(&job.id, &result),
-        Err(failure) => failure_line(&job.id, &failure),
+    // a panic inside the import must still free the slot and answer the request (Python answers
+    // `internal` for any unexpected exception; a silently dead worker would leave `busy` forever)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_import(&job)));
+    let line = match outcome {
+        Ok(Ok(result)) => result_line(&job.id, &result),
+        Ok(Err(failure)) => failure_line(&job.id, &failure),
+        Err(_) => failure_line(&job.id, &Failure::serve("internal", "unexpected panic in the import worker")),
     };
     job.slot.store(false, Ordering::SeqCst);
     let _ = job.channel.write_line(&line);

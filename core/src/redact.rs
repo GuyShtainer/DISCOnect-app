@@ -16,10 +16,12 @@ static EMAIL: LazyLock<Pattern> = LazyLock::new(|| compile(r"[A-Za-z0-9._%+-]+@[
 /// ids, not decimals like 12.3456789
 static LONG_NUMBER_REDACT: LazyLock<Pattern> = LazyLock::new(|| compile(r"(?<![\d.])\d{7,}(?!\d|\.\d)"));
 static LONG_NUMBER_LABEL: LazyLock<Pattern> = LazyLock::new(|| compile(r"\d{7,}"));
+// Python's `\s` on `str` also matches U+001C..U+001F (they are `str.isspace`); the regex crate's
+// `\s` does not, so the classes name them explicitly (opus review of slice 3).
 static POSIX_PATH: LazyLock<Pattern> =
-    LazyLock::new(|| compile(r#"(?:(?<=\s)|^|(?<=['"(:]))/(?:[^\s'"()]+/)+[^\s'"()]*"#));
+    LazyLock::new(|| compile(r#"(?:(?<=[\s\x1c-\x1f])|^|(?<=['"(:]))/(?:[^\s\x1c-\x1f'"()]+/)+[^\s\x1c-\x1f'"()]*"#));
 static WINDOWS_PATH: LazyLock<Pattern> =
-    LazyLock::new(|| compile(r#"[A-Za-z]:\\(?:[^\s'"()\\]+\\)*[^\s'"()\\]*"#));
+    LazyLock::new(|| compile(r#"[A-Za-z]:\\(?:[^\s\x1c-\x1f'"()\\]+\\)*[^\s\x1c-\x1f'"()\\]*"#));
 
 /// Replace every match of `pattern` in `text` with `with`; a pattern that failed to compile or a
 /// runtime backtrack error leaves the rest of the text untouched.
@@ -68,5 +70,12 @@ mod tests {
         assert_eq!(redact_text("open '/Users/x/y.fit' failed"), "open '{path}' failed");
         assert_eq!(redact_text(r"C:\Users\x\y.fit gone"), "{path} gone");
         assert_eq!(redact_text("mail me@x.io now"), "mail {email} now");
+    }
+
+    #[test]
+    fn python_isspace_control_characters_count_as_path_boundaries() {
+        // U+001C..U+001F are `str.isspace` in Python, so its `\s` treats them as a boundary
+        assert_eq!(redact_text("nothing\u{1c}/Users/someone/secret"), "nothing\u{1c}{path}");
+        assert_eq!(redact_text("x\u{1f}C:\\Users\\x\\y.fit"), "x\u{1f}{path}");
     }
 }
