@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params, params_from_iter};
 
 use crate::canon::{self, Value};
@@ -290,6 +291,10 @@ pub fn import_path(
                 import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
             })
             .and_then(|()| export::import_connect_export(path, &mut writer, reborrow(&mut progress)))
+            .and_then(|()| {
+                let touched: Vec<String> = writer.stats.streams.keys().cloned().collect();
+                rederive_json(conn, &mut writer, &touched)
+            })
     } else {
         iter_fit_files(path).and_then(|files| {
             import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
@@ -331,35 +336,36 @@ pub fn parse_stored_json(blob: &[u8]) -> Result<Value, (&'static str, String)> {
     })
 }
 
-/// `_reparse_readiness`: redecode every `json:readiness` raw record of the store together, in
-/// one batch (rowid order), and rewrite the canonical rows of every one of them. A record whose
-/// stored bytes fail to parse is recorded as a failure and left out of the batch. A record that
-/// is not a JSON object is the oracle's uncaught `AttributeError`.
-pub fn reparse_readiness(conn: &Connection, writer: &mut Writer<'_>) -> Result<(), SourceError> {
+/// A `json:readiness` record the batch chose facts for: `(raw_id, decoded, summary)`.
+type ReadinessChoice = (i64, Box<Decoded>, Value);
+/// A stored record whose bytes fail to parse: `(raw_id, class, message)`.
+type Unreadable = (i64, &'static str, String);
+
+/// `_decode_readiness_batch`: decode every `json:readiness` raw record of the store together.
+/// Returns the records the batch chose facts for and `(raw_id, class, message)` per record whose
+/// stored bytes fail to parse (left out of the batch; it does not block the rest). Records are fed
+/// in `payload_hash` order so the decoder's dedup on `timestamp` does not depend on arrival
+/// order. A record that is not a JSON object is the oracle's uncaught `AttributeError`.
+fn decode_readiness_stored(
+    conn: &Connection,
+) -> Result<(Vec<ReadinessChoice>, Vec<Unreadable>), SourceError> {
     let rows: Vec<(i64, String, Vec<u8>)> = {
-        let mut stmt = conn.prepare("SELECT id, source_key, payload FROM raw_records WHERE stream='json:readiness' ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, source_key, payload FROM raw_records WHERE stream='json:readiness' ORDER BY payload_hash, id",
+        )?;
         let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         mapped.collect::<Result<_, _>>()?
     };
     let mut records = Vec::with_capacity(rows.len());
     let mut raw_id_by_key: HashMap<String, i64> = HashMap::new();
+    let mut unreadable = Vec::new();
     for (raw_id, source_key, blob) in rows {
         match parse_stored_json(&blob) {
             Ok(record) => {
                 records.push(record);
                 raw_id_by_key.insert(source_key, raw_id);
             }
-            Err((class, message)) => writer.record_parse_failure(
-                "json:readiness",
-                &format!("raw_record:{raw_id}"),
-                class,
-                &message,
-                None,
-                None,
-                Some(raw_id),
-                None,
-                true,
-            )?,
+            Err((class, message)) => unreadable.push((raw_id, class, message)),
         }
     }
     if let Some(bad) = records.iter().find(|r| !matches!(r, Value::Object(_))) {
@@ -372,13 +378,112 @@ pub fn reparse_readiness(conn: &Connection, writer: &mut Writer<'_>) -> Result<(
     if let Some(message) = abort {
         return Err(SourceError::Abort(message));
     }
+    let mut chosen = Vec::new();
     for step in steps {
         let Step::Record { key, decoded, .. } = step else { continue };
         let Some(&raw_id) = raw_id_by_key.get(&key) else {
             continue; // decoder derived a key with no matching stored record
         };
         let summary = json_summary(&decoded);
+        chosen.push((raw_id, decoded, summary));
+    }
+    Ok((chosen, unreadable))
+}
+
+/// `_reparse_readiness`: redecode every `json:readiness` raw record of the store together, in
+/// one batch, and rewrite the canonical rows of every one of them. A record whose stored bytes
+/// fail to parse is recorded as a failure and left out of the batch.
+pub fn reparse_readiness(conn: &Connection, writer: &mut Writer<'_>) -> Result<(), SourceError> {
+    let (chosen, unreadable) = decode_readiness_stored(conn)?;
+    for (raw_id, class, message) in unreadable {
+        writer.record_parse_failure(
+            "json:readiness",
+            &format!("raw_record:{raw_id}"),
+            class,
+            &message,
+            None,
+            None,
+            Some(raw_id),
+            None,
+            true,
+        )?;
+    }
+    for (raw_id, decoded, summary) in chosen {
         writer.rewrite_canonical(raw_id, "json:readiness", &decoded, &summary)?;
+    }
+    Ok(())
+}
+
+/// `rederive_json`: make the daily rows of the JSON `streams` a pure function of the raw records
+/// stored now (bet 10b). Run at the end of every import and every pull, so devices that converged
+/// on the same raw set converge on the same days whatever order the records arrived in. In one
+/// transaction inside the caller's run (no `import_runs` row of its own, no import statistics or
+/// provenance bumped: the records were just counted when they were written) the canonical rows
+/// those streams' raw records produced are deleted and rebuilt record by record in the content
+/// order of [`raw_ids_by_stream`], so a record a relay supersession removed stops contributing
+/// and a runner-up it hid contributes again.
+///
+/// `json:readiness` is the one batch stream: when it is among `streams` it is redecoded together
+/// after its rows were cleared, never per record. Names that are not `json:` are ignored; FIT
+/// streams and the FIT-derived `local` rows are untouched.
+///
+/// Everything is decoded before anything is deleted. A stored record that no longer decodes keeps
+/// the rows it has and is not reported here (`reparse_all` records and repairs such failures): an
+/// unrelated import must not lose data or turn `partial`.
+pub fn rederive_json(conn: &Connection, writer: &mut Writer<'_>, streams: &[String]) -> Result<(), SourceError> {
+    let mut scope: Vec<String> = streams.iter().filter(|s| s.starts_with("json:")).cloned().collect();
+    scope.sort();
+    scope.dedup();
+    if scope.is_empty() {
+        return Ok(());
+    }
+    let assumed = writer.offsets.assumed_utc();
+    writer.offsets = ClockOffsets::load(conn)?; // what a reparse would see
+    writer.offsets.set_assumed_utc(assumed);
+    let mut decodable: Vec<(i64, Decoded)> = Vec::new();
+    let mut undecodable: Vec<i64> = Vec::new();
+    for (raw_id, stream) in raw_ids_by_stream(conn, Some(&scope))? {
+        if export::is_batch_stream(&stream) {
+            continue;
+        }
+        match decode_raw(conn, raw_id) {
+            Ok((_, decoded, _)) => decodable.push((raw_id, decoded)),
+            Err(RawDecodeError::Other { caught: false, class, message }) => {
+                return Err(SourceError::Abort(format!("{class}: {message}")));
+            }
+            Err(_) => undecodable.push(raw_id),
+        }
+    }
+    let mut readiness: Vec<ReadinessChoice> = Vec::new();
+    if scope.iter().any(|s| s == "json:readiness") {
+        let (chosen, unreadable) = decode_readiness_stored(conn)?;
+        readiness = chosen;
+        undecodable.extend(unreadable.into_iter().map(|(raw_id, _, _)| raw_id));
+    }
+    let dropped_before = writer.stats.dropped.clone();
+    conn.execute_batch("BEGIN")?;
+    let run = |writer: &mut Writer<'_>| -> rusqlite::Result<()> {
+        delete_canonical(conn, Some(&scope), &undecodable)?;
+        for (raw_id, decoded) in &decodable {
+            writer.write_canonical(decoded, *raw_id)?;
+        }
+        for (raw_id, decoded, summary) in &readiness {
+            writer.write_canonical(decoded, *raw_id)?;
+            conn.execute(
+                "UPDATE raw_records SET decode_summary=? WHERE id=?",
+                params![canon::dumps_spaced(summary), raw_id],
+            )?;
+        }
+        Ok(())
+    };
+    let outcome = run(writer);
+    writer.stats.dropped = dropped_before; // a re-derive re-counts nothing the import already counted
+    match outcome {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(error.into());
+        }
     }
     Ok(())
 }
@@ -494,17 +599,22 @@ pub fn reparse_record(conn: &Connection, writer: &mut Writer<'_>, raw_id: i64) -
     }
 }
 
-/// `(id, stream)` for every raw record, oldest `start_utc` first, optionally filtered by stream.
+/// `(id, stream)` for every raw record in an order that depends on content alone: oldest
+/// `start_utc` first (NULL first), ties by `payload_hash`, `stream`, `source_key`, never the local
+/// `id`, so two stores holding the same raw set fold it identically.
 fn raw_ids_by_stream(conn: &Connection, streams: Option<&[String]>) -> rusqlite::Result<Vec<(i64, String)>> {
     let (sql, bound): (String, Vec<&String>) = match streams {
         Some(list) if !list.is_empty() => {
             let marks = vec!["?"; list.len()].join(",");
             (
-                format!("SELECT id, stream FROM raw_records WHERE stream IN ({marks}) ORDER BY start_utc, id"),
+                format!("SELECT id, stream FROM raw_records WHERE stream IN ({marks}) ORDER BY start_utc, payload_hash, stream, source_key"),
                 list.iter().collect(),
             )
         }
-        _ => ("SELECT id, stream FROM raw_records ORDER BY start_utc, id".to_string(), Vec::new()),
+        _ => (
+            "SELECT id, stream FROM raw_records ORDER BY start_utc, payload_hash, stream, source_key".to_string(),
+            Vec::new(),
+        ),
     };
     let mut stmt = conn.prepare(&sql)?;
     let mapped = stmt.query_map(params_from_iter(bound), |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -531,35 +641,45 @@ fn dry_run(conn: &Connection, rows: &[(i64, String)]) -> Result<Vec<Failure>, So
     Ok(failures)
 }
 
-/// `_clear_canonical`: delete every canonical row the raw records in scope produced, in one transaction.
-fn clear_canonical(conn: &Connection, streams: Option<&[String]>) -> rusqlite::Result<()> {
-    let (scope_sql, bound): (String, Vec<&String>) = match streams {
+/// `_delete_canonical`: delete every canonical row the raw records in scope produced, except the
+/// rows of the raw ids in `keep`. The caller owns the transaction.
+fn delete_canonical(conn: &Connection, streams: Option<&[String]>, keep: &[i64]) -> rusqlite::Result<()> {
+    let (mut scope_sql, mut bound): (String, Vec<SqlValue>) = match streams {
         Some(list) if !list.is_empty() => {
             let marks = vec!["?"; list.len()].join(",");
-            (format!("raw_record_id IN (SELECT id FROM raw_records WHERE stream IN ({marks}))"), list.iter().collect())
+            (
+                format!("raw_record_id IN (SELECT id FROM raw_records WHERE stream IN ({marks}))"),
+                list.iter().cloned().map(SqlValue::Text).collect(),
+            )
         }
         _ => ("raw_record_id IS NOT NULL".to_string(), Vec::new()),
     };
+    if !keep.is_empty() {
+        scope_sql.push_str(&format!(" AND raw_record_id NOT IN ({})", vec!["?"; keep.len()].join(",")));
+        bound.extend(keep.iter().copied().map(SqlValue::Integer));
+    }
+    conn.execute(
+        &format!("DELETE FROM sleep_stages WHERE sleep_id IN (SELECT sleep_id FROM sleep_sessions WHERE {scope_sql})"),
+        params_from_iter(bound.iter()),
+    )?;
+    for table in [
+        "metric_samples",
+        "daily_metrics",
+        "daily_labels",
+        "monitoring_intervals",
+        "activities",
+        "clock_offsets",
+        "sleep_sessions",
+    ] {
+        conn.execute(&format!("DELETE FROM {table} WHERE {scope_sql}"), params_from_iter(bound.iter()))?;
+    }
+    Ok(())
+}
+
+/// `_clear_canonical`: [`delete_canonical`] in one transaction.
+fn clear_canonical(conn: &Connection, streams: Option<&[String]>) -> rusqlite::Result<()> {
     conn.execute_batch("BEGIN")?;
-    let run = || -> rusqlite::Result<()> {
-        conn.execute(
-            &format!("DELETE FROM sleep_stages WHERE sleep_id IN (SELECT sleep_id FROM sleep_sessions WHERE {scope_sql})"),
-            params_from_iter(bound.iter()),
-        )?;
-        for table in [
-            "metric_samples",
-            "daily_metrics",
-            "daily_labels",
-            "monitoring_intervals",
-            "activities",
-            "clock_offsets",
-            "sleep_sessions",
-        ] {
-            conn.execute(&format!("DELETE FROM {table} WHERE {scope_sql}"), params_from_iter(bound.iter()))?;
-        }
-        Ok(())
-    };
-    match run() {
+    match delete_canonical(conn, streams, &[]) {
         Ok(()) => conn.execute_batch("COMMIT"),
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");

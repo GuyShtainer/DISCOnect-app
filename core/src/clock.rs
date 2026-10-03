@@ -61,6 +61,11 @@ impl ClockOffsets {
         self.assumed_utc.get()
     }
 
+    /// Carry the count of assumed-UTC dates over to a reloaded table.
+    pub fn set_assumed_utc(&self, count: u64) {
+        self.assumed_utc.set(count);
+    }
+
     /// Insert, or replace the offset stated for the very same moment.
     pub fn add(&mut self, offset: ClockOffset) {
         let key = offset.ts_utc.timestamp();

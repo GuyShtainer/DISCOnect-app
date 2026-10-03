@@ -572,7 +572,6 @@ fn apply_pending(
     half_applied: &HashSet<String>,
     result: &mut PullResult,
 ) -> Result<(), SyncError> {
-    let mut readiness_arrived = false;
     let mut applied: Vec<Applied> = Vec::new();
     let mut reparse_streams: BTreeSet<String> = BTreeSet::new();
     for name in pending {
@@ -636,9 +635,6 @@ fn apply_pending(
                 mark_existing(conn, record, name)?;
             }
         }
-        readiness_arrived |= jsons
-            .iter()
-            .any(|(r, _)| export::is_batch_stream(&r.stream));
         for (record, data) in &jsons {
             let Some((record_value, facts)) = decode_json(&record.stream, data, Some(record))?
             else {
@@ -695,9 +691,10 @@ fn apply_pending(
             count: records.len(),
         });
     }
-    if readiness_arrived {
-        sources::reparse_readiness(conn, writer)?;
-    }
+    // daily rows are a pure function of the raw set: every JSON stream a record was written to
+    // (new, or a conflict winner that replaced the loser) is rebuilt in content order
+    let touched: Vec<String> = writer.stats.streams.keys().cloned().collect();
+    sources::rederive_json(conn, writer, &touched)?;
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
     if !reparse_streams.is_empty() {

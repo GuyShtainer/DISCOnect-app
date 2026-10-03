@@ -567,7 +567,7 @@ impl<'c> Writer<'c> {
 
     // ---- canonical rows ----
 
-    fn write_canonical(&mut self, decoded: &Decoded, raw_id: i64) -> rusqlite::Result<i64> {
+    pub(crate) fn write_canonical(&mut self, decoded: &Decoded, raw_id: i64) -> rusqlite::Result<i64> {
         let conn = self.conn;
         let scope = decoded.source_scope.as_str();
         let device = &decoded.device_id;
