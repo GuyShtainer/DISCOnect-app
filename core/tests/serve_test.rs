@@ -448,3 +448,62 @@ fn the_dependency_tree_has_no_network_crate_but_the_lan_relays_client() {
     }
     assert!(!source("src/serve.rs").contains("relay::lan"), "serve talks to the relay only through `relay::config`");
 }
+
+/// The `dependencies` list of one `[[package]]` block of a lock file (crate names only).
+fn lock_deps(lock: &str, package: &str) -> Vec<String> {
+    let block = lock
+        .split("[[package]]")
+        .find(|b| b.lines().any(|l| l == format!("name = \"{package}\"")))
+        .unwrap_or_else(|| panic!("{package} is in the lock file"));
+    let mut deps = Vec::new();
+    let mut inside = false;
+    for line in block.lines() {
+        if line.starts_with("dependencies = [") {
+            inside = true;
+        } else if inside && line == "]" {
+            break;
+        } else if inside {
+            let entry = line.trim().trim_end_matches(',').trim_matches('"');
+            deps.push(entry.split(' ').next().unwrap_or_default().to_string());
+        }
+    }
+    deps
+}
+
+/// Bet 15 BACKLOG (closed 2026-10-03): the core's own lock links `ureq` without TLS, but inside the desktop app
+/// Cargo unifies the app's `ureq` features (`rustls`, `platform-verifier`, for the coach) into the one `ureq` the
+/// core's LAN relay client also uses, so that binary *could* speak https. It never does: the relay's URL rule
+/// refuses anything but `http://host[:port]` before a client exists. This test reads both lock files and pins the
+/// rule, so the unification stays harmless rather than unnoticed.
+#[test]
+fn the_apps_lock_turns_ureqs_tls_on_and_the_relay_url_rule_keeps_it_unused() {
+    use disconect_core::relay::lan::parse_base_url;
+    let own = lock_deps(&source("Cargo.lock"), "ureq");
+    assert!(
+        !own.iter().any(|d| d.starts_with("rustls") || d == "webpki-roots"),
+        "the core's own ureq must stay without TLS: {own:?}"
+    );
+    let app_lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/src-tauri/Cargo.lock");
+    match std::fs::read_to_string(&app_lock) {
+        Ok(text) => {
+            let unified = lock_deps(&text, "ureq");
+            assert!(
+                unified.iter().any(|d| d == "rustls"),
+                "the app's lock no longer unifies rustls into ureq ({unified:?}): this guard and the BACKLOG note are stale"
+            );
+        }
+        Err(_) => eprintln!("no app lock file next to this crate: only the core's own lock was checked"),
+    }
+    for url in [
+        "https://127.0.0.1:8080",
+        "https://relay.example",
+        "HTTPS://relay.example",
+        "http://user:pw@127.0.0.1:8080",
+        "ftp://127.0.0.1",
+        "127.0.0.1:8080",
+        "http://127.0.0.1:8080/path",
+    ] {
+        assert!(parse_base_url(url).is_err(), "{url} must be refused");
+    }
+    assert_eq!(parse_base_url("http://127.0.0.1:8080").as_deref(), Ok("http://127.0.0.1:8080"));
+}
