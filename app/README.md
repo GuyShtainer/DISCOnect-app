@@ -105,6 +105,17 @@ returned with a reply (each tool call with the exact JSON that left, for the "wh
 itself on the next question. `tests/coach_loop.rs` proves the bytes: a scripted provider over the serve oracle's
 answers, five evals, and one scenario replayed through the real egress against a `127.0.0.1` listener.
 
+## Coach probe and screens
+
+`coach_probe` (`src-tauri/src/coach/probe.rs`) asks the saved endpoint two made-up questions and runs no tool and no core
+call, so it works on a locked store. Round 1 offers the five tools and reads whether the model calls one; round 2 sends a
+filler of 12 000 tokens (4 bytes each, `max_tokens: 1`) and compares the endpoint's `usage.prompt_tokens` with it: under 85 %
+means the server cut the prompt (Ollama reads 4k tokens unless `num_ctx` is raised). The screens are **Coach** (conversation,
+the "what the model can see" drawer, first-use card, the disclaimer line on every visit) and **Coach settings** (mode,
+address, model, key, test). Launch them with `--screen coach` or `--screen coach-settings`. Model text is drawn with
+`textContent` only, after `neutralText()` in `src/identity.ts`; `tests/test_lint_app.py` bans markup-parsing APIs, and every
+`invoke` call lives in `src/core.ts`. Layout notes: `../disconect/docs/design/coach-panel.md`.
+
 ## Build and run
 ```sh
 tools/build-app.sh                 # Rust + PyInstaller sidecars -> tauri build -> .app -> ad-hoc sign
