@@ -234,15 +234,36 @@ fn reqwest_and_hyper_are_not_in_the_desktop_build_and_reach_the_lock_only_throug
 }
 
 #[test]
-fn the_http_client_is_only_the_cores_ureq_until_slice_4_and_no_tls_stack_is_present() {
+fn the_http_client_is_ureq_and_rustls_is_only_its_tls() {
     let graph = lock_graph(&text(&manifest().join("Cargo.lock")));
-    assert!(graph.contains_key("ureq"), "ureq arrives through disconect-core (the LAN relay's client)");
-    assert!(
-        !cargo_section_keys(&text(&manifest().join("Cargo.toml")), "dependencies").contains("ureq"),
-        "the app crate takes ureq in slice 4, together with rustls, behind coach/egress.rs"
+    let manifest_text = text(&manifest().join("Cargo.toml"));
+    // slice 4: the app takes ureq (default features off) for `coach/egress.rs`, with rustls and the OS trust store
+    let ureq_line = manifest_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("ureq"))
+        .expect("the app crate depends on ureq since slice 4");
+    assert!(ureq_line.contains("default-features = false"), "{ureq_line}");
+    assert!(ureq_line.contains("\"rustls\"") && ureq_line.contains("\"platform-verifier\""), "{ureq_line}");
+    assert!(!ureq_line.contains("native-tls"), "{ureq_line}");
+    let direct = cargo_section_keys(&manifest_text, "dependencies");
+    for tls_crate in ["rustls", "ring", "aws-lc-rs", "webpki-roots", "rustls-platform-verifier", "native-tls"] {
+        assert!(!direct.contains(tls_crate), "{tls_crate} must arrive only as ureq's TLS, not as a direct dependency");
+    }
+    // rustls is in the lock, and the only crates that depend on it are ureq and ureq's platform verifier
+    assert_eq!(
+        dependents_of(&graph, "rustls"),
+        BTreeSet::from(["ureq".to_string(), "rustls-platform-verifier".to_string()]),
+        "rustls must be ureq's TLS and nothing else's"
     );
-    // Slice 4 flips this: rustls then appears, and only as ureq's TLS (its dependents become {ureq}).
-    assert!(!graph.contains_key("rustls"), "rustls is not expected before slice 4");
+    assert_eq!(dependents_of(&graph, "rustls-platform-verifier"), BTreeSet::from(["ureq".to_string()]));
+    // the crypto provider is `ring` (no cmake or Go toolchain); aws-lc-rs is not in the tree
+    assert!(graph.contains_key("ring"), "ring is rustls's provider");
+    assert!(!graph.contains_key("aws-lc-rs") && !graph.contains_key("aws-lc-sys"), "aws-lc needs cmake/Go to build");
+    // and the host build still has no second HTTP client
+    let host = host_crates();
+    for banned in ["reqwest", "hyper", "h2", "isahc", "attohttpc", "minreq", "surf"] {
+        assert!(!host.contains(banned), "{banned} is compiled into the desktop app");
+    }
 }
 
 // ---- the sources ---------------------------------------------------------------------------------

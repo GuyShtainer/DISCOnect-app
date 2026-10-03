@@ -27,6 +27,12 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 # The core in-process (Bet 12a): `inproc.rs` runs a `serve::Session` on a thread. The core is built
 # with THIS crate's profiles, so the release stanza below governs it too (same optimisation, plus LTO).
 disconect-core = { path = "../../core" }
+# Bet 15 slice 4: the coach's one egress point (`src/coach/egress.rs`). `rustls` brings the `ring` crypto
+# provider; `platform-verifier` makes the OS trust store the root of trust for a user-chosen cloud endpoint.
+# Nothing else in this crate may name `ureq` (tests/egress_guards.rs). The core links the same ureq for the LAN relay.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+# Already in the tree through tauri and ureq; the coach's endpoint rules parse with it.
+url = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -53,3 +59,5 @@ opt-level = 3
 # Reads `tauri.conf.json` + the platform file exactly as `tauri-build` does (tests/mobile_config.rs);
 # already in the tree through `tauri-build`, so no new crate is compiled.
 tauri-utils = { version = "2", features = ["config-json5"] }
+# Already in the tree through the core; the key-account test recomputes the id the code hard-codes.
+sha2 = "0.11"
