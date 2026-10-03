@@ -1,7 +1,9 @@
-//! DISCOnect desktop shell (Bet 7). Rust holds no business logic: every command is a thin
-//! relay to the core (Rust by default, Python via `--core hearthbeat`) through [`sidecar`], and the
-//! webview draws what the core answers.
+//! DISCOnect app shell (Bet 7, Bet 12). Rust holds no business logic: every command is a thin
+//! relay to the core through [`sidecar`], and the webview draws what the core answers. The core is
+//! the Rust port as a sidecar child (macOS release), in this process ([`inproc`]; debug builds and
+//! phones), or the Python one via `--core hearthbeat`.
 
+pub mod inproc;
 pub mod sidecar;
 
 use std::sync::Arc;
@@ -10,7 +12,9 @@ use serde_json::Value;
 use tauri::{Emitter, Manager, RunEvent, State};
 use zeroize::Zeroizing;
 
-use sidecar::{CoreChoice, CoreError, EventSink, Launch, Sidecar};
+use sidecar::{CoreError, EventSink, Plan, Sidecar};
+#[cfg(desktop)]
+use sidecar::{CoreChoice, Launch};
 
 /// The core, or why it is not there. Stored in Tauri state so commands can reach it.
 pub struct Core(pub Result<Sidecar, CoreError>);
@@ -86,9 +90,45 @@ async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreErr
     core_of(&state)?.unlock(pass).await
 }
 
-fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
+/// The store the in-process core serves, resolved here and handed over explicitly (the core is
+/// never left to look at `$HOME` itself). Desktop: `--db` from argv, else the binary's own rule
+/// (`$DISCONECT_DB`, else `~/.disconect/disconect.db`, or the legacy folder while only it exists).
+/// A phone: a file in the app's private data folder.
+#[cfg(desktop)]
+fn inproc_db(_app: &tauri::AppHandle, core_note: &mut Vec<String>) -> Result<std::path::PathBuf, CoreError> {
+    if let Some(db) = Launch::db_from_args(std::env::args()) {
+        return Ok(db.into()); // taken literally, like the binary's `--db`
+    }
+    let default = disconect_core::home::resolve_default_db()
+        .ok_or_else(|| CoreError { code: "core_unavailable".into(), message: "no store: pass --db <path> or set DISCONECT_DB (HOME is not set)".into() })?;
+    if let Some(legacy) = default.legacy_home {
+        core_note.push(disconect_core::home::legacy_home_hint(legacy));
+    }
+    Ok(default.path)
+}
+
+#[cfg(not(desktop))]
+fn inproc_db(app: &tauri::AppHandle, _core_note: &mut Vec<String>) -> Result<std::path::PathBuf, CoreError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| CoreError { code: "core_unavailable".into(), message: format!("no app data folder: {e}") })?;
+    Ok(dir.join("disconect.db"))
+}
+
+fn start_inproc(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
+    let mut notes = Vec::new();
+    let db = inproc_db(app, &mut notes)?;
+    let core = Sidecar::start_inproc(db, Arc::new(WindowSink(app.clone())))?;
+    for line in notes {
+        core.note(line);
+    }
+    Ok(core)
+}
+
+#[cfg(desktop)]
+fn start_sidecar(app: &tauri::AppHandle, choice: Option<CoreChoice>) -> Result<Sidecar, CoreError> {
     let resource_dir = app.path().resource_dir().ok();
-    let choice = CoreChoice::from_args(std::env::args()).map_err(|message| CoreError { code: "core_unavailable".into(), message })?;
     let program = sidecar::locate_core(resource_dir.as_deref(), choice).ok_or_else(|| CoreError {
         code: "core_unavailable".into(),
         message: match choice {
@@ -98,6 +138,21 @@ fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
     })?;
     let db = Launch::db_from_args(std::env::args());
     Sidecar::start(Launch::new(program, db), Arc::new(WindowSink(app.clone())))
+}
+
+fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
+    #[cfg(desktop)]
+    let choice = CoreChoice::from_args(std::env::args()).map_err(|message| CoreError { code: "core_unavailable".into(), message })?;
+    #[cfg(not(desktop))]
+    let choice = None; // a phone's argv is not ours
+    let env_core = std::env::var_os("DISCONECT_CORE");
+    match sidecar::plan(choice, cfg!(debug_assertions), cfg!(desktop), env_core.as_deref()) {
+        Plan::InProcess => start_inproc(app),
+        #[cfg(desktop)]
+        Plan::Sidecar(choice) => start_sidecar(app, choice),
+        #[cfg(not(desktop))]
+        Plan::Sidecar(_) => Err(CoreError { code: "core_unavailable".into(), message: "this platform has no sidecar".into() }),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

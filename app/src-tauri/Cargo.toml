@@ -1,7 +1,7 @@
 [package]
 name = "disconect-app"
 version = "0.1.0"
-description = "DISCOnect desktop shell over the Python core (sidecar)"
+description = "DISCOnect app shell over the Rust core (in-process, or the sidecar on a macOS release)"
 authors = ["Guy Shtainer"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
@@ -24,6 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+# The core in-process (Bet 12a): `inproc.rs` runs a `serve::Session` on a thread. The core is built
+# with THIS crate's profiles, so the release stanza below governs it too (same optimisation, plus LTO).
+disconect-core = { path = "../../core" }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -31,5 +34,17 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# `unwind`, not `abort`: with the core in-process, a panic in fitparser on a malformed file must not
+# take the app down. Two `catch_unwind` sites turn it into a per-file failure: `fit.rs` (around
+# `processor.deserialize_next`) and `serve.rs::import_worker` (around the whole import). Under
+# `panic = "abort"` both are dead code and the process dies. `tests/inproc.rs` reads this file and
+# fails if the value changes.
+panic = "unwind"
 strip = true
+
+# Argon2id at the production cost (256 MiB, t = 3) is unusably slow unoptimised; dependency profiles
+# of `disconect-core`'s own manifest do not apply when it is a dependency, so they are repeated here.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

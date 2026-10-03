@@ -1,18 +1,24 @@
-//! The bridge to the core (`disconect-core` serve, or `hearthbeat-core` via `--core hearthbeat`), protocol in
-//! `projects/disconect/docs/serve-protocol.md`. One long-lived child per app; JSON Lines over
-//! stdio; the webview and this process never hold the database key.
+//! The bridge to the core, protocol in `projects/disconect/docs/serve-protocol.md`. The core is one
+//! of three things: `disconect-core` serve as a supervised child (the sidecar, release default),
+//! `hearthbeat-core` (the Python rollback), or `disconect-core` **in-process** on a thread
+//! ([`crate::inproc`]; the debug default and the only choice on a phone). All three speak JSON Lines
+//! and feed the one [`Router`], so the webview and the commands in `lib.rs` cannot tell them apart;
+//! the webview and this process never hold the database key.
 //!
 //! Rules enforced here (pitch 07, "Protocol rules"): env allowlist on spawn, request ids,
 //! per-method timeouts, one restart after a crash, stderr drained into a bounded buffer that is
 //! never logged, the child killed on exit, and the passphrase carried only as `Zeroizing`
-//! bytes that are written straight to the pipe. No business logic lives in Rust.
+//! bytes that are written straight to the pipe (or the in-process channel). No business logic
+//! lives in Rust.
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(desktop)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(desktop)]
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -20,11 +26,23 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
+use crate::inproc::{self, InProcCore, LineSink, Runner};
+
 /// Environment variables the child may inherit. Everything else, the passphrase env above
 /// all, is dropped so a shell-launched app can never unlock through the tests-only path.
+/// (An in-process core has no such filter; see `inproc.rs`.)
+#[cfg(desktop)]
 const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "DISCONECT_DB", "DISCONECT_KEYS", "TMPDIR", "LANG"];
 const STDERR_LINES_KEPT: usize = 200;
 const MAX_RESTARTS: u32 = 1;
+/// What an in-process `app.info.core` gains, so the About card says where the core runs.
+const INPROC_SUFFIX: &str = " (in-process)";
+
+/// A poisoned lock still guards intact data here (every critical section is a map or queue
+/// operation), and with `panic = "unwind"` a panicking thread must not take the bridge with it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// An error the webview can act on. `code` mirrors the protocol's string codes plus the
 /// bridge's own: `core_exited`, `core_unavailable`, `timeout`, `bad_response`.
@@ -35,7 +53,7 @@ pub struct CoreError {
 }
 
 impl CoreError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
         Self { code: code.to_string(), message: message.into() }
     }
 }
@@ -78,22 +96,93 @@ impl Launch {
     }
 }
 
-struct Running {
-    child: Child,
-    stdin: ChildStdin,
-}
+type Reply = Result<Value, CoreError>;
 
-struct Inner {
-    launch: Launch,
-    running: Mutex<Option<Running>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, CoreError>>>>,
+/// The id-to-oneshot router and the event forwarder: the one place a protocol line from any core
+/// lands. The child's stdout reader and the in-process writer both call [`Self::route_line`].
+pub struct Router {
+    pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
-    restarts: AtomicU64,
-    stderr_tail: Mutex<VecDeque<String>>,
     sink: Arc<dyn EventSink>,
 }
 
-/// Handle to the supervised child. Cheap to clone; all clones share the one process.
+impl Router {
+    fn new(sink: Arc<dyn EventSink>) -> Arc<Self> {
+        Arc::new(Self { pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1), sink })
+    }
+
+    /// A response goes to its caller by id; an event goes to the window as `core://<name>`.
+    pub fn route_line(&self, line: &str) {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            return; // not protocol: the child isolates its stdout, so this is defensive only
+        };
+        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+            self.deliver(id, msg);
+        } else if let Some(name) = msg.get("event").and_then(Value::as_str) {
+            self.sink.emit(&format!("core://{name}"), msg.clone());
+        }
+    }
+
+    fn deliver(&self, id: u64, msg: Value) {
+        let Some(tx) = lock(&self.pending).remove(&id) else { return };
+        let outcome = match (msg.get("result"), msg.get("error")) {
+            (Some(r), _) => Ok(r.clone()),
+            (None, Some(e)) => Err(serde_json::from_value::<CoreError>(e.clone())
+                .unwrap_or_else(|_| CoreError::new("bad_response", "malformed error from the core"))),
+            _ => Err(CoreError::new("bad_response", "response without result or error")),
+        };
+        let _ = tx.send(outcome);
+    }
+
+    fn register(&self) -> (u64, oneshot::Receiver<Reply>) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        lock(&self.pending).insert(id, tx);
+        (id, rx)
+    }
+
+    fn forget(&self, id: u64) {
+        lock(&self.pending).remove(&id);
+    }
+
+    /// Fail every caller still waiting (the core went away).
+    fn fail_all(&self, code: &str, message: &str) {
+        let pending: Vec<_> = lock(&self.pending).drain().collect();
+        for (_, tx) in pending {
+            let _ = tx.send(Err(CoreError::new(code, message)));
+        }
+    }
+}
+
+impl LineSink for Router {
+    fn line(&self, line: &str) {
+        self.route_line(line);
+    }
+}
+
+/// How the core is reached.
+enum Backend {
+    #[cfg(desktop)]
+    Child(Launch),
+    InProc { db: PathBuf, runner: Runner },
+}
+
+enum Running {
+    #[cfg(desktop)]
+    Child { child: Child, stdin: ChildStdin },
+    InProc(InProcCore),
+}
+
+struct Inner {
+    backend: Backend,
+    running: Mutex<Option<Running>>,
+    router: Arc<Router>,
+    restarts: AtomicU64,
+    stderr_tail: Mutex<VecDeque<String>>,
+}
+
+/// Handle to the supervised core (a child process or an in-process thread). Cheap to clone; all
+/// clones share the one core.
 #[derive(Clone)]
 pub struct Sidecar(Arc<Inner>);
 
@@ -110,24 +199,62 @@ pub fn timeout_for(method: &str) -> Option<Duration> {
 }
 
 impl Sidecar {
-    /// Start the child now; a failure to start is returned, not retried.
-    pub fn start(launch: Launch, sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
-        let inner = Arc::new(Inner {
-            launch,
+    fn with_backend(backend: Backend, sink: Arc<dyn EventSink>) -> Self {
+        Self(Arc::new(Inner {
+            backend,
             running: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+            router: Router::new(sink),
             restarts: AtomicU64::new(0),
             stderr_tail: Mutex::new(VecDeque::new()),
-            sink,
-        });
-        let me = Self(inner);
+        }))
+    }
+
+    /// Start the child now; a failure to start is returned, not retried.
+    #[cfg(desktop)]
+    pub fn start(launch: Launch, sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
+        let me = Self::with_backend(Backend::Child(launch), sink);
         me.spawn()?;
         Ok(me)
     }
 
+    /// Start the core in this process on a thread, serving the store at `db` (always explicit).
+    pub fn start_inproc(db: PathBuf, sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
+        Self::start_inproc_with(db, inproc::serve_runner, sink)
+    }
+
+    /// [`Self::start_inproc`] with the thread's body supplied (tests make it panic).
+    #[doc(hidden)]
+    pub fn start_inproc_with(db: PathBuf, runner: Runner, sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
+        let me = Self::with_backend(Backend::InProc { db, runner }, sink);
+        me.spawn()?;
+        Ok(me)
+    }
+
+    pub fn is_inproc(&self) -> bool {
+        matches!(self.0.backend, Backend::InProc { .. })
+    }
+
     fn spawn(&self) -> Result<(), CoreError> {
-        let launch = &self.0.launch;
+        match &self.0.backend {
+            #[cfg(desktop)]
+            Backend::Child(launch) => self.spawn_child(launch),
+            Backend::InProc { db, runner } => {
+                let me = self.clone();
+                let core = inproc::start(db.clone(), *runner, self.0.router.clone(), move |panicked| {
+                    if panicked {
+                        me.note("the in-process core stopped on an internal error");
+                    }
+                    me.on_exit(None);
+                })
+                .map_err(|e| CoreError::new("core_unavailable", format!("cannot start the core: {e}")))?;
+                *lock(&self.0.running) = Some(Running::InProc(core));
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(desktop)]
+    fn spawn_child(&self, launch: &Launch) -> Result<(), CoreError> {
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
             .env_clear()
@@ -142,17 +269,20 @@ impl Sidecar {
         let mut child = cmd
             .spawn()
             .map_err(|e| CoreError::new("core_unavailable", format!("cannot start the core: {e}")))?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        *self.0.running.lock().unwrap() = Some(Running { child, stdin });
+        let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CoreError::new("core_unavailable", "cannot reach the core's pipes"));
+        };
+        *lock(&self.0.running) = Some(Running::Child { child, stdin });
         self.drain_stderr(stderr);
         self.read_protocol(stdout);
         Ok(())
     }
 
+    #[cfg(desktop)]
     fn drain_stderr(&self, stderr: std::process::ChildStderr) {
-        let inner = self.0.clone();
+        let me = self.clone();
         std::thread::spawn(move || {
             // read_until + lossy decoding: a non-UTF-8 byte must never stop the drain, or the
             // child blocks once the pipe fills.
@@ -162,113 +292,111 @@ impl Sidecar {
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let line = String::from_utf8_lossy(&buf).trim_end().to_string();
-                        let mut tail = inner.stderr_tail.lock().unwrap();
-                        if tail.len() == STDERR_LINES_KEPT {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
+                    Ok(_) => me.note(String::from_utf8_lossy(&buf).trim_end()),
                 }
             }
         });
     }
 
+    #[cfg(desktop)]
     fn read_protocol(&self, stdout: std::process::ChildStdout) {
         let me = self.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                me.handle_line(&line);
+                me.0.router.route_line(&line);
             }
-            me.on_exit();
+            let status = me.reap();
+            me.on_exit(status);
         });
     }
 
-    fn handle_line(&self, line: &str) {
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            return; // not protocol: the child isolates its stdout, so this is defensive only
-        };
-        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-            self.deliver(id, msg);
-        } else if let Some(name) = msg.get("event").and_then(Value::as_str) {
-            self.0.sink.emit(&format!("core://{name}"), msg.clone());
+    /// The core's stdout closed (child) or its thread ended (in-process): fail every caller,
+    /// then restart once.
+    fn on_exit(&self, status: Option<i32>) {
+        if matches!(self.0.backend, Backend::InProc { .. }) {
+            lock(&self.0.running).take(); // our own, finished core; a shutdown already took it
         }
-    }
-
-    fn deliver(&self, id: u64, msg: Value) {
-        let Some(tx) = self.0.pending.lock().unwrap().remove(&id) else { return };
-        let outcome = match (msg.get("result"), msg.get("error")) {
-            (Some(r), _) => Ok(r.clone()),
-            (None, Some(e)) => Err(serde_json::from_value::<CoreError>(e.clone())
-                .unwrap_or_else(|_| CoreError::new("bad_response", "malformed error from the core"))),
-            _ => Err(CoreError::new("bad_response", "response without result or error")),
-        };
-        let _ = tx.send(outcome);
-    }
-
-    /// The child's stdout closed: fail every caller, then restart once.
-    fn on_exit(&self) {
-        let status = self.reap();
-        let pending: Vec<_> = self.0.pending.lock().unwrap().drain().collect();
-        for (_, tx) in pending {
-            let _ = tx.send(Err(CoreError::new("core_exited", "the core stopped while answering")));
-        }
+        self.0.router.fail_all("core_exited", "the core stopped while answering");
         let n = self.0.restarts.fetch_add(1, Ordering::SeqCst) + 1;
+        let sink = &self.0.router.sink;
         if n <= MAX_RESTARTS as u64 && self.spawn().is_ok() {
-            self.0.sink.emit("core://restarted", serde_json::json!({ "attempt": n, "exit": status }));
+            sink.emit("core://restarted", serde_json::json!({ "attempt": n, "exit": status }));
         } else {
-            self.0.sink.emit("core://exited", serde_json::json!({ "exit": status }));
+            sink.emit("core://exited", serde_json::json!({ "exit": status }));
         }
     }
 
+    #[cfg(desktop)]
     fn reap(&self) -> Option<i32> {
-        let mut guard = self.0.running.lock().unwrap();
-        let mut r = guard.take()?;
-        r.child.wait().ok().and_then(|s| s.code())
+        let taken = lock(&self.0.running).take()?;
+        match taken {
+            Running::Child { mut child, .. } => child.wait().ok().and_then(|s| s.code()),
+            Running::InProc(_) => None,
+        }
     }
 
-    /// Last stderr lines of the child, for a diagnostics panel. Never written to any log here.
+    /// Keep one diagnostic line (bounded; never written to any log here).
+    pub fn note(&self, line: impl Into<String>) {
+        let mut tail = lock(&self.0.stderr_tail);
+        if tail.len() == STDERR_LINES_KEPT {
+            tail.pop_front();
+        }
+        tail.push_back(line.into());
+    }
+
+    /// Last diagnostic lines: the child's stderr, or the in-process core's notices.
     pub fn stderr_tail(&self) -> Vec<String> {
-        self.0.stderr_tail.lock().unwrap().iter().cloned().collect()
+        lock(&self.0.stderr_tail).iter().cloned().collect()
     }
 
     fn write_line(&self, line: &[u8]) -> Result<(), CoreError> {
-        let mut guard = self.0.running.lock().unwrap();
-        let Some(r) = guard.as_mut() else {
+        let mut guard = lock(&self.0.running);
+        let Some(running) = guard.as_mut() else {
             return Err(CoreError::new("core_unavailable", "the core is not running"));
         };
-        r.stdin
-            .write_all(line)
-            .and_then(|_| r.stdin.write_all(b"\n"))
-            .and_then(|_| r.stdin.flush())
-            .map_err(|e| CoreError::new("core_unavailable", format!("cannot reach the core: {e}")))
-    }
-
-    fn register(&self) -> (u64, oneshot::Receiver<Result<Value, CoreError>>) {
-        let id = self.0.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.0.pending.lock().unwrap().insert(id, tx);
-        (id, rx)
+        match running {
+            #[cfg(desktop)]
+            Running::Child { stdin, .. } => stdin
+                .write_all(line)
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush())
+                .map_err(|e| CoreError::new("core_unavailable", format!("cannot reach the core: {e}"))),
+            Running::InProc(core) => core
+                .send(line)
+                .map_err(|e| CoreError::new("core_unavailable", format!("cannot reach the core: {e}"))),
+        }
     }
 
     async fn await_reply(
         &self,
         id: u64,
-        rx: oneshot::Receiver<Result<Value, CoreError>>,
+        rx: oneshot::Receiver<Reply>,
         timeout: Option<Duration>,
-    ) -> Result<Value, CoreError> {
+    ) -> Reply {
         let fut = async { rx.await.unwrap_or_else(|_| Err(CoreError::new("core_exited", "the core went away"))) };
         match timeout {
             None => fut.await,
             Some(t) => match tokio::time::timeout(t, fut).await {
                 Ok(r) => r,
                 Err(_) => {
-                    self.0.pending.lock().unwrap().remove(&id);
+                    self.0.router.forget(id);
                     Err(CoreError::new("timeout", "the core did not answer in time"))
                 }
             },
         }
+    }
+
+    /// `app.info.core` names where the core runs when it runs in this process.
+    fn annotate(&self, method: &str, reply: Reply) -> Reply {
+        if method != "app.info" || !self.is_inproc() {
+            return reply;
+        }
+        reply.map(|mut v| {
+            if let Some(core) = v.get("core").and_then(Value::as_str).map(|c| format!("{c}{INPROC_SUFFIX}")) {
+                v["core"] = Value::String(core);
+            }
+            v
+        })
     }
 
     /// Any method; `key.unlock` only without a passphrase (the keychain path), because a
@@ -282,20 +410,21 @@ impl Sidecar {
         if method == "key.unlock" && params.get("passphrase").is_some() {
             return Err(CoreError::new("bad_params", "use the unlock path for key.unlock"));
         }
-        let (id, rx) = self.register();
+        let (id, rx) = self.0.router.register();
         let line = serde_json::to_vec(&serde_json::json!({ "id": id, "method": method, "params": params }))
             .map_err(|e| CoreError::new("bad_params", e.to_string()))?;
         if let Err(e) = self.write_line(&line) {
-            self.0.pending.lock().unwrap().remove(&id);
+            self.0.router.forget(id);
             return Err(e);
         }
-        self.await_reply(id, rx, timeout).await
+        let reply = self.await_reply(id, rx, timeout).await;
+        self.annotate(method, reply)
     }
 
     /// `key.unlock` with the passphrase held only in zeroized buffers: the request line is
     /// built into a `Zeroizing<Vec<u8>>`, written, and wiped when this function returns.
     pub async fn unlock(&self, passphrase: Zeroizing<String>) -> Result<Value, CoreError> {
-        let (id, rx) = self.register();
+        let (id, rx) = self.0.router.register();
         let line = {
             #[derive(Serialize)]
             struct Req<'a> {
@@ -314,40 +443,51 @@ impl Sidecar {
         drop(line);
         drop(passphrase);
         if let Err(e) = written {
-            self.0.pending.lock().unwrap().remove(&id);
+            self.0.router.forget(id);
             return Err(e);
         }
         self.await_reply(id, rx, timeout_for("key.unlock")).await
     }
 
-    /// Stop the child (on app exit). Stdin closes first so a healthy core exits by itself.
+    /// Stop the core (on app exit). A child's stdin closes first so a healthy core exits by
+    /// itself, then it is killed after 2 s; an in-process core's input ends the same way and a
+    /// thread still busy after 2 s (a long import) is left to the process exit.
     pub fn shutdown(&self) {
         self.0.restarts.store(MAX_RESTARTS as u64 + 1, Ordering::SeqCst);
-        let mut guard = self.0.running.lock().unwrap();
-        if let Some(mut r) = guard.take() {
-            drop(r.stdin);
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if matches!(r.child.try_wait(), Ok(Some(_))) {
-                    return;
+        // taken out first: the core's own end-of-run path locks `running` too
+        let taken = lock(&self.0.running).take();
+        match taken {
+            None => {}
+            #[cfg(desktop)]
+            Some(Running::Child { mut child, stdin }) => {
+                drop(stdin);
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let _ = child.kill();
+                let _ = child.wait();
             }
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+            Some(Running::InProc(core)) => core.close_for(Duration::from_secs(2)),
         }
     }
 }
 
-/// Which bundled core the app should run. Chosen by `--core hearthbeat|disconect` on the app's
-/// own argv (rollback switch, pitch 11d step 3); never by an environment variable or a path,
-/// because the executable that receives the passphrase must be one the bundle ships.
+/// Which core the app should run. Chosen by `--core hearthbeat|disconect|inproc` on the app's
+/// own argv (rollback switch, pitch 11d step 3); never by an environment variable or a path
+/// (debug builds apart, see [`plan`]), because the executable that receives the passphrase must be
+/// one the bundle ships. `inproc` runs no executable at all: the core is this process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreChoice {
     /// `disconect-core`, the Rust port.
     Disconect,
     /// `hearthbeat-core`, the PyInstaller Python core (also the MCP server).
     Hearthbeat,
+    /// `disconect-core` as a library, on a thread of the app (Bet 12a). No child, no bundle.
+    InProcess,
 }
 
 impl CoreChoice {
@@ -356,6 +496,7 @@ impl CoreChoice {
         match self {
             Self::Disconect => "disconect",
             Self::Hearthbeat => "hearthbeat",
+            Self::InProcess => "inproc",
         }
     }
 
@@ -365,7 +506,7 @@ impl CoreChoice {
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
             let value = if a == "--core" {
-                it.next().ok_or_else(|| "--core needs a value (hearthbeat or disconect)".to_string())?
+                it.next().ok_or_else(|| "--core needs a value (hearthbeat, disconect or inproc)".to_string())?
             } else if let Some(rest) = a.strip_prefix("--core=") {
                 rest.to_string()
             } else {
@@ -374,7 +515,8 @@ impl CoreChoice {
             return match value.as_str() {
                 "disconect" => Ok(Some(Self::Disconect)),
                 "hearthbeat" => Ok(Some(Self::Hearthbeat)),
-                other => Err(format!("--core must be hearthbeat or disconect, not {other:?}")),
+                "inproc" => Ok(Some(Self::InProcess)),
+                other => Err(format!("--core must be hearthbeat, disconect or inproc, not {other:?}")),
             };
         }
         Ok(None)
@@ -393,7 +535,33 @@ pub fn locate_bundled(dir: &Path, choice: Option<CoreChoice>) -> Option<PathBuf>
     match choice {
         Some(CoreChoice::Disconect) => bundled(dir, "disconect-core"),
         Some(CoreChoice::Hearthbeat) => bundled(dir, "hearthbeat-core"),
+        Some(CoreChoice::InProcess) => None,
         None => bundled(dir, "disconect-core").or_else(|| bundled(dir, "hearthbeat-core")),
+    }
+}
+
+/// What `start_core` does, decided without touching the process: the core in this process, or a
+/// sidecar child (with the `--core` choice, if any, for [`locate_core`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    InProcess,
+    Sidecar(Option<CoreChoice>),
+}
+
+/// The selection rule. On a phone (`desktop == false`) the only core is in-process. On the
+/// desktop `--core inproc` always selects it; with no `--core`, a **debug** build runs in-process
+/// unless `DISCONECT_CORE` names an executable (`DISCONECT_CORE=inproc` is the explicit spelling),
+/// and a **release** build runs the bundled sidecar: the keychain item the app shares with
+/// `disconect-core mcp` is bound to the program that made it, so a release app that unlocked
+/// in-process would own a different item than the sidecar it replaces (kb/23 class 5).
+pub fn plan(choice: Option<CoreChoice>, debug_build: bool, desktop: bool, env_core: Option<&std::ffi::OsStr>) -> Plan {
+    if !desktop {
+        return Plan::InProcess;
+    }
+    match (choice, debug_build) {
+        (Some(CoreChoice::InProcess), _) => Plan::InProcess,
+        (None, true) if env_core.is_none_or(|v| v == "inproc") => Plan::InProcess,
+        (choice, _) => Plan::Sidecar(choice),
     }
 }
 
@@ -403,6 +571,9 @@ pub fn locate_bundled(dir: &Path, choice: Option<CoreChoice>) -> Option<PathBuf>
 /// the dev venv's `disconect-serve`; release builds never let an environment variable pick
 /// the executable that receives the passphrase.
 pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> Option<PathBuf> {
+    if choice == Some(CoreChoice::InProcess) {
+        return None;
+    }
     #[cfg(debug_assertions)]
     if choice.is_none() {
         if let Some(p) = std::env::var_os("DISCONECT_CORE") {
@@ -413,7 +584,7 @@ pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> O
         return Some(p);
     }
     #[cfg(debug_assertions)]
-    if choice != Some(CoreChoice::Disconect) {
+    if matches!(choice, None | Some(CoreChoice::Hearthbeat)) {
         let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../disconect/.venv/bin/disconect-serve");
         if dev.is_file() {
             return Some(dev);
@@ -498,6 +669,38 @@ mod tests {
         assert_eq!(timeout_for("import.run"), None);
         assert_eq!(timeout_for("key.status"), Some(Duration::from_secs(60)));
         assert_eq!(timeout_for("data.metric"), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn inproc_is_a_core_choice_and_never_a_located_executable() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(CoreChoice::from_args(args(&["app", "--core", "inproc"])), Ok(Some(CoreChoice::InProcess)));
+        assert_eq!(CoreChoice::from_args(args(&["app", "--core=inproc"])), Ok(Some(CoreChoice::InProcess)));
+        let both = bundle_with(&["disconect-core", "hearthbeat-core"]);
+        assert_eq!(locate_bundled(both.0.as_path(), Some(CoreChoice::InProcess)), None);
+        assert_eq!(locate_core(Some(both.0.as_path()), Some(CoreChoice::InProcess)), None);
+    }
+
+    #[test]
+    fn selection_debug_is_inproc_release_is_the_sidecar() {
+        use std::ffi::OsStr;
+        // debug, nothing said: in-process; a path in DISCONECT_CORE keeps the old dev loop
+        assert_eq!(plan(None, true, true, None), Plan::InProcess);
+        assert_eq!(plan(None, true, true, Some(OsStr::new("inproc"))), Plan::InProcess);
+        assert_eq!(plan(None, true, true, Some(OsStr::new("/x/disconect-core"))), Plan::Sidecar(None));
+        // release, nothing said: the sidecar, and no environment variable moves it
+        assert_eq!(plan(None, false, true, None), Plan::Sidecar(None));
+        assert_eq!(plan(None, false, true, Some(OsStr::new("inproc"))), Plan::Sidecar(None));
+        // argv wins in both builds
+        for debug in [true, false] {
+            assert_eq!(plan(Some(CoreChoice::InProcess), debug, true, None), Plan::InProcess);
+            assert_eq!(plan(Some(CoreChoice::Disconect), debug, true, None), Plan::Sidecar(Some(CoreChoice::Disconect)));
+            assert_eq!(plan(Some(CoreChoice::Hearthbeat), debug, true, None), Plan::Sidecar(Some(CoreChoice::Hearthbeat)));
+        }
+        // a phone has no other choice, whatever argv or build says
+        for choice in [None, Some(CoreChoice::Disconect), Some(CoreChoice::Hearthbeat), Some(CoreChoice::InProcess)] {
+            assert_eq!(plan(choice, false, false, None), Plan::InProcess);
+        }
     }
 
     #[test]
