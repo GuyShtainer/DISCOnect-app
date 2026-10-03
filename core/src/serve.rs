@@ -9,6 +9,10 @@
 //! [`METHODS`] answers `unknown_method` (never a new error code, never a fake result); the list of what
 //! was once absent is [`crate::read::DEFERRED_METHODS`], now empty.
 //!
+//! `tools.call` (Bet 15, slice 2) answers what the MCP tool of that name would, through an
+//! [`crate::mcp::Server`] built from the session's store and master key, so the app's coach loop has no third
+//! implementation of the six tools; see [`tools_call`].
+//!
 //! `import.run` is the one asynchronous method: the request loop validates it, takes the import slot
 //! and starts a worker thread that holds the write lock, streams `progress` events and writes the
 //! response when it is done (so a read such as `import.last` is answered while it runs); at EOF the loop
@@ -51,6 +55,9 @@ use crate::contract::{Contract, ContractError};
 use crate::identity::{self, NOTICE, PRODUCT};
 use crate::keychain::{self, KeychainError, KeychainState};
 use crate::keys::{self, KeyError, Secret32};
+use crate::mcp::Server as ToolServer;
+use crate::mcp_args::coerce;
+use crate::mcp_tools::{Outcome, TOOLS, rejection_names, spec_text};
 use crate::read::ReadError;
 use crate::read::coverage::{self, NOT_COVERED, PRESENT};
 use crate::read::health;
@@ -332,6 +339,15 @@ fn result_line(id: &Id, result: &Value) -> String {
     line
 }
 
+fn ordered_result_line(id: &Id, result: &Json) -> String {
+    let mut line = String::from("{\"id\":");
+    wirejson::write_json_id(&mut line, id);
+    line.push_str(",\"result\":");
+    wirejson::write_json(&mut line, result, None);
+    line.push('}');
+    line
+}
+
 fn error_line(id: &Id, code: &str, message: &str) -> String {
     let mut line = String::from("{\"id\":");
     wirejson::write_json_id(&mut line, id);
@@ -441,6 +457,8 @@ pub struct Call {
 #[derive(Clone, Copy)]
 pub enum Handler {
     Reply(fn(&mut Session, &Call) -> Result<Value, Failure>),
+    /// Like `Reply`, with a result that keeps the order of its keys (`tools.call`: the MCP's own tool output).
+    Ordered(fn(&mut Session, &Call) -> Result<Json, Failure>),
     /// Validates, then starts a thread that writes the response itself (`import.run`).
     Spawn(fn(&mut Session, &Call) -> Result<(), Failure>),
 }
@@ -459,6 +477,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("import.last", Handler::Reply(import_last)),
     ("sync.status", Handler::Reply(sync_status)),
     ("sync.run", Handler::Spawn(sync_run)),
+    ("tools.call", Handler::Ordered(tools_call)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -1084,6 +1103,52 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     }
 }
 
+// ---- tools ----
+
+/// What the MCP tool `name` answers to `arguments` (`structuredContent`), read from this session's store: the
+/// coach loop of the desktop app reaches the six read-only tools through here, so each tool has one
+/// implementation per core. The tool runs on an [`ToolServer`] built from the session's store and master key;
+/// arguments are coerced by [`coerce`] as the MCP does. Failures: `invalid_params` (`name` is not a non-empty
+/// string, `arguments` is not an object, or the arguments do not fit the tool: the message names the
+/// parameters at fault, never a value), `unknown_tool`, and `tool_error` (the tool's own error text, or the
+/// crash text of `mcp.json`).
+fn tools_call(session: &mut Session, call: &Call) -> Result<Json, Failure> {
+    session.require_unlocked()?;
+    let invalid = |message: &str| Failure::serve("invalid_params", message);
+    let name = match call.params.get("name") {
+        Some(Json::Str(text)) if !text.is_empty() => text,
+        _ => return Err(invalid("name must be a non-empty string")),
+    };
+    let empty = Json::dict();
+    let arguments = match call.params.get("arguments") {
+        None | Some(Json::Null) => &empty,
+        Some(object @ Json::Object(_)) => object,
+        Some(_) => return Err(invalid("arguments must be an object")),
+    };
+    let Some(tool) = TOOLS.iter().find(|tool| name.equals(tool.name)) else {
+        return Err(Failure::serve(
+            "unknown_tool",
+            spec_text(&["errors", "unknown_tool"]).replace("{name}", &name.units_lossy()),
+        ));
+    };
+    let args = coerce(tool.params, arguments)
+        .map_err(|rejected| invalid(&rejection_names(&rejected)))?;
+    let server = ToolServer::new(session.db_path.clone(), session.unlocked.clone());
+    match (tool.run)(&server, &args) {
+        Outcome::Done(json) => {
+            let mut answer = Json::dict();
+            answer.set("name", Json::text(tool.name));
+            answer.set("result", json);
+            Ok(answer)
+        }
+        Outcome::Failed(message) => Err(Failure::serve("tool_error", message)),
+        Outcome::Crashed => Err(Failure::serve(
+            "tool_error",
+            spec_text(&["errors", "crash"]).replace("{name}", tool.name),
+        )),
+    }
+}
+
 // ---- the loop ----
 
 /// A line that is not a usable request; the id is [`Id::None`] when not even an id could be read.
@@ -1137,6 +1202,10 @@ fn dispatch(session: &mut Session, call: &Call) -> Option<String> {
     match handler {
         Handler::Reply(handler) => Some(match handler(session, call) {
             Ok(result) => result_line(&call.id, &result),
+            Err(failure) => failure_line(&call.id, &failure),
+        }),
+        Handler::Ordered(handler) => Some(match handler(session, call) {
+            Ok(result) => ordered_result_line(&call.id, &result),
             Err(failure) => failure_line(&call.id, &failure),
         }),
         Handler::Spawn(handler) => match handler(session, call) {

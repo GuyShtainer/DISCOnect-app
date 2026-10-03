@@ -311,6 +311,15 @@ pub(crate) fn changed_store_text() -> String {
     )
 }
 
+/// The message of a serve `invalid_params` failure for rejected arguments: the parameters at fault, sorted
+/// (`serve.py` words it from pydantic's error locations the same way). No reason and no value.
+pub(crate) fn rejection_names(rejected: &[(&str, &str)]) -> String {
+    let mut names: Vec<&str> = rejected.iter().map(|(param, _)| *param).collect();
+    names.sort_unstable();
+    names.dedup();
+    format!("arguments rejected: {}", names.join(", "))
+}
+
 pub(crate) fn rejection(tool: &Tool, rejected: &[(&str, &str)]) -> String {
     let plural = if rejected.len() == 1 { "" } else { "s" };
     let mut text = format!(
