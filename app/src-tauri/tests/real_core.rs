@@ -7,7 +7,7 @@
 //!     cargo test --test real_core -- --ignored --nocapture
 //!
 //! DISCONECT_CORE is the BUNDLED sidecar (it serves without arguments and runs the CLI with
-//! `cli`). The scratch DB must be a copy, never ~/.hearthbeat/hearthbeat.db; the passphrase file is
+//! `cli`). The scratch DB must be a copy, never the live store (~/.disconect/disconect.db, or the legacy ~/.hearthbeat/hearthbeat.db); the passphrase file is
 //! read once into a zeroized buffer and never printed. With DISCONECT_TEST_IMPORT set, the second
 //! test imports that folder through the bridge on copy A and through the CLI on an identical copy
 //! B, and the counts must agree (acceptance item 3).
