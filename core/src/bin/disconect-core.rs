@@ -3,6 +3,10 @@
 //! stdio; the default store is `$DISCONECT_DB`, else `~/.disconect/disconect.db` (or the old
 //! `~/.hearthbeat/hearthbeat.db` while only that exists; see `disconect_core::home`).
 //!
+//! `disconect-core mcp [--db <path>] [--passphrase-file <file>]` is the MCP server over stdio (`disconect_core::mcp`, `mcp_start`, `mcp_tools`):
+//! the same store resolution as `serve`; exit 9 before reading stdin when the store is encrypted and its key is
+//! not in the keychain. `--passphrase-file` is for the test harness; `DISCONECT_PASSPHRASE` is never read.
+//!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
 //!  | sync push|pull|status|forget [--relay <folder> [--remember]]`
 //!
@@ -21,6 +25,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use disconect_core::keys::{self, KeyError, PassphraseSource};
+use disconect_core::mcp_start as mcp;
 use disconect_core::home;
 use disconect_core::identity;
 use disconect_core::serve;
@@ -72,7 +77,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--relay" => relay = Some(it.next().ok_or("--relay needs a folder")?),
             "--remember" => remember = true,
-            "status" | "init" | "import" | "sync" | "serve" if command.is_none() => command = Some(arg),
+            "status" | "init" | "import" | "sync" | "serve" | "mcp" if command.is_none() => command = Some(arg),
             "push" | "pull" | "status" | "forget"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
@@ -419,6 +424,49 @@ fn run_serve(args: &Args) -> ExitCode {
     ExitCode::from(u8::try_from(serve::run(db, &warnings)).unwrap_or(1))
 }
 
+/// `mcp`: scrub the secret variables (and, in a release build, the test switches) before any thread exists,
+/// then unlock and speak MCP on stdio.
+fn run_mcp(args: &Args) -> ExitCode {
+    let unexpected = args.json
+        || args.import_path.is_some()
+        || args.transport.is_some()
+        || args.sync_action.is_some()
+        || args.relay.is_some()
+        || args.remember;
+    if unexpected {
+        eprintln!("error: mcp takes only --db <path> and --passphrase-file <file>");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let passphrase = match args.passphrase_file.as_ref().map(read_passphrase) {
+        Some(Ok(phrase)) => Some(phrase),
+        Some(Err(message)) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(EXIT_USAGE);
+        }
+        None => None,
+    };
+    let db = match args.db.clone() {
+        Some(db) => db,
+        None => {
+            let Some(default) = home::resolve_default_db() else {
+                eprintln!("error: no store: pass --db <path> or set DISCONECT_DB (HOME is not set)");
+                return ExitCode::from(1);
+            };
+            if let Some(legacy) = default.legacy_home {
+                eprintln!("{}", home::legacy_home_hint(legacy));
+            }
+            default.path
+        }
+    };
+    if keys::scrub_env_secrets() {
+        eprintln!("{} is ignored by mcp and was removed from the environment", keys::PASSPHRASE_ENV);
+    }
+    if !cfg!(debug_assertions) {
+        mcp::scrub_test_switches();
+    }
+    ExitCode::from(u8::try_from(mcp::run(mcp::Options { db, passphrase })).unwrap_or(1))
+}
+
 fn main() -> ExitCode {
     disconect_core::fit::silence_parser_panics();
     let args = match parse_args() {
@@ -433,6 +481,9 @@ fn main() -> ExitCode {
     }
     if args.command.is_none() {
         return run_serve(&args);
+    }
+    if args.command.as_deref() == Some("mcp") {
+        return run_mcp(&args);
     }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
