@@ -12,9 +12,11 @@
 //! marker): there is no constructor from a string, so no raw tool answer can reach a request. This is the
 //! type-level half of the guarantee the capture tests check on the bytes.
 //!
-//! **The tools** are the five of `disconect-core/mcp.json` with their descriptions and input schemas as the
-//! file has them (JSON-schema `title` keys, which are generator noise, are stripped); `get_contract` is not
-//! sent. `mcp.json`'s `instructions` text is the MCP server's and is never used here.
+//! **The tools** are the five of `disconect-core/mcp.json` with their input schemas as the file has them
+//! (JSON-schema `title` keys, which are generator noise, are stripped) and the coach's **own descriptions**
+//! ([`COACH_DESCRIPTIONS`]): the MCP file's describe fields the projection drops (import provenance, recent
+//! imports, the stage timeline) and carry prose the provider has no use for, so they stay with the MCP server.
+//! `get_contract` is not sent. `mcp.json`'s `instructions` text is the MCP server's and is never used here.
 //!
 //! **The reply** is read by [`parse_response`], tolerant of extra fields (usage details, `system_fingerprint`,
 //! `refusal`, ...) and strict about what the loop needs. [`WireError`] is a closed enum with fixed messages and
@@ -201,6 +203,20 @@ pub struct FunctionSpec {
 /// `mcp.json`, embedded (the core embeds the same file for the MCP server; its table is private there).
 const MCP_JSON: &str = include_str!("../../../../core/mcp.json");
 
+/// What the provider is told each tool returns: the projected answer ([`super::views`]), nothing the
+/// projection drops. One entry per sendable tool, in `mcp.json`'s order; a tool without one is not offered.
+pub const COACH_DESCRIPTIONS: [(&str, &str); 5] = [
+    ("get_data_health", "What data exists: per metric and source scope, how many days are present, and which days in the window are present, failed, source_empty or not_covered, as day ranges; counts of sleep nights and activities; how closely the sources agree. Use it to tell 'never imported' from 'the source had nothing' before reading a gap as a change."),
+    ("get_metric_series", "Daily values of one or more metrics (see the metric enum) over a window ending today or end_date, newest first. Daily metrics return {date, value}; sample metrics (heart_rate, stress, respiration_rate, spo2, hrv_rmssd) return per-day {date, min, mean, max, samples}; label metrics return a label per day. Each series states its unit and source_scope; scopes are never merged. A day without a value has no row; nothing is filled in. Unknown metric names are counted, not errors."),
+    ("get_sleep_detail", "One night: total minutes, minutes per stage, the ordered list of stages with their lengths, the score breakdown and overnight SpO2, heart rate and respiration. Every source's record of the night is returned side by side. Omit date for the latest night. No bedtime or wake time: only the night's date and its structure."),
+    ("list_activities", "Recent recorded workouts, newest first: date, sport, sub_sport, duration, distance, calories, average and maximum heart rate, ascent and descent. No time of day, no routes, no coordinates. A workout's date is its UTC date and can be the neighbouring day near midnight."),
+    ("get_period_facts", "Deterministic facts: the last window_days (default 7) of every metric with data, compared with this person's own baseline over the baseline_days (default 28) before it. Each fact carries value, direction, delta, z_score, confidence (high, medium, low or insufficient, by baseline days with data), a reason_code and the evidence dates. Comparisons are only against the person's own history; no population norms exist here. A fact with confidence insufficient has no comparison, by design. end_date defaults to the latest stored date (see as_of)."),
+];
+
+fn coach_description(name: &str) -> Option<&'static str> {
+    COACH_DESCRIPTIONS.iter().find(|(tool, _)| *tool == name).map(|(_, text)| *text)
+}
+
 /// Remove JSON-schema `title` keys (a string next to the schema keywords; a *property* called `title` has an
 /// object as its value and stays).
 fn strip_titles(node: &mut Value) {
@@ -223,14 +239,15 @@ static SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
     let tools = file.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut specs = Vec::new();
     for tool in tools {
-        let (Some(name), Some(description)) =
-            (tool.get("name").and_then(Value::as_str), tool.get("description").and_then(Value::as_str))
-        else {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
         if !SENDABLE_TOOLS.contains(&name) {
             continue; // get_contract: never sent
         }
+        let Some(description) = coach_description(name) else {
+            continue; // a sendable tool without a coach description is not offered (the test below forbids this)
+        };
         let mut parameters = tool.get("inputSchema").cloned().unwrap_or(Value::Null);
         strip_titles(&mut parameters);
         specs.push(ToolSpec {
@@ -439,6 +456,33 @@ mod tests {
         let series = tool_specs().iter().find(|s| s.function.name == "get_metric_series").unwrap();
         assert_eq!(series.function.parameters["required"], json!(["metrics"]));
         assert_eq!(series.function.parameters["properties"]["days"]["default"], 90);
+    }
+
+    /// The descriptions are the coach's, not the MCP file's: every sendable tool has one, none describes a
+    /// field the projection drops, and the MCP server's prose ("provenance", "recent imports", "timeline")
+    /// stays out of what the provider receives. Medical verbs are the CLAIMS lint's job: it scans this file.
+    #[test]
+    fn the_descriptions_are_the_coachs_own_and_name_nothing_the_projection_drops() {
+        let file: Value = serde_json::from_str(MCP_JSON).unwrap();
+        let mcp: Vec<(&str, &str)> = file["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t["description"].as_str().unwrap()))
+            .collect();
+        let sendable: Vec<&str> = mcp.iter().map(|(n, _)| *n).filter(|n| SENDABLE_TOOLS.contains(n)).collect();
+        assert_eq!(COACH_DESCRIPTIONS.iter().map(|(n, _)| *n).collect::<Vec<_>>(), sendable, "one coach description per sendable tool, in the file's order");
+        assert_eq!(tool_specs().len(), sendable.len(), "every sendable tool is offered");
+        for spec in tool_specs() {
+            let text = &spec.function.description;
+            assert_eq!(Some(text.as_str()), coach_description(&spec.function.name));
+            assert_ne!(Some(text.as_str()), mcp.iter().find(|(n, _)| *n == spec.function.name).map(|(_, d)| *d), "{}: the MCP description is not reused", spec.function.name);
+            let lower = text.to_lowercase();
+            for dropped in ["provenance", "recent imports", "timeline", "start_utc", "end_utc", "_at", "_message", "import time", "file name"] {
+                assert!(!lower.contains(dropped), "{}: describes `{dropped}`, which never reaches the model", spec.function.name);
+            }
+            assert!(text.is_ascii() && text.len() <= 600, "{}: short plain ASCII", spec.function.name);
+        }
     }
 
     #[test]
