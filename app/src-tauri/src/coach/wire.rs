@@ -359,7 +359,7 @@ impl Reply {
     }
 }
 
-fn parse_call(index: usize, raw: &Value) -> Result<ToolCall, WireError> {
+fn parse_call(round: usize, index: usize, raw: &Value) -> Result<ToolCall, WireError> {
     let function = raw.get("function").and_then(Value::as_object).ok_or(WireError::BadShape)?;
     let name = function.get("name").and_then(Value::as_str).ok_or(WireError::BadShape)?;
     // some servers send the arguments as an object, some omit them for a tool without parameters
@@ -369,17 +369,26 @@ fn parse_call(index: usize, raw: &Value) -> Result<ToolCall, WireError> {
         Some(other @ Value::Object(_)) => other.to_string(),
         Some(_) => return Err(WireError::BadShape),
     };
-    // a server that sends no call id still gets a stable one, so the answer can be paired
+    // a server that sends no call id still gets one, so the answer can be paired; the round is in it so two
+    // rounds of one question never reuse an id
     let id = match raw.get("id") {
         Some(Value::String(id)) if !id.is_empty() => id.clone(),
-        Some(Value::Null) | None => format!("call_{index}"),
+        Some(Value::Null) | None => format!("call_{round}_{index}"),
         Some(_) => return Err(WireError::BadShape),
     };
     Ok(ToolCall { id, function: FunctionCall { name: name.to_string(), arguments } })
 }
 
-/// Read a chat-completions body.
+/// Read a chat-completions body (a first-round reply: see [`parse_response_in_round`]).
 pub fn parse_response(body: &[u8]) -> Result<Reply, WireError> {
+    parse_response_in_round(body, 0)
+}
+
+/// Read a chat-completions body. `round` is the tool round of the question (0 is the first request); a tool call
+/// the server sent without an id is named `call_{round}_{index}`, so ids stay unique across the rounds of one
+/// question. Two calls with the same id in one reply are [`WireError::BadShape`]: the answers could not be
+/// paired with them.
+pub fn parse_response_in_round(body: &[u8], round: usize) -> Result<Reply, WireError> {
     let root: Value = serde_json::from_slice(body).map_err(|_| WireError::NotJson)?;
     let choice = root.get("choices").and_then(Value::as_array).and_then(|choices| choices.first()).ok_or(WireError::NoChoices)?;
     let message = choice.get("message").and_then(Value::as_object).ok_or(WireError::BadShape)?;
@@ -389,11 +398,16 @@ pub fn parse_response(body: &[u8]) -> Result<Reply, WireError> {
         Some(_) => return Err(WireError::BadShape),
     };
     let calls = match message.get("tool_calls") {
-        Some(Value::Array(raw)) => raw.iter().enumerate().map(|(i, call)| parse_call(i, call)).collect::<Result<Vec<_>, _>>()?,
+        Some(Value::Array(raw)) => raw.iter().enumerate().map(|(i, call)| parse_call(round, i, call)).collect::<Result<Vec<_>, _>>()?,
         Some(Value::Null) | None => Vec::new(),
         Some(_) => return Err(WireError::BadShape),
     };
     if content.is_none() && calls.is_empty() {
+        return Err(WireError::BadShape);
+    }
+    let mut ids: Vec<&str> = calls.iter().map(|call| call.id.as_str()).collect();
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(WireError::BadShape);
     }
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str).map(str::to_string);
@@ -480,9 +494,27 @@ mod tests {
         let calls = reply.tool_calls();
         assert_eq!(calls.len(), 2);
         assert_eq!((calls[0].id.as_str(), calls[0].function.arguments.as_str()), ("call_9", r#"{"limit":3}"#));
-        assert_eq!(calls[1].id, "call_1", "a missing id is made up so the answer can be paired");
+        assert_eq!(calls[1].id, "call_0_1", "a missing id is made up so the answer can be paired");
+        // the same reply in a later round gets ids of that round, so they never collide with round 0's
+        let later = parse_response_in_round(tools, 3).unwrap();
+        assert_eq!(later.tool_calls()[1].id, "call_3_1");
+        assert_eq!(later.tool_calls()[0].id, "call_9", "an id the server sent is kept");
         assert_eq!(calls[1].function.arguments, r#"{"date":"2025-06-30"}"#);
         assert_eq!(reply.usage, None);
+    }
+
+    #[test]
+    fn two_calls_with_one_id_in_one_reply_are_a_bad_shape() {
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "get_period_facts", "arguments": "{}"}});
+        let body = |calls: Vec<Value>| {
+            json!({"choices": [{"message": {"role": "assistant", "content": null, "tool_calls": calls}}]}).to_string().into_bytes()
+        };
+        assert_eq!(parse_response(&body(vec![call("a"), call("a")])), Err(WireError::BadShape));
+        assert!(parse_response(&body(vec![call("a"), call("b")])).is_ok());
+        // a made-up id that collides with one the server sent is the same failure
+        let unnamed = json!({"type": "function", "function": {"name": "get_period_facts", "arguments": "{}"}});
+        assert_eq!(parse_response(&body(vec![call("call_0_1"), unnamed.clone()])), Err(WireError::BadShape));
+        assert_eq!(parse_response_in_round(&body(vec![call("call_0_1"), unnamed]), 1).map(|r| r.tool_calls().len()), Ok(2));
     }
 
     #[test]

@@ -355,7 +355,7 @@ impl<'a> Coach<'a> {
             conv.question_sends += 1;
             conv.left = conv.trace.len();
             let inbound = self.egress.send(Outbound { url: url.clone(), bearer: self.bearer.clone(), body })?;
-            let reply = wire::parse_response(&inbound.body)?;
+            let reply = wire::parse_response_in_round(&inbound.body, round)?;
             let calls = reply.tool_calls();
             if calls.is_empty() {
                 let text = neutral_text(reply.text().unwrap_or_default());
