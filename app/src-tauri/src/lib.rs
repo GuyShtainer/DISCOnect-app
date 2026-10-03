@@ -5,7 +5,7 @@
 //! the Rust port as a sidecar child (macOS release), in this process ([`inproc`]; debug builds and
 //! phones), or the Python one via `--core hearthbeat`.
 
-#[allow(dead_code)] // slices 2-5 fill it
+#[allow(dead_code)] // slices 5-8 fill it
 pub mod coach;
 pub mod inproc;
 pub mod sidecar;
@@ -200,13 +200,16 @@ pub fn run() {
                 let _ = tauri::async_runtime::block_on(core.unlock(pass));
             }
             app.manage(Core(core));
+            app.manage(coach::key::KeyHolder::default());
             build_main_window(app)?;
             Ok(())
         });
     #[cfg(debug_assertions)]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file,
+        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state]);
     #[cfg(not(debug_assertions))]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command]);
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command,
+        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state]);
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
