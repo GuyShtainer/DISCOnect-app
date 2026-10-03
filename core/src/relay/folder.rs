@@ -22,6 +22,16 @@ pub enum RelayError {
     BadName,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A network relay could not be reached (connect, name lookup, time-out, broken response).
+    /// Retryable: nothing was changed on either side.
+    #[error("the relay is unreachable (retry later)")]
+    Unreachable,
+    /// A network relay refused this device's token (HTTP 401): another account or a bad clock.
+    #[error("authentication_failed: the relay refused this device's token")]
+    Unauthorized,
+    /// A network relay answered an unexpected HTTP status (only the number is kept).
+    #[error("the relay answered HTTP {0}")]
+    Status(u16),
 }
 
 impl RelayError {
@@ -32,6 +42,9 @@ impl RelayError {
         match self {
             RelayError::TooLarge => reasons::TOO_LARGE,
             RelayError::BadName => reasons::PY_VALUE_ERROR,
+            // network relays only; these never reach a `rejected` row (see `is_transient`)
+            RelayError::Unreachable | RelayError::Status(_) => reasons::PY_OS_ERROR,
+            RelayError::Unauthorized => reasons::AUTHENTICATION_FAILED,
             RelayError::Io(error) => match error.kind() {
                 K::NotFound => reasons::PY_FILE_NOT_FOUND,
                 K::PermissionDenied => reasons::PY_PERMISSION,
@@ -48,11 +61,26 @@ impl RelayError {
     }
 }
 
+impl RelayError {
+    /// True when the failure says nothing about the object being read: the relay could not be
+    /// reached, refused the token or broke. A pull stops on these (nothing is marked, the next pull
+    /// retries) instead of recording the bundle as `rejected`.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            RelayError::Unreachable | RelayError::Unauthorized | RelayError::Status(_)
+        )
+    }
+}
+
 /// A dumb object store the user controls.
 pub trait Relay {
     fn put(&self, name: &str, data: &[u8]) -> Result<(), RelayError>;
     fn get(&self, name: &str) -> Result<Vec<u8>, RelayError>;
     fn list(&self, account: &str) -> Result<Vec<String>, RelayError>;
+    /// Remove one object (`FileNotFoundError` when it is not there). Nothing in a push or pull
+    /// deletes; pairing and tests do.
+    fn delete(&self, name: &str) -> Result<(), RelayError>;
 }
 
 fn is_hex(text: &str, length: usize) -> bool {
@@ -113,6 +141,14 @@ impl Relay for FolderRelay {
             return Err(RelayError::TooLarge);
         }
         Ok(fs::read(&path)?)
+    }
+
+    fn delete(&self, name: &str) -> Result<(), RelayError> {
+        if !is_object_name(name) {
+            return Err(RelayError::BadName);
+        }
+        fs::remove_file(self.root.join(name))?;
+        Ok(())
     }
 
     fn list(&self, account: &str) -> Result<Vec<String>, RelayError> {
@@ -201,6 +237,34 @@ mod tests {
         let big = relay.get(&name('d')).expect_err("oversized");
         assert!(matches!(big, RelayError::TooLarge));
         assert_eq!(big.reason(), "too_large");
+    }
+
+    #[test]
+    fn delete_removes_one_object_and_validates_the_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relay = FolderRelay::new(dir.path().join("relay"));
+        relay.put(&name('a'), b"abc").expect("put");
+        relay.put(&name('b'), b"def").expect("put");
+        relay.delete(&name('a')).expect("delete");
+        assert_eq!(relay.list(ACCOUNT).expect("list"), vec![name('b')]);
+        let missing = relay.delete(&name('a')).expect_err("already gone");
+        assert_eq!(missing.reason(), "FileNotFoundError");
+        assert!(matches!(
+            relay.delete("../escape"),
+            Err(RelayError::BadName)
+        ));
+        assert_eq!(relay.get(&name('b')).expect("untouched"), b"def");
+    }
+
+    #[test]
+    fn network_errors_are_transient_and_folder_errors_are_not() {
+        assert!(RelayError::Unreachable.is_transient());
+        assert!(RelayError::Unauthorized.is_transient());
+        assert!(RelayError::Status(500).is_transient());
+        assert!(!RelayError::BadName.is_transient());
+        assert!(!RelayError::TooLarge.is_transient());
+        assert!(!RelayError::Io(std::io::ErrorKind::NotFound.into()).is_transient());
+        assert_eq!(RelayError::Unauthorized.reason(), "authentication_failed");
     }
 
     #[test]

@@ -627,14 +627,17 @@ fn apply_pending(
     let mut applied: Vec<Applied> = Vec::new();
     let mut reparse_streams: BTreeSet<String> = BTreeSet::new();
     for name in pending {
-        let fetched = relay
-            .get(name)
-            .map_err(|e| e.reason().to_string())
-            .and_then(|blob| {
-                unpack(master, name, &blob)
-                    .map(|bundle| (blob, bundle))
-                    .map_err(|rejected| rejected.reason)
-            });
+        let fetched = match relay.get(name) {
+            // the relay, not the object, is the problem: stop here, mark nothing, retry next pull
+            Err(error) if error.is_transient() => return Err(error.into()),
+            other => other,
+        }
+        .map_err(|e| e.reason().to_string())
+        .and_then(|blob| {
+            unpack(master, name, &blob)
+                .map(|bundle| (blob, bundle))
+                .map_err(|rejected| rejected.reason)
+        });
         let (blob, bundle) = match fetched {
             Ok(pair) => pair,
             Err(reason) => {
@@ -961,6 +964,49 @@ pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
         conflicts: count("SELECT count(*) FROM sync_conflicts")?,
         superseded: count("SELECT count(*) FROM raw_superseded")?,
         gaps: gaps(conn)?,
+    })
+}
+
+/// `status` for a store that may predate the relay tables (schema 1 or 2, never synced): the same
+/// counts a fresh schema-3 store would show, so a read-only `sync.status` never needs a migration.
+pub fn status_or_fresh(conn: &Connection) -> Result<StatusReport, SyncError> {
+    let has_relay: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='relay_bundles')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_relay {
+        return status(conn);
+    }
+    Ok(StatusReport {
+        bundles: BTreeMap::new(),
+        records_unsent: conn.query_row("SELECT count(*) FROM raw_records", [], |r| r.get(0))?,
+        records_seen: 0,
+        conflicts: 0,
+        superseded: 0,
+        gaps: Vec::new(),
+    })
+}
+
+/// The JSON `sync status --json` prints and the `sync.status` method answers.
+pub fn status_value(report: &StatusReport) -> serde_json::Value {
+    let bundles: serde_json::Map<String, serde_json::Value> = report
+        .bundles
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+        .collect();
+    let gaps: Vec<serde_json::Value> = report
+        .gaps
+        .iter()
+        .map(|g| serde_json::json!({"chain": g.chain, "device_seq": g.device_seq, "missing": g.missing}))
+        .collect();
+    serde_json::json!({
+        "bundles": bundles,
+        "records_unsent": report.records_unsent,
+        "records_seen": report.records_seen,
+        "conflicts": report.conflicts,
+        "superseded": report.superseded,
+        "gaps": gaps,
     })
 }
 

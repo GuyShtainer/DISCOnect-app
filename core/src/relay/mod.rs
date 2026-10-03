@@ -8,5 +8,8 @@
 //! core's (`docs/relay-protocol.md`): each core must read the other's bundles.
 
 pub mod bundle;
+pub mod config;
 pub mod folder;
+pub mod lan;
+pub mod lan_server;
 pub mod sync;

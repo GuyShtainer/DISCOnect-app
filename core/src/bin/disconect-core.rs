@@ -8,20 +8,25 @@
 //! not in the keychain. `--passphrase-file` is for the test harness; `DISCONECT_PASSPHRASE` is never read.
 //!
 //! `disconect-core --db <path> [--passphrase-file <file>] [--json] status | init | import <path> [--transport T]
-//!  | reparse [--stream S]... [--force] | sync push|pull|status|forget [--relay <folder> [--remember]]`
+//!  | reparse [--stream S]... [--force] | sync push|pull|status|forget [--relay <folder|url> [--remember]]
+//!  | relay-serve --relay <folder> [--listen <addr:port>]`
+//!
+//! `relay-serve` serves a relay folder over HTTP on the LAN (`disconect_core::relay::lan_server`): it needs the
+//! unlocked key only to derive the token key and the account, never decrypts a bundle, binds `127.0.0.1:0` unless
+//! `--listen` says otherwise, prints `listening http://<addr>` on stdout and logs only method and status to stderr.
 //!
 //! `reparse` replays decoding over the retained raw records (`sources::reparse_all`, the Python `reparse`);
 //! `--json` prints the run's `ImportStats` plus `status`, the same keys as the Python CLI.
 //!
-//! `sync` talks to the blind relay (`docs/relay-protocol.md`); the folder comes from `--relay` or
-//! `relay.json` in the data folder (`{"folder": path}`, shared with the Python CLI; `--remember` writes
-//! it). `push` and `pull` need the store's master key (a key file beside the db, unlocked with
+//! `sync` talks to the blind relay (`docs/relay-protocol.md`); the relay comes from `--relay` (a folder, or
+//! `http://host:port` for a LAN relay) or `relay.json` in the data folder (`{"folder": path}` or
+//! `{"lan": url}`, shared with the Python CLI, which refuses `lan`; `--remember` writes it). `push` and `pull` need the store's master key (a key file beside the db, unlocked with
 //! `--passphrase-file` or `DISCONECT_PASSPHRASE`); `status` and `forget` need no relay and no key
 //! beyond opening the store.
 //!
 //! Exit codes (the Python CLI's table): 0 ok; 1 failed, partial (`import`/`reparse` with failures, `pull`
 //! that rejected a bundle) or an error the oracle lets escape; 2 usage (no such path, no relay
-//! folder); 4 write lock busy; 6 database error; 7 schema newer than this build; 9 locked (wrong
+//! folder); 4 write lock busy; 5 the LAN relay is unreachable (retryable; nothing was marked); 6 database error; 7 schema newer than this build; 9 locked (wrong
 //! or missing passphrase, or `sync push|pull` on a store with no key file).
 
 use std::path::PathBuf;
@@ -32,7 +37,9 @@ use disconect_core::mcp_start as mcp;
 use disconect_core::home;
 use disconect_core::identity;
 use disconect_core::serve;
-use disconect_core::relay::folder::{FolderRelay, RelayError};
+use disconect_core::relay::config::{self as relay_cfg, RelayConfig};
+use disconect_core::relay::folder::{Relay, RelayError};
+use disconect_core::relay::lan_server::LanServer;
 use disconect_core::relay::sync::{self, PullResult, StatusReport, SyncError};
 use disconect_core::sources::{self, SourceError, TRANSPORTS};
 use disconect_core::writer::{ImportStats, WriterError};
@@ -45,6 +52,7 @@ const EXIT_LOCKED: u8 = 9;
 const EXIT_USAGE: u8 = 2;
 const EXIT_NOT_CONFIGURED: u8 = 3;
 const EXIT_BUSY: u8 = 4;
+const EXIT_UNREACHABLE: u8 = 5;
 const EXIT_DATABASE: u8 = 6;
 const EXIT_SCHEMA: u8 = 7;
 
@@ -58,6 +66,7 @@ struct Args {
     transport: Option<String>,
     sync_action: Option<String>,
     relay: Option<String>,
+    listen: Option<String>,
     remember: bool,
     streams: Vec<String>,
     force: bool,
@@ -68,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut db, mut pass, mut command, mut json) = (None, None, None, false);
     let (mut import_path, mut transport) = (None, None);
     let (mut sync_action, mut relay, mut remember) = (None, None, false);
+    let mut listen = None;
     let (mut streams, mut force) = (Vec::new(), false);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -81,11 +91,12 @@ fn parse_args() -> Result<Args, String> {
                 }
                 transport = Some(value);
             }
-            "--relay" => relay = Some(it.next().ok_or("--relay needs a folder")?),
+            "--relay" => relay = Some(it.next().ok_or("--relay needs a folder or an http:// address")?),
+            "--listen" => listen = Some(it.next().ok_or("--listen needs host:port")?),
             "--remember" => remember = true,
             "--stream" => streams.push(it.next().ok_or("--stream needs a value")?),
             "--force" => force = true,
-            "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" if command.is_none() => command = Some(arg),
+            "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" | "relay-serve" if command.is_none() => command = Some(arg),
             "push" | "pull" | "status" | "forget"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
@@ -106,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
         transport,
         sync_action,
         relay,
+        listen,
         remember,
         streams,
         force,
@@ -230,19 +242,21 @@ fn relay_config() -> Option<PathBuf> {
     home::relay_config_path()
 }
 
-/// `_relay_for`: the folder from `--relay` or the config file; no secrets live there.
-fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
+/// The relay `--relay` or `relay.json` names (`_relay_for`); no secrets live there. `master` derives
+/// the LAN token when the relay is an `http://` address.
+fn relay_config_for(args: &Args) -> Result<RelayConfig, (u8, String)> {
     let config = relay_config();
-    let mut folder = args.relay.clone();
-    if folder.as_deref().is_none_or(str::is_empty)
+    let mut chosen = args
+        .relay
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .map(RelayConfig::from_arg);
+    if chosen.is_none()
         && let Some(path) = config.as_ref().filter(|p| p.exists())
     {
-        folder = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .and_then(|value| value.get("folder").and_then(Value::as_str).map(str::to_string));
+        chosen = relay_cfg::read(path);
     }
-    let Some(folder) = folder.filter(|f| !f.is_empty()) else {
+    let Some(chosen) = chosen else {
         let shown = config.as_ref().map_or_else(
             || format!("~/{}/{}", identity::DATA_DIR, home::RELAY_CONFIG_NAME),
             |p| p.display().to_string(),
@@ -252,11 +266,15 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
             format!("usage: no relay folder: pass --relay <folder> or write {{\"folder\": ...}} to {shown}"),
         ));
     };
+    if let RelayConfig::Lan(url) = &chosen {
+        relay_cfg::check_lan_url(url).map_err(|rule| (EXIT_USAGE, format!("usage: {rule}")))?;
+    }
     if args.relay.is_some() && args.remember {
         let path = config.ok_or((1, "cannot remember the relay: HOME is not set".to_string()))?;
+        let (key, value) = chosen.entry();
         let text = disconect_core::canon::dumps_spaced(&disconect_core::canon::Value::Object(vec![(
-            "folder".to_string(),
-            disconect_core::canon::Value::Str(folder.clone()),
+            key.to_string(),
+            disconect_core::canon::Value::Str(value.to_string()),
         )]));
         if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
             return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
@@ -269,7 +287,15 @@ fn relay_for(args: &Args) -> Result<FolderRelay, (u8, String)> {
         };
         write().map_err(|e| (1, format!("cannot write the relay config: {}", e.kind())))?;
     }
-    Ok(FolderRelay::new(expand_user(&folder)))
+    Ok(chosen)
+}
+
+fn relay_for(args: &Args, master: &[u8]) -> Result<Box<dyn Relay>, (u8, String)> {
+    let config = relay_config_for(args)?;
+    match relay_cfg::open(&config, master) {
+        Ok(relay) => Ok(relay),
+        Err(rule) => Err((EXIT_USAGE, format!("usage: {rule}"))),
+    }
 }
 
 fn sync_exit(error: &SyncError) -> u8 {
@@ -277,6 +303,7 @@ fn sync_exit(error: &SyncError) -> u8 {
         SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) | SyncError::WriteFailed(_) => EXIT_DATABASE,
         SyncError::Source(SourceError::Db(_)) => EXIT_DATABASE,
         SyncError::Relay(RelayError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => EXIT_USAGE,
+        SyncError::Relay(RelayError::Unreachable) => EXIT_UNREACHABLE,
         _ => 1,
     }
 }
@@ -358,15 +385,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
         "status" => {
             let opened = store::open_for_write(db_of(args)?, "sync", 10.0, source).map_err(open_err)?;
             let report = sync::status(opened.conn()).map_err(failed)?;
-            let bundles: Map<String, Value> = report.bundles.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
-            let payload = json!({
-                "bundles": bundles,
-                "records_unsent": report.records_unsent,
-                "records_seen": report.records_seen,
-                "conflicts": report.conflicts,
-                "superseded": report.superseded,
-                "gaps": gaps_json(&report.gaps),
-            });
+            let payload = sync::status_value(&report);
             emit(args.json, payload, status_text(&report));
             Ok(())
         }
@@ -378,11 +397,11 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                     format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
                 ));
             };
-            let relay = relay_for(args)?;
+            let relay = relay_for(args, master.as_slice())?;
             let opened =
                 store::open_for_write_with(db_of(args)?, "sync", 10.0, Some(&master)).map_err(open_err)?;
             if action == "push" {
-                let result = sync::push(opened.conn(), &*master, &relay).map_err(failed)?;
+                let result = sync::push(opened.conn(), &*master, &*relay).map_err(failed)?;
                 emit(
                     args.json,
                     json!({"bundles": result.bundles, "records": result.records, "ranges": result.ranges}),
@@ -395,7 +414,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                 );
                 return Ok(());
             }
-            let result = sync::pull(opened.conn(), &*master, &relay).map_err(failed)?;
+            let result = sync::pull(opened.conn(), &*master, &*relay).map_err(failed)?;
             emit(
                 args.json,
                 pull_json(&result),
@@ -414,6 +433,32 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             if result.status == "ok" { Ok(()) } else { Err((1, String::new())) }
         }
     }
+}
+
+/// `relay-serve`: serve a relay folder over HTTP on the LAN until the process is killed. The master
+/// key only derives the token key and the account name; no bundle is ever opened.
+fn run_relay_serve(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String)> {
+    if args.remember || args.sync_action.is_some() || args.import_path.is_some() {
+        return Err((EXIT_USAGE, "usage: relay-serve takes --db, --passphrase-file, --relay <folder> and --listen".into()));
+    }
+    let master = store::resolve_master(db_of(args)?, source).map_err(|e| (open_error_code(&e), e.to_string()))?;
+    let Some(master) = master else {
+        return Err((
+            EXIT_LOCKED,
+            format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
+        ));
+    };
+    let folder = match relay_config_for(args)? {
+        RelayConfig::Folder(folder) => expand_user(&folder),
+        RelayConfig::Lan(_) => return Err((EXIT_USAGE, "usage: relay-serve serves a folder, not an http:// address".into())),
+    };
+    let listen = args.listen.as_deref().unwrap_or("127.0.0.1:0");
+    // method and status only: no path, no object name, no address of a peer
+    let log: disconect_core::relay::lan_server::Logger = std::sync::Arc::new(|method, status| eprintln!("{method} {status}"));
+    let server = LanServer::start(listen, folder, master.as_slice(), log).map_err(|m| (1, m))?;
+    println!("listening http://{}", server.local_addr());
+    server.wait();
+    Ok(())
 }
 
 /// The store a command works on: `--db` is required for everything except `serve`.
@@ -435,6 +480,7 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
         "import" => run_import(args, source),
         "reparse" => run_reparse(args, source),
         "sync" => run_sync(args, source),
+        "relay-serve" => run_relay_serve(args, source),
         "status" if args.json => {
             let value = status(db_of(args)?, source).map_err(fail)?;
             println!("{value}");
@@ -453,6 +499,7 @@ fn run_serve(args: &Args) -> ExitCode {
         || args.transport.is_some()
         || args.sync_action.is_some()
         || args.relay.is_some()
+        || args.listen.is_some()
         || args.remember
         || !args.streams.is_empty()
         || args.force;
@@ -490,6 +537,7 @@ fn run_mcp(args: &Args) -> ExitCode {
         || args.transport.is_some()
         || args.sync_action.is_some()
         || args.relay.is_some()
+        || args.listen.is_some()
         || args.remember
         || !args.streams.is_empty()
         || args.force;

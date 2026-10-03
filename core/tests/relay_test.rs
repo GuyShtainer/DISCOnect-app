@@ -1212,6 +1212,9 @@ fn a_listed_object_that_vanishes_before_it_is_read_is_rejected_as_file_not_found
         ) -> Result<Vec<String>, disconect_core::relay::folder::RelayError> {
             self.0.list(account)
         }
+        fn delete(&self, name: &str) -> Result<(), disconect_core::relay::folder::RelayError> {
+            self.0.delete(name)
+        }
     }
     let tmp = tempfile::tempdir().expect("tmp");
     let (a, b) = (device(), device());

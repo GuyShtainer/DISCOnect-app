@@ -36,6 +36,9 @@ fancy-regex = "0.19.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ryu = "1.0.23"
 getrandom = "0.4"
+tiny_http = "0.12"
+hmac = "0.13.0"
+ureq = { version = "3", default-features = false }
 
 # The OS keychain behind `key.cache` (MIT/Apache-2.0; talks to the Security framework in-process,
 # so the master key never appears in a child process's argv). Other platforms: no keychain.

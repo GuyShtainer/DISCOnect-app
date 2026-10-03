@@ -156,7 +156,7 @@ pub struct Bundle {
     pub ranges: Vec<RangeRow>,
 }
 
-fn hkdf_expand(master: &[u8], salt: Option<&[u8]>, info: &[u8]) -> Zeroizing<[u8; 32]> {
+pub(crate) fn hkdf_expand(master: &[u8], salt: Option<&[u8]>, info: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut out = Zeroizing::new([0u8; 32]);
     // 32 bytes is far below the HKDF-SHA256 limit; expand cannot fail.
     if Hkdf::<Sha256>::new(salt, master)

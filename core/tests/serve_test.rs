@@ -403,12 +403,11 @@ fn the_read_and_transport_modules_never_ask_the_host_for_its_time_zone_or_print(
 }
 
 #[test]
-fn the_dependency_tree_has_no_network_crate() {
+fn the_dependency_tree_has_no_network_crate_but_the_lan_relays_two() {
     let lock = source("Cargo.lock");
     for crate_name in [
         "reqwest",
         "hyper",
-        "ureq",
         "curl",
         "tokio",
         "native-tls",
@@ -419,4 +418,29 @@ fn the_dependency_tree_has_no_network_crate() {
             "{crate_name} would be a network dependency"
         );
     }
+    // Bet 12 slice B: the LAN relay is the one network feature (ADR 0005, "self-hosted"): `ureq` (client, no
+    // TLS) and `tiny_http` (server), and nothing else in the crate may name them
+    let allowed = ["src/relay/lan.rs", "src/relay/lan_server.rs"];
+    let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(folder) = stack.pop() {
+        for entry in std::fs::read_dir(&folder).expect("read src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .expect("under the crate")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&path).expect("source");
+            let names_network = text.contains("ureq::") || text.contains("tiny_http::");
+            assert!(
+                !names_network || allowed.contains(&relative.as_str()),
+                "{relative} reaches the network outside the LAN relay modules"
+            );
+        }
+    }
+    assert!(!source("src/serve.rs").contains("relay::lan"), "serve talks to the relay only through `relay::config`");
 }
