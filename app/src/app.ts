@@ -373,7 +373,7 @@ async function screenKey(out: ParentNode): Promise<void> {
   wrap.append(right, box);
   label.append(wrap);
   card.append(label, note);
-  if (keyStatus.keychain === "stale") card.append(el("p", "caption", "A key saved by an earlier build of this app is in the keychain and this build cannot read it. Turn the switch on again to replace it."));
+  if (keyStatus.keychain === "stale") card.append(el("p", "caption", "A key saved by another program or an earlier build of this app is in the keychain, and this build cannot read it without asking. Turn the switch on to replace it with one this build can read; macOS may ask you once to allow that."));
   card.append(el("p", "caption muted", "Off by default: you are asked for your passphrase each time the app starts. On, it is convenient, but programs you approve can then read the key. The app and the terminal each keep their own copy, and an update of the app forgets its copy: cache again afterwards."));
   out.append(card);
   const about = el("div", "card body");
@@ -384,6 +384,12 @@ async function screenKey(out: ParentNode): Promise<void> {
   if (mcp) {
     about.append(el("span", "", "Claude Desktop can use this app's core as its MCP server with this command:"));
     about.append(el("pre", "mono caption", mcp));
+    // The MCP is a separate program with its own keychain item: it needs its own one-time cache.
+    const cache = mcp.replace(/ mcp$/, " cli key cache");
+    if (cache !== mcp) {
+      about.append(el("span", "", "To let it open your encrypted database without a passphrase, run this once in a terminal (it asks for your passphrase):"));
+      about.append(el("pre", "mono caption", cache));
+    }
   }
   about.append(el("span", "caption muted", "If macOS refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
   out.append(about);

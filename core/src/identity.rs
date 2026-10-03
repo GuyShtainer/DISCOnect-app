@@ -8,6 +8,12 @@
 pub const PRODUCT: &str = "DISCOnect";
 pub const NOTICE: &str = "Not affiliated with or endorsed by any watch manufacturer.";
 
+/// The keychain service this core stores its master-key item under. **Rust-only on purpose:** the
+/// Python core (and so the MCP server) keeps `hearthbeat`. A generic password is unique per
+/// (service, account) and macOS binds it to the program that made it, so two programs sharing one
+/// service would fight over the same item (the drift test pins that the two names differ).
+pub const KEYCHAIN_SERVICE: &str = "disconect";
+
 /// The scrub as Python spells it (`re.compile(..., re.IGNORECASE)`): the manufacturer's name, with
 /// an optional following " connect". [`neutral_text`] implements exactly this.
 pub const MANUFACTURER_PATTERN: &str = "garmin(?: connect)?";
