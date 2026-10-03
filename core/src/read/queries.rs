@@ -111,17 +111,6 @@ pub fn parse_date(text: &str) -> Result<NaiveDate, ReadError> {
     })
 }
 
-/// `datetime.date.fromisoformat` of a request's own text (which may hold a lone surrogate).
-pub fn parse_date_py(text: &PyStr) -> Result<NaiveDate, ReadError> {
-    match text.to_text() {
-        Some(plain) => parse_date(&plain),
-        None => Err(ReadError::Value(format!(
-            "Invalid isoformat string: {}",
-            pyrepr::repr(text)
-        ))),
-    }
-}
-
 /// `parse_day`: `YYYY-MM-DD` and nothing else, as a request's own text (which may hold a lone
 /// surrogate). Any other text, and a shape-correct day that is not on the calendar, is
 /// `ValueError("<name> must be YYYY-MM-DD")`. It never overflows: `9999-12-31` and `0001-01-01` parse;

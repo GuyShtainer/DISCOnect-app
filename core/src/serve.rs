@@ -730,7 +730,8 @@ fn data_metric(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     let store = session.reader()?;
     let conn = store.conn();
     let last = match last_day {
-        Some(text) => queries::parse_date_py(&text)?,
+        // strict `YYYY-MM-DD` with the MCP paths' message; Python's `queries.parse_day` says the same
+        Some(text) => queries::parse_day(&text, "last_day")?,
         None => queries::parse_date(&queries::local_today(conn)?)?,
     };
     let first = queries::shift(last, -(days.clamp(1, cap) - 1))?;

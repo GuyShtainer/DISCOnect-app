@@ -6,9 +6,9 @@
 //!
 //! Comparison is on tagged trees: `wirejson::Json` keeps bool, int, float, string, null, list and
 //! object apart, big integers exactly. `app.info.core` and `app.info.db` are the only allowances.
-//! Entries for methods that are not ported yet must answer `unknown_method`. An entry the script marks
-//! `booked` (Python accepts a `last_day` form the port refuses, `docs/kb/23`) must be answered
-//! `bad_params` unless it matches the oracle anyway.
+//! Entries for methods that are not ported yet must answer `unknown_method`. No entry is `booked` any
+//! more (the last named allowance, `kb23-fromisoformat-permissive`, was retired on 2026-10-03: both cores
+//! take `last_day` as strict `YYYY-MM-DD`), so every other entry must match the oracle exactly.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -233,14 +233,7 @@ fn replay(store_file: &str, oracle_file: &str) {
             .map(|n| sorted(mask(n)))
             .collect();
         if got != want {
-            let refused = got.len() == 1
-                && got[0]
-                    .get("error")
-                    .and_then(|e| e.get("code"))
-                    == Some(&Json::Str(PyStr::from_text("bad_params")));
-            if !(entry.get("booked").is_some() && refused) {
-                differences.push(format!("#{index} {}", oracle[index].0));
-            }
+            differences.push(format!("#{index} {}", oracle[index].0));
         }
     }
     writer.join().expect("writer");
