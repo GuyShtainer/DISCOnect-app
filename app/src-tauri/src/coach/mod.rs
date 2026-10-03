@@ -6,6 +6,9 @@
 //! [`views::project`] (an allowlist projection), [`schema::validate`] (a fail-closed positive schema) and
 //! [`caps::fit`] (byte budgets).
 //!
+//! The loop (slice 5): [`prompt`] is the system prompt, [`wire`] the chat-completions format, [`chat_loop`] one
+//! question end to end with its window manager, [`commands::coach_ask`] the Tauri command over it.
+//!
 //! Provider plumbing (slice 4): [`settings`] holds the non-secret provider settings (`Off` by default),
 //! [`key`] the user's key (OS keychain or session memory), [`egress`] the one choke point. [`provider`] is
 //! how a caller gets an egress: `None` means the coach is off and the caller must send nothing.
@@ -19,6 +22,9 @@ pub mod prompt;
 pub mod schema;
 pub mod settings;
 pub mod views;
+pub mod wire;
+#[path = "loop.rs"]
+pub mod chat_loop;
 
 use egress::{Egress, Endpoint, Real};
 use settings::Settings;

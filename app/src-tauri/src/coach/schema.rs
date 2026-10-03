@@ -616,6 +616,37 @@ pub fn validate(tool: &str, projected: &Value) -> Result<(), SchemaError> {
         .map_err(|reason| SchemaError { tool: name, path: join(&path), reason })
 }
 
+/// A projected answer that [`validate`] accepted. The field is private to this module and [`validated`] is
+/// the only constructor, so a value of this type is proof the positive schema passed: the coach's tool-result
+/// message ([`super::wire::ToolMessage`]) can be built from nothing else.
+#[derive(Clone, PartialEq)]
+pub struct Validated(Value);
+
+impl Validated {
+    /// The validated value (what the "what the model can see" drawer shows).
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    /// The compact JSON text that goes into the tool message, byte for byte.
+    pub fn compact(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl std::fmt::Debug for Validated {
+    /// Never the data: only its size.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Validated({} bytes)", self.compact().len())
+    }
+}
+
+/// [`validate`], keeping the proof: `Ok` hands the value back wrapped in [`Validated`].
+pub fn validated(tool: &str, projected: Value) -> Result<Validated, SchemaError> {
+    validate(tool, &projected)?;
+    Ok(Validated(projected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
