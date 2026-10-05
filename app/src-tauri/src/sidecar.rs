@@ -33,6 +33,10 @@ use crate::inproc::{self, InProcCore, LineSink, Runner};
 /// (An in-process core has no such filter; see `inproc.rs`.)
 #[cfg(desktop)]
 const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "DISCONECT_DB", "DISCONECT_KEYS", "TMPDIR", "LANG"];
+/// The live link's child reads the watch, never the store: no store or key path reaches it.
+const LIVE_ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "TMPDIR", "LANG"];
+/// How long `LiveLink::stop` waits for the child to unsubscribe and close the link on its own.
+const LIVE_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 const STDERR_LINES_KEPT: usize = 200;
 const MAX_RESTARTS: u32 = 1;
 /// What an in-process `app.info.core` gains, so the About card says where the core runs.
@@ -641,7 +645,7 @@ impl LiveLink {
     pub fn start(program: &Path, args: &[String], sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
         let mut cmd = Command::new(program);
         cmd.args(args).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        for key in ENV_ALLOWLIST {
+        for key in LIVE_ENV_ALLOWLIST {
             if let Some(v) = std::env::var_os(key) {
                 cmd.env(key, v);
             }
@@ -671,10 +675,18 @@ impl LiveLink {
         lock(&self.child).as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
     }
 
-    /// End the session: close its stdin (the child's own stop signal), then kill and reap it.
+    /// End the session: close its stdin (the child's own stop signal, on which it unsubscribes and closes
+    /// the link), give it [`LIVE_STOP_GRACE`] to exit by itself, then kill and reap whatever is left.
     pub fn stop(&self) {
         if let Some(mut child) = lock(&self.child).take() {
             drop(child.stdin.take());
+            let deadline = std::time::Instant::now() + LIVE_STOP_GRACE;
+            while std::time::Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -830,6 +842,11 @@ mod tests {
     fn passphrase_env_is_not_in_the_allowlist() {
         assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_PASSPHRASE"));
         assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_RECOVERY_WORDS"));
+        // the live child reads the watch, never the store
+        for key in LIVE_ENV_ALLOWLIST {
+            assert!(!key.starts_with("DISCONECT_"), "{key}");
+        }
+        assert!(LIVE_ENV_ALLOWLIST.iter().all(|k| ENV_ALLOWLIST.contains(k)));
     }
 
     #[cfg(desktop)]
@@ -875,7 +892,16 @@ mod tests {
         }
         let link = LiveLink::start(Path::new("/bin/cat"), &[], Arc::new(Drop_)).expect("spawn");
         assert!(link.running());
-        link.stop();
+        let started = std::time::Instant::now();
+        link.stop(); // cat exits on EOF by itself: no kill, no full grace period
         assert!(!link.running());
+        assert!(started.elapsed() < LIVE_STOP_GRACE, "the child ended on EOF, stop did not wait out the grace");
+        // a child that ignores EOF is killed once the grace is over
+        let stubborn = LiveLink::start(Path::new("/bin/sh"), &["-c".into(), "trap '' TERM; sleep 60".into()], Arc::new(Drop_)).expect("spawn");
+        assert!(stubborn.running());
+        let started = std::time::Instant::now();
+        stubborn.stop();
+        assert!(!stubborn.running());
+        assert!(started.elapsed() >= LIVE_STOP_GRACE);
     }
 }

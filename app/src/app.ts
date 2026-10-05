@@ -251,7 +251,7 @@ function drawLive(): void {
   if (liveNodes.status) liveNodes.status.textContent = liveStatusWord();
   if (liveNodes.button) {
     liveNodes.button.textContent = liveRunning ? "Disconnect" : "Connect to watch";
-    liveNodes.button.disabled = liveStatus === "scanning" || liveStatus === "connecting";
+    liveNodes.button.disabled = liveStatus === "starting" || liveStatus === "scanning" || liveStatus === "connecting";
   }
   for (const [metric, node] of liveNodes.values) {
     const latest = liveLatest.get(metric);
@@ -266,7 +266,7 @@ function onLive(line: core.LiveLine): void {
   if (typeof line.status === "string") {
     liveStatus = line.status;
     liveStop = typeof line.stop === "string" ? line.stop : null;
-    if (line.status === "stopped") liveRunning = false;
+    liveRunning = line.status !== "stopped"; // any other status line comes from a running link
   }
   if (typeof line.metric === "string" && typeof line.value === "number" && typeof line.t === "number") {
     liveLatest.set(line.metric, { value: line.value, t: line.t });
@@ -290,9 +290,12 @@ async function toggleLive(): Promise<void> {
       liveRunning = true;
     }
   } catch (e) {
-    liveRunning = false;
-    liveStatus = "stopped";
-    liveStop = core.isCoreError(e) ? e.code : "error";
+    const code = core.isCoreError(e) ? e.code : "error";
+    liveRunning = code === "live_busy"; // a refused second start: the first link still runs
+    if (!liveRunning) {
+      liveStatus = "stopped";
+      liveStop = code;
+    }
   }
   drawLive();
 }

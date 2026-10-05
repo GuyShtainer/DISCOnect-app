@@ -52,13 +52,17 @@ impl LiveState {
 /// The lab's interpreter and script, resolved from this crate's own location: development builds only.
 /// `None` when the lab's virtual environment is not there (a release build, or a checkout without it).
 pub fn lab_program() -> Option<(PathBuf, Vec<String>)> {
-    if !cfg!(debug_assertions) {
-        return None;
+    #[cfg(debug_assertions)]
+    {
+        let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("ble-lab");
+        let python = lab.join(".venv").join("bin").join("python");
+        let script = lab.join("live.py");
+        (python.is_file() && script.is_file()).then(|| (python, vec![script.to_string_lossy().into_owned()]))
     }
-    let lab = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("ble-lab");
-    let python = lab.join(".venv").join("bin").join("python");
-    let script = lab.join("live.py");
-    (python.is_file() && script.is_file()).then(|| (python, vec![script.to_string_lossy().into_owned()]))
+    #[cfg(not(debug_assertions))]
+    {
+        None // the checkout path is not even compiled into a release binary
+    }
 }
 
 fn unavailable() -> CoreError {
