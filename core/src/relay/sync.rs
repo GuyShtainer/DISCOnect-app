@@ -961,8 +961,14 @@ pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
             "SELECT count(*) FROM raw_records r LEFT JOIN relay_seen s ON s.raw_record_id=r.id WHERE s.raw_record_id IS NULL",
         )?,
         records_seen: count("SELECT count(*) FROM relay_seen")?,
-        conflicts: count("SELECT count(*) FROM sync_conflicts")?,
-        superseded: count("SELECT count(*) FROM raw_superseded")?,
+        // by content (the versions that lost), so converged devices report the same numbers: the tables
+        // themselves are per-bundle journals whose row counts depend on arrival order
+        conflicts: count(
+            "SELECT count(*) FROM (SELECT DISTINCT stream, source_key, loser_hash FROM sync_conflicts)",
+        )?,
+        superseded: count(
+            "SELECT count(*) FROM (SELECT DISTINCT stream, source_key, payload_hash FROM raw_superseded)",
+        )?,
         gaps: gaps(conn)?,
     })
 }
