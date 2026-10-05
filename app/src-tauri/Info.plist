@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Tauri merges this file into the bundle's Info.plist. The Watch screen's live link (a child process
+	     of this app, so this app is the responsible process for macOS privacy) reads the watch over
+	     Bluetooth; without this string macOS kills the child (TCC, 2026-10-05). -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>The Watch screen reads live values from your watch over Bluetooth. The watch is only read; nothing is written to it.</string>
+</dict>
+</plist>
