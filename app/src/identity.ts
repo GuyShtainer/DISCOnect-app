@@ -23,6 +23,14 @@ export const PROVIDERS: { id: "chat_gpt" | "claude" | "gemini" | "le_chat" | "de
   { id: "deep_seek", name: "DeepSeek", host: "chat.deepseek.com" },
 ];
 
+// ---- support channels (Bet 17, donations only; the sponsor-message tier is cut). Mirrors
+// src-tauri/src/coach/support.rs's SupportSite arms exactly (test_lint_app.py pins the drift, the way it
+// pins PROVIDERS against handoff.rs). Ships empty: the channels are Guy's decision, not this bet's.
+export const SUPPORT_INTRO = "This app is free software. If it is useful to you, the maintainer takes support through these channels. Nothing is required, nothing in the app changes whether you give or not, nothing is recorded here, and this app has no way to learn whether you gave.";
+export const SUPPORT_NETWORK = "This screen opens no network connection; the buttons open your browser, under your own session with that service, governed by their terms, not ours.";
+export const SUPPORT_EMPTY = "No support channel is configured in this build.";
+export const SUPPORT_SITES: { id: string; name: string; host: string }[] = [];
+
 // Names mirrored from identity.py (tests/test_identity_drift.py fails on drift).
 export const DATA_DIR = ".disconect";
 export const DB_FILENAME = "disconect.db";

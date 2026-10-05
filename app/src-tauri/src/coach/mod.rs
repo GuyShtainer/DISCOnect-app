@@ -17,6 +17,10 @@
 //! user's own chat, and opens one of five fixed sites in the system browser. It opens no network connection
 //! itself and does not touch [`settings`], [`key`] or [`provider`]: the hand-off works while the coach is off.
 //!
+//! Support channels (Bet 17, donations only): [`support`] is a closed, empty-today table of fixed sites, on
+//! the same shape as [`handoff`]'s five chats; [`open_fixed`] is the one spawner the two share besides
+//! `sidecar.rs`.
+//!
 //! Provider plumbing (slice 4): [`settings`] holds the non-secret provider settings (`Off` by default),
 //! [`key`] the user's key (OS keychain or session memory), [`egress`] the one choke point. [`provider`] is
 //! how a caller gets an egress: `None` means the coach is off and the caller must send nothing.
@@ -28,10 +32,12 @@ pub mod egress_guard;
 pub mod gate;
 pub mod handoff;
 pub mod key;
+pub mod open_fixed;
 pub mod probe;
 pub mod prompt;
 pub mod schema;
 pub mod settings;
+pub mod support;
 pub mod views;
 pub mod wire;
 #[path = "loop.rs"]

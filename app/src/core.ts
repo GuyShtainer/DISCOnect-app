@@ -139,6 +139,22 @@ export function handoffOpen(provider: ProviderId): Promise<void> {
   return invoke("handoff_open", { provider });
 }
 
+// ---- support channels (Bet 17, donations only). Opens no network connection of its own: the buttons open
+// the system browser. The command is macOS-only; off macOS it does not exist and the call rejects. ----------
+
+/** The Rust `SupportSite` enum refuses anything it does not itself name, at the IPC boundary — so a plain
+ *  `string` here is as safe as a branded one: a value made up on this side is simply never accepted. */
+export type SupportSiteId = string;
+export type SupportSiteDto = { id: SupportSiteId; name: string; host: string };
+
+export function supportSites(): Promise<SupportSiteDto[]> {
+  return invoke<SupportSiteDto[]>("support_sites");
+}
+
+export function supportOpen(id: SupportSiteId): Promise<void> {
+  return invoke("support_open", { site: id });
+}
+
 // ---- the live link (Bet 9 follow-up). Dev builds only: the lab's Python reads the watch as a child process. ----
 
 /** One line from the live link: a status change or a reading (unix seconds, the product's metric id, an int). */

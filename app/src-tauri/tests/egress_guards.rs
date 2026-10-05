@@ -292,44 +292,57 @@ fn network_types_appear_only_in_the_coach_egress_module() {
 #[test]
 fn child_processes_are_spawned_only_by_the_sidecar_module() {
     // `std::process::id()` (a unique temp-folder name) is not a spawn; naming `Command` or `Stdio` is.
-    // Verified when this test was written: `src/sidecar.rs` starts the bundled core, and `src/coach/handoff.rs`
-    // (Bet 15c) opens one of five fixed sites in the system browser; no other file names `Command` or `Stdio`.
-    // `tests/inproc.rs` spawns the CLI, but a test file is not shipped code and is outside `src/`.
+    // `src/sidecar.rs` starts the bundled core. `src/coach/open_fixed.rs` (Bet 17) is the one spawner the
+    // hand-off and the support screen now share, opening one of a closed set of fixed sites in the system
+    // browser — `handoff.rs` carried this spawn alone until Bet 17 factored it out so `support.rs` could
+    // reuse it without a second `Command::new`. No other file names `Command` or `Stdio`. `tests/inproc.rs`
+    // spawns the CLI, but a test file is not shipped code and is outside `src/`.
     let src = manifest().join("src");
     let sidecar = src.join("sidecar.rs");
+    let open_fixed = src.join("coach").join("open_fixed.rs");
     let handoff = src.join("coach").join("handoff.rs");
+    let support = src.join("coach").join("support.rs");
     assert!(sidecar.is_file(), "the one spawning file exists");
-    assert!(handoff.is_file(), "the hand-off's opener exists");
+    assert!(open_fixed.is_file(), "the fixed-site opener exists");
+    assert!(handoff.is_file() && support.is_file(), "the hand-off and the support screen exist");
     let files = files_under(&src, "rs");
     assert!(files.len() >= 6, "the sources are where the test looks: {files:?}");
     for path in files {
-        if path == sidecar || path == handoff {
+        if path == sidecar || path == open_fixed {
             continue;
         }
         let code = text(&path);
         for word in ["Command::new", "process::Command", "std::process::{", "process::{", "Stdio::", "tokio::process"] {
-            assert!(!code.contains(word), "{} names `{word}` outside sidecar.rs or handoff.rs", path.display());
+            assert!(!code.contains(word), "{} names `{word}` outside sidecar.rs or open_fixed.rs", path.display());
         }
     }
     assert!(text(&sidecar).contains("Command::new("), "the pin would be empty if the sidecar stopped spawning");
 
-    // handoff.rs spawns exactly once, and only ever the fixed `/usr/bin/open` binary: no string built from
-    // input ever reaches `Command::new`, and no second egress route hides in the same file.
-    let handoff_code = text(&handoff);
-    let spawns: Vec<&str> = handoff_code.match_indices("Command::new(").map(|(i, _)| &handoff_code[i..]).collect();
-    assert_eq!(spawns.len(), 1, "handoff.rs spawns exactly once: {spawns:?}");
+    // open_fixed.rs spawns exactly once, and only ever the fixed `/usr/bin/open` binary: no string built
+    // from input ever reaches `Command::new`, and no second egress route hides in the same file.
+    let open_fixed_code = text(&open_fixed);
+    let spawns: Vec<&str> = open_fixed_code.match_indices("Command::new(").map(|(i, _)| &open_fixed_code[i..]).collect();
+    assert_eq!(spawns.len(), 1, "open_fixed.rs spawns exactly once: {spawns:?}");
     assert!(
         spawns[0].starts_with("Command::new(\"/usr/bin/open\")"),
-        "handoff.rs's one spawn names the fixed opener literally: {}",
+        "open_fixed.rs's one spawn names the fixed opener literally: {}",
         &spawns[0][..spawns[0].len().min(60)]
     );
-    let handoff_non_test = non_test_code(&handoff_code);
+    let open_fixed_non_test = non_test_code(&open_fixed_code);
     for word in ["egress", "ureq", "Url::parse"] {
-        assert!(!handoff_non_test.contains(word), "handoff.rs's non-test code names `{word}`");
+        assert!(!open_fixed_non_test.contains(word), "open_fixed.rs's non-test code names `{word}`");
     }
-    for line in handoff_non_test.lines() {
+    for line in open_fixed_non_test.lines() {
         if line.contains("format!(") {
-            assert!(!line.to_lowercase().contains("http"), "a format! in handoff.rs's non-test code names a URL scheme: {line}");
+            assert!(!line.to_lowercase().contains("http"), "a format! in open_fixed.rs's non-test code names a URL scheme: {line}");
+        }
+    }
+
+    // handoff.rs and support.rs delegate the spawn to open_fixed.rs: neither names Command or Stdio any more.
+    for (name, path) in [("handoff.rs", &handoff), ("support.rs", &support)] {
+        let code = text(path);
+        for word in ["Command", "Stdio"] {
+            assert!(!code.contains(word), "{name} names `{word}`: the spawn must live only in open_fixed.rs");
         }
     }
 }
@@ -356,6 +369,53 @@ fn handoff_never_touches_egress_and_handoff_build_never_touches_the_key_or_the_p
     for word in ["provider", "KeyHolder", "egress"] {
         assert!(!body.contains(word), "handoff_build's body names `{word}`: it must not touch the key or egress");
     }
+}
+
+#[test]
+fn support_and_open_fixed_never_touch_egress_and_the_support_commands_never_touch_the_key_or_the_provider() {
+    // Bet 17, the same shape as the hand-off's guard above: the support screen opens no network connection
+    // of its own, and its two commands in commands.rs never read the provider settings, the key or egress.
+    let support = manifest().join("src").join("coach").join("support.rs");
+    let open_fixed = manifest().join("src").join("coach").join("open_fixed.rs");
+    for path in [&support, &open_fixed] {
+        let code = text(path);
+        let non_test = non_test_code(&code);
+        for word in ["egress", "send(", "ureq", "Egress", "Url::parse"] {
+            assert!(!non_test.contains(word), "{} non-test code names `{word}`", path.display());
+        }
+        for line in non_test.lines() {
+            if line.contains("format!(") {
+                assert!(!line.to_lowercase().contains("http"), "a format! in {} non-test code names a URL scheme: {line}", path.display());
+            }
+        }
+    }
+
+    // `commands.rs::support_sites` and `support_open`: each sliced from its own `fn` to the next
+    // `#[tauri::command]` attribute, the same slicing `handoff_build` uses above.
+    let commands = manifest().join("src").join("coach").join("commands.rs");
+    let commands_code = text(&commands);
+    for fn_name in ["fn support_sites", "fn support_open"] {
+        let start = commands_code.find(fn_name).unwrap_or_else(|| panic!("{fn_name} exists in commands.rs"));
+        let rest = &commands_code[start..];
+        let end = rest[1..].find("#[tauri::command]").map_or(rest.len(), |i| i + 1);
+        let body = &rest[..end];
+        for word in ["provider", "KeyHolder", "egress"] {
+            assert!(!body.contains(word), "{fn_name}'s body names `{word}`: it must not touch the key or egress");
+        }
+    }
+}
+
+#[test]
+fn bundle_resources_are_exactly_the_two_core_sidecars() {
+    // No test pinned `bundle.resources` before Bet 17; it is the one door through which a bundled binary
+    // reaches the shipped app, and the two paths here are the only entries that door may ever carry.
+    let config: Value = serde_json::from_str(&text(&manifest().join("tauri.conf.json"))).expect("tauri.conf.json parses as json");
+    let resources = config["bundle"]["resources"].as_object().expect("bundle.resources is a map");
+    let keys: BTreeSet<String> = resources.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["resources/hearthbeat-core/".to_string(), "resources/disconect-core/".to_string()])
+    );
 }
 
 #[test]

@@ -17,6 +17,10 @@ use super::handoff::{self, HandoffError, HandoffText, ProviderId};
 use super::key::{self, KeyError, KeyHolder, KeyState};
 use super::probe::{self, ProbeReport};
 use super::settings::{self, Mode, Settings, SettingsError};
+// Bet 17: the support screen, its command and the nav entry are macOS-only — absent elsewhere, never
+// present-and-broken (there is no other desktop target today; see `lib.rs`'s two `generate_handler!` sets).
+#[cfg(target_os = "macos")]
+use super::support::{self, SupportSite};
 
 /// What a failed coach command tells the webview. Both strings come from closed enums. A failed question also
 /// carries what already left the machine before the failure: the tool calls whose results were in a request
@@ -32,7 +36,9 @@ pub struct CoachError {
 }
 
 impl CoachError {
-    fn plain(code: &'static str, message: &'static str, status: Option<u16>) -> CoachError {
+    /// `pub(crate)`: `support.rs`'s `From<SupportError> for CoachError` (Bet 17) builds one the same way
+    /// `From<HandoffError>` below does, without duplicating the struct literal.
+    pub(crate) fn plain(code: &'static str, message: &'static str, status: Option<u16>) -> CoachError {
         CoachError { code, message, status, trace: Vec::new(), sends: 0 }
     }
 
@@ -256,6 +262,32 @@ fn handoff_build_blocking<R: tauri::Runtime>(
 #[tauri::command]
 pub fn handoff_open(provider: ProviderId) -> Result<(), CoachErrorDto> {
     handoff::open_fixed_site(provider).map_err(CoachError::from)
+}
+
+/// One support channel, for the screen's list (Bet 17). `id` is the closed enum on the wire; `name` and
+/// `host` are [`support::name`] and [`support::host`] of that same arm, so the webview never builds a URL.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Serialize)]
+pub struct SupportSiteDto {
+    pub id: SupportSite,
+    pub name: &'static str,
+    pub host: &'static str,
+}
+
+/// The support channels this build ships (Bet 17). Empty until Guy picks one; see `support.rs`'s module
+/// doc for what adding a channel takes.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn support_sites() -> Vec<SupportSiteDto> {
+    support::SITES.iter().map(|&id| SupportSiteDto { id, name: support::name(id), host: support::host(id) }).collect()
+}
+
+/// Open one of the support channels in the system browser (Bet 17). The one argument is always one of
+/// [`support::SITES`]'s own values; no string ever crosses from the webview into it.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn support_open(site: SupportSite) -> Result<(), CoachErrorDto> {
+    support::open_support_site(site).map_err(CoachError::from)
 }
 
 /// Test the endpoint (slice 6): two synthetic requests, no tool, no core call, so a locked store is fine. The

@@ -2,7 +2,7 @@
 // Rules: every value carries its source word; a missing day is drawn as absence; the UI never
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
-import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, metricLabel, neutralText, scopeWord } from "./identity";
+import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, metricLabel, neutralText, scopeWord } from "./identity";
 import { disposeCharts, drawTrend, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
@@ -32,6 +32,7 @@ const SCREENS: { id: string; title: string }[] = [
   { id: "coach", title: "Coach" },
   { id: "coach-settings", title: "Coach settings" },
   { id: "key", title: "Your key" },
+  { id: "support", title: "Support" },
 ];
 
 const nav = document.getElementById("nav") as HTMLElement;
@@ -146,7 +147,7 @@ async function route(): Promise<void> {
   const id = current();
   // the coach settings need no data from the store (the probe works on a locked one), so they stay reachable
   // the watch screen reads the link, not the store
-  if (locked() && id !== "key" && id !== "coach-settings" && id !== "watch") {
+  if (locked() && id !== "key" && id !== "coach-settings" && id !== "watch" && id !== "support") {
     location.hash = "#/key"; // hashchange re-enters route()
     return;
   }
@@ -164,6 +165,7 @@ async function route(): Promise<void> {
     else if (id === "health") await screenHealth(out);
     else if (id === "coach") screenCoach(out, later);
     else if (id === "coach-settings") await screenCoachSettings(out);
+    else if (id === "support") await screenSupport(out);
     else await screenKey(out);
   } catch (e) {
     if (core.isCoreError(e) && e.code === "locked") {
@@ -1038,6 +1040,43 @@ async function screenCoachSettings(out: ParentNode): Promise<void> {
   out.append(testCard);
 
   out.append(el("p", "caption muted", "These settings are saved in a small file named coach.json in this app's configuration folder, on this computer. The provider key is never written to it."));
+}
+
+// ---- Support (Bet 17, donations only) --------------------------------------------------
+// This screen opens no network connection of its own: the buttons open the system browser. Off macOS the
+// command does not exist (lib.rs's cfg), so a rejected core.supportSites() draws the same empty card.
+async function screenSupport(out: ParentNode): Promise<void> {
+  header(out, "Support", "If this app is useful to you");
+  const intro = el("div", "card");
+  intro.append(el("p", "body", SUPPORT_INTRO));
+  intro.append(el("p", "caption muted", SUPPORT_NETWORK));
+  out.append(intro);
+
+  const sites = await core.supportSites().catch(() => [] as core.SupportSiteDto[]);
+  if (!sites.length) {
+    out.append(el("div", "card body", SUPPORT_EMPTY));
+    return;
+  }
+  for (const s of sites) {
+    const card = el("div", "card");
+    card.append(el("h2", "heading", s.name));
+    card.append(el("span", "caption muted", s.host));
+    const button = el("button", "", `Open ${s.host}`) as HTMLButtonElement;
+    button.setAttribute("aria-label", `Open ${s.host} in your browser`);
+    const status = el("p", "caption");
+    button.onclick = async () => {
+      try {
+        await core.supportOpen(s.id);
+        status.textContent = "";
+        status.className = "caption";
+      } catch {
+        status.textContent = "The browser could not be opened.";
+        status.className = "caption error";
+      }
+    };
+    card.append(button, status);
+    out.append(card);
+  }
 }
 
 // ---- Boot -------------------------------------------------------------------------------

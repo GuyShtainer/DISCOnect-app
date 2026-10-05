@@ -13,8 +13,8 @@
 //!
 //! **The URL is unrepresentable, not validated.** [`ProviderId`] is a closed enum; [`site`] `match`es it to a
 //! `&'static str` literal. No string URL is ever built from input, here or anywhere else: [`open_fixed_site`]
-//! is the only function in this crate besides `sidecar.rs` that spawns a child process, and the one argument
-//! it ever passes to `/usr/bin/open` is one of those five literals.
+//! calls into [`super::open_fixed`], the one spawner this crate shares with `support.rs` besides
+//! `sidecar.rs`, and the one argument it ever passes along is one of those five literals.
 //!
 //! This file touches neither [`super::settings`] nor [`super::key`] nor `super::provider`: the hand-off
 //! works while the coach is off, and opens no network connection of its own.
@@ -135,28 +135,13 @@ fn from_gate(failure: GateFailure) -> HandoffError {
     }
 }
 
-/// Open `site(provider)` in the system browser: the one spawn in this file, and its only argument.
-#[cfg(target_os = "macos")]
+/// Open `site(provider)` in the system browser, through the one spawner this crate shares with
+/// `support.rs` ([`super::open_fixed::open_fixed`]).
 pub fn open_fixed_site(provider: ProviderId) -> Result<(), HandoffError> {
-    use std::process::{Command, Stdio};
-    let status = Command::new("/usr/bin/open")
-        .arg(site(provider))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|_| HandoffError::OpenFailed)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(HandoffError::OpenFailed)
-    }
-}
-
-/// Not macOS: there is no fixed-site opener for this target.
-#[cfg(not(target_os = "macos"))]
-pub fn open_fixed_site(_provider: ProviderId) -> Result<(), HandoffError> {
-    Err(HandoffError::Unsupported)
+    super::open_fixed::open_fixed(site(provider)).map_err(|e| match e {
+        super::open_fixed::OpenError::OpenFailed => HandoffError::OpenFailed,
+        super::open_fixed::OpenError::Unsupported => HandoffError::Unsupported,
+    })
 }
 
 // ---- the text -----------------------------------------------------------------------------------------
