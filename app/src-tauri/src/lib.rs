@@ -39,16 +39,24 @@ fn core_of(state: &State<'_, Core>) -> Result<Sidecar, CoreError> {
 
 /// Generic relay. `key.unlock` is refused here; see [`core_unlock`].
 #[tauri::command]
-async fn core_call(state: State<'_, Core>, method: String, params: Option<Value>) -> Result<Value, CoreError> {
+async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String, params: Option<Value>) -> Result<Value, CoreError> {
     let core = core_of(&state)?;
-    core.call(&method, params.unwrap_or(Value::Object(Default::default()))).await
+    let answer = core.call(&method, params.unwrap_or(Value::Object(Default::default()))).await;
+    if method == "key.unlock" && answer.as_ref().is_ok_and(|v| v.get("unlocked").and_then(Value::as_bool) == Some(true)) {
+        live::paid_on_unlock(&app);
+    }
+    answer
 }
 
 /// The passphrase arrives as `Zeroizing<String>` and is never cloned, formatted or logged.
 #[tauri::command]
-async fn core_unlock(state: State<'_, Core>, passphrase: Zeroizing<String>) -> Result<Value, CoreError> {
+async fn core_unlock(app: tauri::AppHandle, state: State<'_, Core>, passphrase: Zeroizing<String>) -> Result<Value, CoreError> {
     let core = core_of(&state)?;
-    core.unlock(passphrase).await
+    let answer = core.unlock(passphrase).await;
+    if answer.is_ok() {
+        live::paid_on_unlock(&app);
+    }
+    answer
 }
 
 /// The command Claude Desktop should run to use this app's core as its MCP server.

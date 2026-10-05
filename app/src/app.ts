@@ -240,12 +240,16 @@ const liveLatest = new Map<string, { value: number; t: number }>();
 let liveStatus = "idle";
 let liveStop: string | null = null;
 let liveRunning = false;
+let liveStored: string | null = null; // what the sweep of the readings folder said after the last link ended
 const liveNodes: { values: Map<string, HTMLElement>; since: Map<string, HTMLElement>; status: HTMLElement | null; button: HTMLButtonElement | null } = {
   values: new Map(), since: new Map(), status: null, button: null,
 };
 
 function liveStatusWord(): string {
-  if (liveStatus === "stopped") return liveStop ? `stopped (${liveStop.replaceAll(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()})` : "stopped";
+  if (liveStatus === "stopped") {
+    const base = liveStop ? `stopped (${liveStop.replaceAll(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()})` : "stopped";
+    return liveStored ? `${base} · ${liveStored}` : base;
+  }
   return liveStatus;
 }
 
@@ -291,6 +295,7 @@ async function toggleLive(): Promise<void> {
     } else {
       liveLatest.clear();
       liveStop = null;
+      liveStored = null;
       liveStatus = "starting";
       drawLive();
       await core.liveStart();
@@ -342,13 +347,17 @@ async function screenWatch(out: ParentNode, later: Later): Promise<void> {
     cards.append(tile);
   }
   out.append(cards);
-  out.append(el("p", "caption muted", "Every reading is collected in the lab's raw folder on this Mac, never in the store yet. The watch is only read; nothing is written to it."));
+  out.append(el("p", "caption muted", "Every reading is collected in the lab's raw folder on this Mac, and stored when the link ends. The watch is only read; nothing is written to it."));
   liveNodes.status = status;
   liveNodes.button = button;
   later(drawLive);
 }
 
 void core.onLiveLine(onLive);
+void core.onLiveStored((text) => {
+  liveStored = text;
+  drawLive();
+});
 void core.onLiveEnded(() => {
   liveRunning = false;
   if (liveStatus !== "stopped") liveStatus = "stopped";

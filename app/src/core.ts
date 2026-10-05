@@ -180,3 +180,8 @@ export function onLiveLine(cb: (line: LiveLine) => void): Promise<UnlistenFn> {
 export function onLiveEnded(cb: (exit: number | null) => void): Promise<UnlistenFn> {
   return listen("live://ended", (e) => cb((e.payload as { exit: number | null }).exit));
 }
+
+/** What the sweep of the readings folder answered after a link ended: "stored", "already stored" or "not stored (…)". */
+export function onLiveStored(cb: (text: string) => void): Promise<UnlistenFn> {
+  return listen("live://stored", (e) => cb((e.payload as { text: string }).text));
+}
