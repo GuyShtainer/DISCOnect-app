@@ -102,7 +102,7 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
     );
     assert_eq!(
         stdout(&pulled).trim(),
-        "pulled 1 bundle(s): 2 new, 0 duplicate, 0 invalid, 0 conflict(s), 0 new range(s); rejected 0; gaps 0"
+        "pulled 1 bundle(s): 2 new, 0 duplicate, 0 invalid, 0 conflict(s), 0 new range(s); rejected 0; gaps 0; repaired 0"
     );
     let again = cli.run(&b, &["sync", "pull"]);
     assert_eq!(code(&again), 0);
@@ -136,7 +136,7 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
     let partial = cli.run(&b, &["sync", "pull"]);
     assert_eq!(code(&partial), 1);
     assert!(
-        stdout(&partial).trim().ends_with("rejected 1; gaps 0"),
+        stdout(&partial).trim().ends_with("rejected 1; gaps 0; repaired 0"),
         "{}",
         stdout(&partial)
     );

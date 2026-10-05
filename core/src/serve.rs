@@ -1026,6 +1026,7 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         "records_invalid": pulled.records_invalid,
         "conflicts": pulled.conflicts,
         "ranges_new": pulled.ranges_new,
+        "records_repaired": pulled.records_repaired,
         "gaps": pulled.gaps.len(),
         "status": pulled.status,
     });

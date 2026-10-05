@@ -15,7 +15,7 @@
 //! `payload_hash`; the batch streams (readiness) have no time of their own, so the hash alone
 //! decides. The loser's bytes go to `raw_superseded`, the decision to `sync_conflicts`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -86,6 +86,8 @@ pub struct PullResult {
     pub records_invalid: i64,
     pub conflicts: i64,
     pub ranges_new: i64,
+    /// Stored copies whose bytes no longer matched their hash, refetched from the relay.
+    pub records_repaired: i64,
     pub gaps: Vec<Gap>,
     pub status: &'static str,
 }
@@ -100,6 +102,7 @@ impl Default for PullResult {
             records_invalid: 0,
             conflicts: 0,
             ranges_new: 0,
+            records_repaired: 0,
             gaps: Vec::new(),
             status: "ok",
         }
@@ -566,9 +569,72 @@ fn conflict_recorded(
 }
 
 /// Fetch and apply every bundle on the relay this store has not applied yet.
+/// `_repair_damaged`: every stored record the relay has carried (`relay_seen`) is checked against its
+/// hash; a copy whose bytes no longer inflate to it is refetched from the bundle that carried it and the
+/// streams it feeds are re-derived. Without this a damaged copy stays damaged forever: a peer never pushes
+/// a pulled record back, and the conflict rule, meeting bytes that do not decode, would hand the key to
+/// whatever arrives next. A bundle the relay no longer has leaves the record as it is (nothing fails).
+fn repair_damaged(
+    conn: &Connection,
+    master: &[u8],
+    relay: &dyn Relay,
+    result: &mut PullResult,
+) -> Result<(), SyncError> {
+    let mut damaged: BTreeMap<String, Vec<(i64, String, String)>> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.payload, r.payload_hash, r.stream, s.bundle FROM raw_records r \
+             JOIN relay_seen s ON s.raw_record_id = r.id ORDER BY r.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, payload, digest, stream, bundle) = row?;
+            let intact = sources::inflate(&payload).is_some_and(|data| sha256_hex(&data) == digest);
+            if !intact {
+                damaged.entry(bundle).or_default().push((id, digest, stream));
+            }
+        }
+    }
+    let mut streams: BTreeSet<String> = BTreeSet::new();
+    for (bundle_name, wanted) in damaged {
+        let Ok(blob) = relay.get(&bundle_name) else { continue };
+        let Ok(bundle) = unpack(master, &bundle_name, &blob) else { continue };
+        let by_hash: HashMap<&str, &RawRow> = bundle
+            .records
+            .iter()
+            .filter(|r| verify(r).is_some())
+            .map(|r| (r.payload_hash.as_str(), r))
+            .collect();
+        for (id, digest, stream) in wanted {
+            let Some(record) = by_hash.get(digest.as_str()) else { continue };
+            conn.execute(
+                "UPDATE raw_records SET payload=? WHERE id=?",
+                params![record.payload, id],
+            )?;
+            conn.execute("DELETE FROM import_failures WHERE raw_record_id=?", params![id])?;
+            result.records_repaired += 1;
+            streams.insert(stream);
+        }
+    }
+    if !streams.is_empty() {
+        let streams: Vec<String> = streams.into_iter().collect();
+        sources::reparse_all(conn, Some(&streams), true)?;
+    }
+    Ok(())
+}
+
 pub fn pull(conn: &Connection, master: &[u8], relay: &dyn Relay) -> Result<PullResult, SyncError> {
     let account = account_for(master);
     let mut result = PullResult::default();
+    repair_damaged(conn, master, relay, &mut result)?;
     let names = |status: &str| -> rusqlite::Result<HashSet<String>> {
         let mut stmt = conn.prepare("SELECT name FROM relay_bundles WHERE status=?")?;
         let mapped = stmt.query_map(params![status], |r| r.get::<_, String>(0))?;
