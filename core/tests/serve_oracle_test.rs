@@ -136,6 +136,11 @@ fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_store_
     replay("empty.hbdb", "oracle-empty.jsonl.gz");
 }
 
+#[test]
+fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_store_with_live_readings() {
+    replay("synthetic-live.hbdb", "oracle-synthetic-live.jsonl.gz");
+}
+
 fn replay(store_file: &str, oracle_file: &str) {
     let script: Value = serde_json::from_str(
         &std::fs::read_to_string(fixtures().join("script.json")).expect("script"),
