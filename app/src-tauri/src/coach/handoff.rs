@@ -118,8 +118,8 @@ impl HandoffError {
         match self {
             HandoffError::BadWindow => "the window must be 7, 28 or 90 days",
             HandoffError::Withheld => "a tool answer was withheld; nothing was built",
-            HandoffError::TooLarge => "a tool answer was too large to send, even after shrinking",
-            HandoffError::Tool(_) => "a tool call failed while building the hand-off text",
+            HandoffError::TooLarge => "a tool answer was too large to copy, even after shrinking",
+            HandoffError::Tool(_) => "a tool call failed; the hand-off could not be built",
             HandoffError::OpenFailed => "the browser could not be opened",
             HandoffError::Unsupported => "this computer has no fixed-site opener for a hand-off",
         }
@@ -164,6 +164,10 @@ pub fn open_fixed_site(_provider: ProviderId) -> Result<(), HandoffError> {
 /// `window_days` values [`build_text`] accepts.
 const WINDOWS: [u8; 3] = [7, 28, 90];
 
+/// The most bytes [`build_text`] ever returns (the five caps sum to 80 KiB; the rest is headings and notes).
+/// Enforced in code, not only pinned by a test: a larger text is [`HandoffError::TooLarge`].
+pub const MAX_BYTES: usize = 96 * 1024;
+
 /// Five daily metrics (one clean value per day), from the read contract: steps, the day's resting heart
 /// rate, sleep length, the day's average stress and the day's highest energy reserve. Chosen for being a
 /// single number per day; the loop's other metrics are sampled many times a day and would each need a mean,
@@ -182,11 +186,18 @@ pub struct Shortened {
 }
 
 /// What [`build_text`] returns: the text ready to copy, its byte length, and how much of it was shortened.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct HandoffText {
     pub text: String,
     pub bytes: usize,
     pub shortened: Shortened,
+}
+
+impl std::fmt::Debug for HandoffText {
+    /// Never the text: only its size.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HandoffText({} bytes)", self.bytes)
+    }
 }
 
 fn count_shortening(value: &Value, into: &mut Shortened) {
@@ -250,7 +261,10 @@ pub fn build_text(
     body.push_str(" — a day-level summary of my own watch data, pasted by me\n");
     body.push_str(DISCLAIMER);
     body.push('\n');
-    body.push_str(&format!("Window: the last {window_days} days; sleep detail: the latest night.\n"));
+    match &night {
+        Some(date) => body.push_str(&format!("Window: the last {window_days} days; sleep detail: the night of {date}, the latest recorded.\n")),
+        None => body.push_str(&format!("Window: the last {window_days} days; sleep detail: none, no night is recorded.\n")),
+    }
 
     let sections: [(&str, Option<&Validated>); 5] = [
         ("get_data_health", Some(&health)),
@@ -269,7 +283,7 @@ pub fn build_text(
                 body.push_str(&v.compact());
                 body.push('\n');
             }
-            None => body.push_str("\nNo night was recorded in this window, so there is no sleep detail to add.\n"),
+            None => body.push_str("\nNo night is recorded in your data, so there is no sleep detail to add.\n"),
         }
     }
 
@@ -282,6 +296,9 @@ pub fn build_text(
 
     let text = neutral_text(&body);
     let bytes = text.len();
+    if bytes > MAX_BYTES {
+        return Err(HandoffError::TooLarge);
+    }
     Ok(HandoffText { text, bytes, shortened })
 }
 

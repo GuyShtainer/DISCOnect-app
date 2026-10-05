@@ -758,7 +758,7 @@ async function prepareHandoff(): Promise<void> {
   } catch (e) {
     if (seq !== handoffSeq) return;
     handoffBuilding = false;
-    handoffStatus = core.coachErrorText(e);
+    handoffStatus = core.handoffErrorText(e);
     handoffStatusError = true;
   }
   void route();
@@ -777,7 +777,7 @@ function handoffCard(): HTMLElement {
     const row = el("label", "choice body") as HTMLLabelElement;
     const radio = el("input") as HTMLInputElement;
     radio.type = "radio"; radio.name = "handoff-window"; radio.value = String(days); radio.checked = days === handoffWindow;
-    radio.onchange = () => { handoffWindow = days; };
+    radio.onchange = () => { handoffWindow = days; handoff = null; handoffStatus = ""; void route(); };
     row.append(radio, el("span", "", `${days} days`));
     windowGroup.append(row);
   }
@@ -803,7 +803,7 @@ function handoffCard(): HTMLElement {
   const providerRow = el("div", "actions");
   for (const p of PROVIDERS) {
     const btn = el("button", "secondary", p.name) as HTMLButtonElement;
-    if (p.id === handoffProvider) btn.setAttribute("aria-pressed", "true");
+    btn.setAttribute("aria-pressed", String(p.id === handoffProvider));
     btn.onclick = () => { handoffProvider = p.id; void route(); };
     providerRow.append(btn);
   }
@@ -827,21 +827,23 @@ function handoffCard(): HTMLElement {
       handoffCopying = true;
       copyOpen.disabled = true;
       navigator.clipboard.writeText(text).then(
-        () => core.handoffOpen(provider).then(
-          () => {
-            handoffStatus = `Copied ${bytes} bytes; ${host} opened. Paste with ⌘V.`;
-            handoffStatusError = false;
-            handoffCopiedOnce = true;
-            handoffCopying = false;
-            void route();
-          },
-          (e) => {
-            handoffStatus = core.coachErrorText(e);
-            handoffStatusError = true;
-            handoffCopying = false;
-            void route();
-          },
-        ),
+        () => {
+          handoffCopiedOnce = true; // the text is in the clipboard from here on, whatever the open does
+          return core.handoffOpen(provider).then(
+            () => {
+              handoffStatus = `Copied ${bytes} bytes; ${host} opened. Paste with ⌘V.`;
+              handoffStatusError = false;
+              handoffCopying = false;
+              void route();
+            },
+            () => {
+              handoffStatus = `Copied ${bytes} bytes; the browser could not be opened. Paste with ⌘V, or replace the clipboard below.`;
+              handoffStatusError = true;
+              handoffCopying = false;
+              void route();
+            },
+          );
+        },
         () => {
           handoffStatus = "The clipboard refused the write; nothing was opened.";
           handoffStatusError = true;
@@ -856,11 +858,18 @@ function handoffCard(): HTMLElement {
   if (handoffCopiedOnce) {
     const replace = el("button", "secondary", "Replace the clipboard") as HTMLButtonElement;
     replace.onclick = () => {
-      navigator.clipboard.writeText(" ").then(() => {
-        handoffStatus = "The clipboard now holds a space.";
-        handoffStatusError = false;
-        void route();
-      });
+      navigator.clipboard.writeText(" ").then(
+        () => {
+          handoffStatus = "The clipboard now holds a space.";
+          handoffStatusError = false;
+          void route();
+        },
+        () => {
+          handoffStatus = "The clipboard refused the write; it still holds the copied text.";
+          handoffStatusError = true;
+          void route();
+        },
+      );
     };
     card.append(replace);
   }

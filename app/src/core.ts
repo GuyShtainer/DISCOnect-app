@@ -126,6 +126,15 @@ export function handoffBuild(windowDays: 7 | 28 | 90, includePoints: boolean): P
 
 /** Open one of the five fixed sites in the system browser. The one argument is always a closed enum value;
  *  no string ever crosses from the webview into it. */
+/** `code: message` from a hand-off error, else a fixed hand-off sentence (never the coach's wording). */
+export function handoffErrorText(e: unknown): string {
+  if (typeof e === "object" && e !== null && typeof (e as CoachError).code === "string" && typeof (e as CoachError).message === "string") {
+    const err = e as CoachError;
+    return `${err.code}: ${err.message}`;
+  }
+  return "handoff_failed: the hand-off could not be built";
+}
+
 export function handoffOpen(provider: ProviderId): Promise<void> {
   return invoke("handoff_open", { provider });
 }

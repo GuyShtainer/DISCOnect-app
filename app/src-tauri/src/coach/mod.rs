@@ -4,8 +4,9 @@
 //!
 //! What a tool answer may carry out of the machine is decided by three pure modules, in this order:
 //! [`views::project`] (an allowlist projection), [`schema::validate`] (a fail-closed positive schema) and
-//! [`caps::fit`] (byte budgets). [`gate::gate_tool`] runs a clamped tool call through all three, in that
-//! order; it is the one chain both [`chat_loop`] and [`handoff`] use.
+//! [`caps::fit`] (byte budgets). [`gate::gate_tool`] runs a clamped tool call through the projection, then
+//! `fit`, then the schema (the shrunken value is what gets validated); it is the one gate both [`chat_loop`]
+//! and [`handoff`] use.
 //!
 //! The loop (slice 5): [`prompt`] is the system prompt, [`wire`] the chat-completions format, [`chat_loop`] one
 //! question end to end with its window manager, [`commands::coach_ask`] the Tauri command over it.
