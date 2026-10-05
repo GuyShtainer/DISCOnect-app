@@ -36,7 +36,7 @@ impl OpenError {
 /// `&'static str` literal from a caller's own closed `match` — never a string built from anything read at
 /// runtime.
 #[cfg(target_os = "macos")]
-pub fn open_fixed(site: &'static str) -> Result<(), OpenError> {
+pub(crate) fn open_fixed(site: &'static str) -> Result<(), OpenError> {
     use std::process::{Command, Stdio};
     let status = Command::new("/usr/bin/open")
         .arg(site)
@@ -54,7 +54,7 @@ pub fn open_fixed(site: &'static str) -> Result<(), OpenError> {
 
 /// Not macOS: there is no fixed-site opener for this target.
 #[cfg(not(target_os = "macos"))]
-pub fn open_fixed(_site: &'static str) -> Result<(), OpenError> {
+pub(crate) fn open_fixed(_site: &'static str) -> Result<(), OpenError> {
     Err(OpenError::Unsupported)
 }
 

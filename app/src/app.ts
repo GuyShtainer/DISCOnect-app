@@ -2,7 +2,7 @@
 // Rules: every value carries its source word; a missing day is drawn as absence; the UI never
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
-import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, metricLabel, neutralText, scopeWord } from "./identity";
+import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord } from "./identity";
 import { disposeCharts, drawTrend, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
@@ -91,10 +91,15 @@ function coachFlag(): HTMLElement {
   return flag;
 }
 
+// Bet 17: the Support row is drawn only where the opener command exists (macOS; lib.rs's cfg). The probe
+// at boot flips this off when `support_sites` is absent, so the row is absent there, never present-and-broken.
+let supportShown = true;
+
 function renderNav(): void {
   nav.replaceChildren();
   nav.append(el("div", "brand", PRODUCT));
   for (const s of SCREENS) {
+    if (s.id === "support" && !supportShown) continue;
     const a = el("a", "", s.title) as HTMLAnchorElement;
     a.href = `#/${s.id}`;
     if (current() === s.id) a.setAttribute("aria-current", "page");
@@ -1044,7 +1049,7 @@ async function screenCoachSettings(out: ParentNode): Promise<void> {
 
 // ---- Support (Bet 17, donations only) --------------------------------------------------
 // This screen opens no network connection of its own: the buttons open the system browser. Off macOS the
-// command does not exist (lib.rs's cfg), so a rejected core.supportSites() draws the same empty card.
+// command does not exist (lib.rs's cfg): the nav row is hidden and a direct visit draws SUPPORT_UNAVAILABLE.
 async function screenSupport(out: ParentNode): Promise<void> {
   header(out, "Support", "If this app is useful to you");
   const intro = el("div", "card");
@@ -1052,7 +1057,11 @@ async function screenSupport(out: ParentNode): Promise<void> {
   intro.append(el("p", "caption muted", SUPPORT_NETWORK));
   out.append(intro);
 
-  const sites = await core.supportSites().catch(() => [] as core.SupportSiteDto[]);
+  const sites = await core.supportSites().catch(() => null);
+  if (sites === null) {
+    out.append(el("div", "card body", SUPPORT_UNAVAILABLE));
+    return;
+  }
   if (!sites.length) {
     out.append(el("div", "card body", SUPPORT_EMPTY));
     return;
@@ -1061,7 +1070,7 @@ async function screenSupport(out: ParentNode): Promise<void> {
     const card = el("div", "card");
     card.append(el("h2", "heading", s.name));
     card.append(el("span", "caption muted", s.host));
-    const button = el("button", "", `Open ${s.host}`) as HTMLButtonElement;
+    const button = el("button", "secondary", `Open ${s.host}`) as HTMLButtonElement;
     button.setAttribute("aria-label", `Open ${s.host} in your browser`);
     const status = el("p", "caption");
     button.onclick = async () => {
@@ -1094,6 +1103,7 @@ void core.onCoreEvent("exited", () => { banner = "The core stopped and could not
 void (async () => {
   await refreshKey();
   if (locked() && (await core.unlockFromKeychain())) await refreshKey();
+  await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);
   const i = args.indexOf("--screen");
   const wanted = i >= 0 && SCREENS.some((s) => s.id === args[i + 1]) ? args[i + 1] : null;

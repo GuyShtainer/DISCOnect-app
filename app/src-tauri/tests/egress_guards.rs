@@ -328,6 +328,21 @@ fn child_processes_are_spawned_only_by_the_sidecar_module() {
         "open_fixed.rs's one spawn names the fixed opener literally: {}",
         &spawns[0][..spawns[0].len().min(60)]
     );
+    // The `&'static str` type is what keeps a runtime string out of the spawn; `String::leak`/`Box::leak`
+    // would manufacture one, so no coach file may name `leak`, and only the two closed tables may call in.
+    for path in files_under(&src.join("coach"), "rs") {
+        let code = text(&path);
+        let non_test = non_test_code(&code);
+        for call in [".leak(", "::leak("] {
+            assert!(!non_test.contains(call), "{} calls `{call}` in non-test code", path.display());
+        }
+        let calls = non_test.matches("open_fixed(").count();
+        if path == handoff || path == support {
+            assert_eq!(calls, 1, "{} calls open_fixed exactly once", path.display());
+        } else if path != open_fixed {
+            assert_eq!(calls, 0, "{} calls open_fixed; only handoff.rs and support.rs may", path.display());
+        }
+    }
     let open_fixed_non_test = non_test_code(&open_fixed_code);
     for word in ["egress", "ureq", "Url::parse"] {
         assert!(!open_fixed_non_test.contains(word), "open_fixed.rs's non-test code names `{word}`");

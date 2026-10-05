@@ -6,8 +6,9 @@
 //! and touches neither [`super::settings`] nor [`super::key`] nor the coach's one choke point for the rest.
 //!
 //! **The table ships empty.** Which channels exist, if any, is Guy's decision, not this bet's: shipping a
-//! default would make it the author's choice instead. Adding one later is four edits, all in plain sight:
-//! one arm on [`SupportSite`]; one row each in [`site`], [`host`] and [`name`]; and one row in
+//! default would make it the author's choice instead. Adding one later is five edits, all in plain sight:
+//! one arm on [`SupportSite`]; one row each in [`site`], [`host`] and [`name`]; the arm listed in [`SITES`]
+//! (what the screen actually shows — an arm missing there ships invisible); and one row in
 //! `identity.ts`'s `SUPPORT_SITES` mirror (drift-pinned the same way `PROVIDERS` pins `handoff.rs`, by
 //! `test_lint_app.py`). The literal test below picks up a new arm by itself — it passes vacuously today
 //! because [`SITES`] is empty, and starts enforcing the day an arm exists.
@@ -126,5 +127,14 @@ mod tests {
             assert!(serde_json::from_str::<SupportSite>(&json).is_ok());
         }
         assert_eq!(SITES.len(), 0, "the table ships empty: the channels are Guy's decision");
+    }
+
+    /// The one property an empty enum has: it refuses every wire value. `support_open` therefore cannot be
+    /// called with anything today — not a made-up id, not a number, not null.
+    #[test]
+    fn the_empty_enum_refuses_every_wire_value() {
+        for wire in ["\"kofi\"", "\"\"", "0", "null", "{}", "[]"] {
+            assert!(serde_json::from_str::<SupportSite>(wire).is_err(), "{wire} was accepted");
+        }
     }
 }

@@ -29,6 +29,11 @@ export const PROVIDERS: { id: "chat_gpt" | "claude" | "gemini" | "le_chat" | "de
 export const SUPPORT_INTRO = "This app is free software. If it is useful to you, the maintainer takes support through these channels. Nothing is required, nothing in the app changes whether you give or not, nothing is recorded here, and this app has no way to learn whether you gave.";
 export const SUPPORT_NETWORK = "This screen opens no network connection; the buttons open your browser, under your own session with that service, governed by their terms, not ours.";
 export const SUPPORT_EMPTY = "No support channel is configured in this build.";
+// Off macOS the opener command does not exist (lib.rs); the nav row is hidden and this is what a direct
+// visit sees — not SUPPORT_EMPTY, which would be false on a build that does configure channels.
+export const SUPPORT_UNAVAILABLE = "This build cannot open a support channel in your browser.";
+// What the screen lists comes from the Rust table (`support_sites`); this mirror exists for the drift pin
+// only, so editing it alone changes nothing on screen — the lint says so when the two disagree.
 export const SUPPORT_SITES: { id: string; name: string; host: string }[] = [];
 
 // Names mirrored from identity.py (tests/test_identity_drift.py fails on drift).
