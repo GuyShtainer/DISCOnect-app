@@ -76,7 +76,7 @@ impl From<SettingsError> for CoachError {
     }
 }
 
-fn config_dir(app: &tauri::AppHandle) -> Result<PathBuf, CoachError> {
+fn config_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, CoachError> {
     app.path()
         .app_config_dir()
         .map_err(|_| CoachError::from(SettingsError::NotWritable))
@@ -180,7 +180,7 @@ pub struct CoachReply {
 /// later request of the question (the gate closure of [`ask_blocking`]). The loop is synchronous, so it runs on a blocking
 /// thread, and its tool runner calls the core's `tools.call` from there.
 #[tauri::command]
-pub async fn coach_ask(app: tauri::AppHandle, text: String) -> Result<CoachReply, CoachErrorDto> {
+pub async fn coach_ask<R: tauri::Runtime>(app: tauri::AppHandle<R>, text: String) -> Result<CoachReply, CoachErrorDto> {
     let settings = config_dir(&app).map(|dir| settings::load(&dir)).unwrap_or_default();
     chat_loop::gate(&settings)?;
     tauri::async_runtime::spawn_blocking(move || ask_blocking(&app, &settings, &text))
@@ -188,7 +188,7 @@ pub async fn coach_ask(app: tauri::AppHandle, text: String) -> Result<CoachReply
         .map_err(|_| CoachError::from(KeyError::Busy))?
 }
 
-fn ask_blocking(app: &tauri::AppHandle, settings: &Settings, text: &str) -> Result<CoachReply, CoachErrorDto> {
+fn ask_blocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &Settings, text: &str) -> Result<CoachReply, CoachErrorDto> {
     let core = app.state::<crate::Core>().0.clone();
     let call_tool = move |name: &str, arguments: Value| -> Result<Value, ToolCallError> {
         let core = core.as_ref().map_err(|e| ToolCallError { code: e.code.clone() })?;
@@ -294,6 +294,25 @@ mod tests {
         assert_eq!(held.question_sends, 5, "nothing was cleared");
         drop(held);
         assert_eq!(reset_conversation(&state), Ok(()));
+    }
+
+    /// The command through a real `AppHandle` (mock runtime): with no settings saved the coach is off, so the
+    /// question is refused by the gate before the key holder or the core is consulted — the core here is an
+    /// error value, and a key holder that is never read stays empty. Nothing is written anywhere.
+    #[test]
+    fn coach_ask_through_an_app_handle_is_refused_by_the_gate_before_any_key_or_core_read() {
+        let app = tauri::test::mock_builder()
+            .manage(crate::Core(Err(crate::sidecar::CoreError::new("locked", "no core in this test"))))
+            .manage(KeyHolder::default())
+            .manage(CoachState::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        let handle = app.handle().clone();
+        let error = tauri::async_runtime::block_on(coach_ask(handle.clone(), "how did I sleep?".into())).expect_err("off");
+        assert_eq!((error.code, error.sends, error.trace.len()), ("off", 0, 0));
+        let state = handle.state::<CoachState>();
+        let conversation = state.conversation.lock().unwrap();
+        assert_eq!((conversation.question_sends, conversation.trace.len()), (0, 0), "the gate refused before the loop ran");
     }
 
     #[test]
