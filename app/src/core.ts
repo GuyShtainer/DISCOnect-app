@@ -112,3 +112,29 @@ export function coachErrorText(e: unknown): string {
   }
   return "coach_failed: the request did not complete";
 }
+
+// ---- the live link (Bet 9 follow-up). Dev builds only: the lab's Python reads the watch as a child process. ----
+
+/** One line from the live link: a status change or a reading (unix seconds, the product's metric id, an int). */
+export type LiveLine = { status?: string; stop?: string; t?: number; metric?: string; value?: number };
+export type LiveStatus = { running: boolean; available: boolean };
+
+export function liveStart(): Promise<LiveStatus> {
+  return invoke<LiveStatus>("live_start");
+}
+
+export function liveStop(): Promise<LiveStatus> {
+  return invoke<LiveStatus>("live_stop");
+}
+
+export function liveState(): Promise<LiveStatus> {
+  return invoke<LiveStatus>("live_state");
+}
+
+export function onLiveLine(cb: (line: LiveLine) => void): Promise<UnlistenFn> {
+  return listen("live://line", (e) => cb(e.payload as LiveLine));
+}
+
+export function onLiveEnded(cb: (exit: number | null) => void): Promise<UnlistenFn> {
+  return listen("live://ended", (e) => cb((e.payload as { exit: number | null }).exit));
+}

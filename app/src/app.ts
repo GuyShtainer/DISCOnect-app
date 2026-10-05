@@ -26,6 +26,7 @@ const SCOPES = ["device", "vendor_cloud", "local"];
 const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "steps", "sleep_score", "stress_avg", "hrv_last_night_average", "sleep_duration"];
 const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
+  { id: "watch", title: "Watch" },
   { id: "trend", title: "Trends" },
   { id: "health", title: "Data health" },
   { id: "coach", title: "Coach" },
@@ -144,7 +145,8 @@ async function route(): Promise<void> {
   renderNav();
   const id = current();
   // the coach settings need no data from the store (the probe works on a locked one), so they stay reachable
-  if (locked() && id !== "key" && id !== "coach-settings") {
+  // the watch screen reads the link, not the store
+  if (locked() && id !== "key" && id !== "coach-settings" && id !== "watch") {
     location.hash = "#/key"; // hashchange re-enters route()
     return;
   }
@@ -157,6 +159,7 @@ async function route(): Promise<void> {
   }
   try {
     if (id === "today") await screenToday(out);
+    else if (id === "watch") await screenWatch(out, later);
     else if (id === "trend") await screenTrend(out, later);
     else if (id === "health") await screenHealth(out);
     else if (id === "coach") screenCoach(out, later);
@@ -221,6 +224,129 @@ async function screenToday(out: ParentNode): Promise<void> {
   card.append(el("span", "caption muted", "Comparisons are against your own history only. They describe; they do not diagnose."));
   out.append(card);
 }
+
+// ---- Watch (the live link, Bet 9 follow-up) -----------------------------------------------
+// The lab's Python reads the watch over Bluetooth as a child of the app; every reading arrives as an event and
+// is also collected in the lab's raw folder on this Mac. The screen only draws the latest value per metric.
+const LIVE_ORDER = ["heart_rate", "steps", "stress", "respiration_rate", "spo2", "energy_reserve"];
+const liveLatest = new Map<string, { value: number; t: number }>();
+let liveStatus = "idle";
+let liveStop: string | null = null;
+let liveRunning = false;
+const liveNodes: { values: Map<string, HTMLElement>; since: Map<string, HTMLElement>; status: HTMLElement | null; button: HTMLButtonElement | null } = {
+  values: new Map(), since: new Map(), status: null, button: null,
+};
+
+function liveStatusWord(): string {
+  if (liveStatus === "stopped") return liveStop ? `stopped (${liveStop.replaceAll(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()})` : "stopped";
+  return liveStatus;
+}
+
+function ago(t: number): string {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  return s < 60 ? `${s} s ago` : `${Math.round(s / 60)} min ago`;
+}
+
+function drawLive(): void {
+  if (liveNodes.status) liveNodes.status.textContent = liveStatusWord();
+  if (liveNodes.button) {
+    liveNodes.button.textContent = liveRunning ? "Disconnect" : "Connect to watch";
+    liveNodes.button.disabled = liveStatus === "scanning" || liveStatus === "connecting";
+  }
+  for (const [metric, node] of liveNodes.values) {
+    const latest = liveLatest.get(metric);
+    node.textContent = latest ? String(latest.value) : "—";
+    node.classList.toggle("muted", !latest);
+    const since = liveNodes.since.get(metric);
+    if (since) since.textContent = latest ? ago(latest.t) : "no reading yet";
+  }
+}
+
+function onLive(line: core.LiveLine): void {
+  if (typeof line.status === "string") {
+    liveStatus = line.status;
+    liveStop = typeof line.stop === "string" ? line.stop : null;
+    if (line.status === "stopped") liveRunning = false;
+  }
+  if (typeof line.metric === "string" && typeof line.value === "number" && typeof line.t === "number") {
+    liveLatest.set(line.metric, { value: line.value, t: line.t });
+  }
+  drawLive();
+}
+
+async function toggleLive(): Promise<void> {
+  try {
+    if (liveRunning) {
+      await core.liveStop();
+      liveRunning = false;
+      liveStatus = "stopped";
+      liveStop = null;
+    } else {
+      liveLatest.clear();
+      liveStop = null;
+      liveStatus = "starting";
+      drawLive();
+      await core.liveStart();
+      liveRunning = true;
+    }
+  } catch (e) {
+    liveRunning = false;
+    liveStatus = "stopped";
+    liveStop = core.isCoreError(e) ? e.code : "error";
+  }
+  drawLive();
+}
+
+async function screenWatch(out: ParentNode, later: Later): Promise<void> {
+  const state = await core.liveState().catch(() => ({ running: false, available: false }));
+  liveRunning = state.running;
+  header(out, "Watch", "live readings over Bluetooth, read-only");
+  const card = el("div", "card");
+  const row = el("div", "actions");
+  const button = el("button", "", "Connect to watch");
+  button.onclick = () => void toggleLive();
+  if (!state.available) {
+    button.disabled = true;
+    card.append(el("p", "caption muted", "The live link runs in development builds only: this build has no lab to run."));
+  }
+  const cable = el("button", "secondary", "Cable sync");
+  cable.disabled = true;
+  cable.title = "Not wired yet";
+  row.append(button, cable);
+  card.append(row);
+  const status = el("p", "caption");
+  card.append(status);
+  card.append(el("p", "caption muted", "Turn the phone's Bluetooth off first: the watch talks to one device at a time, and it stays silent while the phone holds the link. The first connection shows a code on the watch; confirm it. Cable sync will copy the watch's files over USB for days without Bluetooth; it is not wired yet."));
+  out.append(card);
+  const cards = el("div", "cards");
+  liveNodes.values.clear();
+  liveNodes.since.clear();
+  for (const metric of LIVE_ORDER) {
+    const tile = el("div", "card");
+    tile.append(el("span", "caption muted", metricLabel(metric)));
+    const value = el("span", "value", "—");
+    const since = el("span", "caption muted", "no reading yet");
+    tile.append(value, since);
+    liveNodes.values.set(metric, value);
+    liveNodes.since.set(metric, since);
+    cards.append(tile);
+  }
+  out.append(cards);
+  out.append(el("p", "caption muted", "Every reading is collected in the lab's raw folder on this Mac, never in the store yet. The watch is only read; nothing is written to it."));
+  liveNodes.status = status;
+  liveNodes.button = button;
+  later(drawLive);
+}
+
+void core.onLiveLine(onLive);
+void core.onLiveEnded(() => {
+  liveRunning = false;
+  if (liveStatus !== "stopped") liveStatus = "stopped";
+  drawLive();
+});
+setInterval(() => {
+  if (liveNodes.status && document.contains(liveNodes.status)) drawLive();
+}, 1000);
 
 // ---- Trend ------------------------------------------------------------------------------
 let trendMetric = TREND_METRICS[0];

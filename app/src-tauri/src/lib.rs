@@ -8,6 +8,7 @@
 #[allow(dead_code)] // slices 5-8 fill it
 pub mod coach;
 pub mod inproc;
+pub mod live;
 pub mod sidecar;
 
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use sidecar::{CoreChoice, Launch};
 /// The core, or why it is not there. Stored in Tauri state so commands can reach it.
 pub struct Core(pub Result<Sidecar, CoreError>);
 
-struct WindowSink(tauri::AppHandle);
+pub(crate) struct WindowSink(pub(crate) tauri::AppHandle);
 
 impl EventSink for WindowSink {
     fn emit(&self, name: &str, payload: Value) {
@@ -202,20 +203,24 @@ pub fn run() {
             app.manage(Core(core));
             app.manage(coach::key::KeyHolder::default());
             app.manage(coach::commands::CoachState::default());
+            app.manage(live::LiveState::default());
             build_main_window(app)?;
             Ok(())
         });
     #[cfg(debug_assertions)]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file,
-        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe]);
+        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe,
+        live::live_start, live::live_stop, live::live_state]);
     #[cfg(not(debug_assertions))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command,
-        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe]);
+        coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe,
+        live::live_start, live::live_stop, live::live_state]);
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
+            handle.state::<live::LiveState>().stop();
             if let Ok(core) = &handle.state::<Core>().0 {
                 core.shutdown();
             }

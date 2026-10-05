@@ -620,6 +620,74 @@ pub fn locate_core(resource_dir: Option<&Path>, choice: Option<CoreChoice>) -> O
     None
 }
 
+// ---- the live link (Bet 9 follow-up, 2026-10-05) ---------------------------------------------------------
+//
+// A read-only Bluetooth session to the watch, run by the lab's Python (`projects/ble-lab/live.py`, AGPL,
+// a separate program) as a child of this process: one JSON line per reading on its stdout, forwarded to
+// the window as `live://line`. The child lives only while the link is wanted: dropping its stdin ends it,
+// a kill makes sure. Same env allowlist as the core. It stays in this file because this file is the one
+// place that spawns (see `tests/egress_guards.rs`).
+
+/// The child reading the watch, and the handle that ends it.
+#[cfg(desktop)]
+pub struct LiveLink {
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+#[cfg(desktop)]
+impl LiveLink {
+    /// Start `program args…`, forward its stdout lines as `live://line` events (one JSON object each; a line
+    /// that is not one is dropped) and `live://ended {"exit": code}` when it stops.
+    pub fn start(program: &Path, args: &[String], sink: Arc<dyn EventSink>) -> Result<Self, CoreError> {
+        let mut cmd = Command::new(program);
+        cmd.args(args).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        for key in ENV_ALLOWLIST {
+            if let Some(v) = std::env::var_os(key) {
+                cmd.env(key, v);
+            }
+        }
+        let mut child = cmd.spawn().map_err(|e| CoreError::new("live_unavailable", format!("cannot start the live link: {e}")))?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CoreError::new("live_unavailable", "cannot reach the live link's pipe"));
+        };
+        let child = Arc::new(Mutex::new(Some(child)));
+        let slot = child.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&line) {
+                    sink.emit("live://line", value);
+                }
+            }
+            let exit = lock(&slot).take().and_then(|mut c| c.wait().ok()).and_then(|s| s.code());
+            sink.emit("live://ended", serde_json::json!({ "exit": exit }));
+        });
+        Ok(Self { child })
+    }
+
+    /// True while the child has not been reaped.
+    pub fn running(&self) -> bool {
+        lock(&self.child).as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    /// End the session: close its stdin (the child's own stop signal), then kill and reap it.
+    pub fn stop(&self) {
+        if let Some(mut child) = lock(&self.child).take() {
+            drop(child.stdin.take());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(desktop)]
+impl Drop for LiveLink {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +830,52 @@ mod tests {
     fn passphrase_env_is_not_in_the_allowlist() {
         assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_PASSPHRASE"));
         assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_RECOVERY_WORDS"));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn the_live_link_forwards_json_object_lines_only_and_reports_the_end() {
+        use std::sync::mpsc;
+        struct Collect(Mutex<mpsc::Sender<(String, Value)>>);
+        impl EventSink for Collect {
+            fn emit(&self, name: &str, payload: Value) {
+                let _ = lock(&self.0).send((name.to_string(), payload));
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let script = "printf '%s\\n' '{\"status\":\"scanning\"}' 'not json' '[1,2]' '{\"t\":1.5,\"metric\":\"heart_rate\",\"value\":70}'; exit 3";
+        let link = LiveLink::start(Path::new("/bin/sh"), &["-c".to_string(), script.to_string()], Arc::new(Collect(Mutex::new(tx))))
+            .expect("spawn");
+        let mut got = Vec::new();
+        while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+            let done = event.0 == "live://ended";
+            got.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("live://line".to_string(), serde_json::json!({"status": "scanning"})),
+                ("live://line".to_string(), serde_json::json!({"t": 1.5, "metric": "heart_rate", "value": 70})),
+                ("live://ended".to_string(), serde_json::json!({"exit": 3})),
+            ]
+        );
+        assert!(!link.running());
+        link.stop(); // a no-op after the end
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn stopping_the_live_link_kills_a_child_that_waits_on_stdin() {
+        struct Drop_;
+        impl EventSink for Drop_ {
+            fn emit(&self, _: &str, _: Value) {}
+        }
+        let link = LiveLink::start(Path::new("/bin/cat"), &[], Arc::new(Drop_)).expect("spawn");
+        assert!(link.running());
+        link.stop();
+        assert!(!link.running());
     }
 }
