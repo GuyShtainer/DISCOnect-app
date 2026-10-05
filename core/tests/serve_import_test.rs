@@ -383,7 +383,7 @@ fn import_run_refuses_bad_parameters_before_it_touches_the_store() {
         );
         assert_eq!(c, "bad_params", "{transport}");
         assert!(
-            m == "transport must be one of ['export', 'usb']"
+            m == "transport must be one of ['ble', 'export', 'usb']"
                 || m == "transport must be a non-empty string",
             "{m}"
         );

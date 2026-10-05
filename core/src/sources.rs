@@ -16,15 +16,20 @@ use rusqlite::{Connection, params, params_from_iter};
 use crate::canon::{self, Value};
 use crate::clock::ClockOffsets;
 use crate::export::{self, DecodeError, Step};
+use crate::live;
 use crate::fit::{self, FitDecodeError};
 use crate::model::Decoded;
 use crate::redact::{mask_label, redact_text};
+use crate::time::utc_now_iso;
 use crate::writer::{Failure, ImportStats, WriteOutcome, Writer, WriterError, fit_summary, json_summary};
 
 pub const TRANSPORT_DROP: &str = "drop";
 pub const TRANSPORT_CONNECT_EXPORT: &str = "connect_export";
 /// The transports `--transport` accepts.
-pub const TRANSPORTS: [&str; 5] = ["connect_export", "usb", "gadgetbridge", "ciq", "drop"];
+pub const TRANSPORTS: [&str; 6] = ["connect_export", "usb", "gadgetbridge", "ciq", "drop", "ble"];
+pub const TRANSPORT_BLE: &str = "ble";
+/// The `dropped` reason for a live file that holds no readings.
+pub const DROPPED_LIVE_EMPTY: &str = "live_file_without_readings";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -223,6 +228,76 @@ pub fn iter_fit_files(path: &Path) -> Result<Vec<(String, Vec<u8>)>, SourceError
     Ok(out)
 }
 
+/// A live file as the import sees it: its masked name and its readings `[t, metric, value]`.
+pub type LiveFile = (String, Vec<Vec<Value>>);
+
+/// `(label, readings)` for every live-link `.jsonl` under `path` (a file or a folder), in the Python
+/// order; a status-only file yields no readings. Files that fail the live rule are not yielded.
+/// A zip is not scanned. Labels are masked file names.
+pub fn iter_live_files(path: &Path) -> Result<Vec<LiveFile>, SourceError> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if path.is_file() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if suffix_lower(&name) == ".jsonl" {
+            candidates.push(path.to_path_buf());
+        }
+    } else if path.is_dir() {
+        let mut files = Vec::new();
+        walk_files(path, Path::new(""), &mut files)?;
+        files.retain(|rel| rel.file_name().is_some_and(|n| n.as_encoded_bytes().ends_with(b".jsonl")));
+        files.sort_by_key(|rel| components_key(rel));
+        candidates.extend(files.iter().map(|rel| path.join(rel)));
+    }
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if let Some(readings) = live::parse_live_file(&fs::read(&candidate)?) {
+            let name = candidate.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            out.push((mask_label(&name), readings));
+        }
+    }
+    Ok(out)
+}
+
+/// `_import_live_batch`: one `json:live` raw record per file; a file without readings is counted
+/// under [`DROPPED_LIVE_EMPTY`] and skipped.
+fn import_live_batch(
+    files: Vec<LiveFile>,
+    writer: &mut Writer<'_>,
+    mut progress: Option<Progress<'_>>,
+) -> Result<(), SourceError> {
+    let total = files.len() as u64;
+    for (done, (label, readings)) in (1u64..).zip(files) {
+        let outcome = if readings.is_empty() {
+            *writer.stats.dropped.entry(DROPPED_LIVE_EMPTY.to_string()).or_insert(0) += 1;
+            "skipped"
+        } else {
+            let record = live::canonical_record(readings);
+            let Value::Object(members) = &record else { continue };
+            let (source_key, decoded) = match live::decode_live_record(members) {
+                Ok(Some(keyed)) => keyed,
+                Ok(None) => continue,
+                Err(export::DecodeError::Abort(message) | export::DecodeError::Refused(message)) => {
+                    return Err(SourceError::Abort(message));
+                }
+            };
+            let now = utc_now_iso();
+            let outcome = writer.write_json_record(
+                live::STREAM,
+                &source_key,
+                &record,
+                &decoded,
+                &label,
+                Some((TRANSPORT_BLE, now.as_str())),
+            )?;
+            outcome_text(outcome)
+        };
+        if let Some(report) = progress.as_deref_mut() {
+            report(done, Some(total), outcome);
+        }
+    }
+    Ok(())
+}
+
 /// `ProgressCallback`: `progress(done, total_or_None, note)`. The FIT phase reports `(done, total,
 /// outcome)` after each file, where `outcome` is what `write_fit` returned (`imported`, `duplicate` or
 /// `failed`: the oracle's `_import_fit_batch` names it `stream`, but it is the status constant); an
@@ -296,8 +371,11 @@ pub fn import_path(
                 rederive_json(conn, &mut writer, &stored)
             })
     } else {
-        iter_fit_files(path).and_then(|files| {
-            import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
+        iter_live_files(path).and_then(|live_files| {
+            let single_live_file = path.is_file() && !live_files.is_empty();
+            import_live_batch(live_files, &mut writer, reborrow(&mut progress))?;
+            let fit_files = if single_live_file { Vec::new() } else { iter_fit_files(path)? };
+            import_batch(&fit_files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
         })
     };
     if let Err(error) = outcome {

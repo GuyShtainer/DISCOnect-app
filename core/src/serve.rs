@@ -815,9 +815,10 @@ fn data_today(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
 // ---- import ----
 
 /// Protocol transport names -> the names the store records (`TRANSPORTS` in the oracle).
-const TRANSPORTS: [(&str, &str); 2] = [
+const TRANSPORTS: [(&str, &str); 3] = [
     ("export", sources::TRANSPORT_CONNECT_EXPORT),
     ("usb", "usb"),
+    ("ble", sources::TRANSPORT_BLE),
 ];
 
 /// `str(pathlib.Path(text))`: empty and `.` components dropped, a leading `//` kept, `.` for nothing.
@@ -916,7 +917,7 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
             None => {
                 return Err(Failure::serve(
                     "bad_params",
-                    "transport must be one of ['export', 'usb']",
+                    "transport must be one of ['ble', 'export', 'usb']",
                 ));
             }
         },

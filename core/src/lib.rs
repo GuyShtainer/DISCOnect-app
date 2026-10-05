@@ -16,6 +16,7 @@ pub mod home;
 pub mod identity;
 pub mod keychain;
 pub mod keys;
+pub mod live;
 pub mod mcp;
 pub mod mcp_args;
 pub mod mcp_start;

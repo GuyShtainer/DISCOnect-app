@@ -38,7 +38,7 @@ use crate::writer::Writer;
 const UPLOADED_FILES_SECTION: &str = "DI-Connect-Uploaded-Files";
 const MORNING_CONTEXT: &str = "AFTER_WAKEUP_RESET";
 
-type Obj = [(String, Value)];
+pub(crate) type Obj = [(String, Value)];
 
 // ---- file families ----
 
@@ -481,7 +481,7 @@ impl From<String> for DecodeError {
     }
 }
 
-type Decode<T> = Result<T, DecodeError>;
+pub(crate) type Decode<T> = Result<T, DecodeError>;
 
 pub(crate) fn type_name(value: &Value) -> &'static str {
     match value {
@@ -621,7 +621,11 @@ fn parse_gmt(value: Option<&Value>) -> Option<Instant> {
 /// float handling: `modf`, the fraction scaled to microseconds and rounded half to even (a
 /// fraction that rounds up to a full second carries). Out-of-range values raise as Python does.
 pub fn epoch_ms_to_utc(number: f64) -> Result<Instant, String> {
-    let seconds = number / 1000.0;
+    epoch_s_to_utc(number / 1000.0)
+}
+
+/// `datetime.fromtimestamp(seconds, UTC)` truncated to whole seconds (see [`epoch_ms_to_utc`]).
+pub fn epoch_s_to_utc(seconds: f64) -> Result<Instant, String> {
     let mut whole = seconds.trunc();
     let micros = ((seconds - whole) * 1e6).round_ties_even();
     if micros >= 1e6 {
@@ -704,7 +708,7 @@ fn new_decoded(stream: &str) -> Decoded {
     Decoded::new(stream, "vendor_cloud")
 }
 
-type Keyed = Option<(String, Decoded)>;
+pub(crate) type Keyed = Option<(String, Decoded)>;
 
 // ---- UDSFile ----
 
@@ -1212,6 +1216,7 @@ fn record_decoder(stream: &str) -> Option<RecordDecoder> {
         "json:hill" => decode_hill,
         "json:fitness_age" => decode_fitness_age,
         "json:biometrics" => decode_biometrics,
+        "json:live" => crate::live::decode_live_record,
         _ => return None,
     })
 }
