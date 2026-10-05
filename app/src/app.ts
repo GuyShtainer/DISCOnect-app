@@ -2,7 +2,7 @@
 // Rules: every value carries its source word; a missing day is drawn as absence; the UI never
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
-import { DISCLAIMER, NOTICE, PRODUCT, metricLabel, neutralText, scopeWord } from "./identity";
+import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, metricLabel, neutralText, scopeWord } from "./identity";
 import { disposeCharts, drawTrend, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
@@ -577,6 +577,17 @@ let conversation: Turn[] = [];
 let coachDraft = "";
 let coachIntroSeen = false; // this session only: a module variable, never storage
 
+// ---- the hand-off card (Bet 15c): module state only, never storage, never logged. ----------------------
+let handoffWindow: 7 | 28 | 90 = 28;
+let handoffBuilding = false;
+let handoff: core.HandoffText | null = null;
+let handoffSeq = 0; // a sequence guard: a response from an earlier build is dropped
+let handoffProvider: core.ProviderId | null = null;
+let handoffCopying = false;
+let handoffCopiedOnce = false;
+let handoffStatus = "";
+let handoffStatusError = false;
+
 function hostOf(base: string): string {
   try {
     return new URL(base).host || "the endpoint";
@@ -656,11 +667,12 @@ function screenCoach(out: ParentNode, later: Later): void {
   if (!s || s.mode === "off") {
     const card = el("div", "card");
     card.append(el("h2", "heading", "Coaching is off"));
-    card.append(el("p", "body", "Nothing leaves this computer while it is off. Turning it on means this: day-level summaries of your data, and the words you type, go to the endpoint you choose. Nothing else is sent, and this app stores no conversation."));
+    card.append(el("p", "body", `${OFF_NETWORK} Turning it on means this: day-level summaries of your data, and the words you type, go to the endpoint you choose. Nothing else is sent, and this app stores no conversation.`));
     const link = el("a", "", "Open Coach settings") as HTMLAnchorElement;
     link.href = "#/coach-settings";
     card.append(link);
     out.append(card);
+    out.append(handoffCard());
     return;
   }
   const host = hostOf(s.base_url);
@@ -721,10 +733,140 @@ function screenCoach(out: ParentNode, later: Later): void {
   form.append(box, actions);
   form.onsubmit = (ev) => { ev.preventDefault(); void sendQuestion(); };
   out.append(form);
+  out.append(handoffCard());
   later(() => {
     if (!coachSending) box.focus();
     thread.lastElementChild?.scrollIntoView({ block: "nearest" });
   });
+}
+
+// ---- The hand-off to the user's own chat (Bet 15c): a different path from Ask. The app copies a day-level
+// summary to the clipboard and opens a fixed provider site; it holds no login, no key, no session for any
+// of the five, and never reads the answer back. Available whether coaching is on or off. ------------------
+
+async function prepareHandoff(): Promise<void> {
+  const seq = ++handoffSeq;
+  handoffBuilding = true;
+  handoff = null;
+  handoffStatus = "";
+  void route();
+  try {
+    const result = await core.handoffBuild(handoffWindow, false);
+    if (seq !== handoffSeq) return; // a slower earlier build lost the race: drop it
+    handoff = result;
+    handoffBuilding = false;
+  } catch (e) {
+    if (seq !== handoffSeq) return;
+    handoffBuilding = false;
+    handoffStatus = core.coachErrorText(e);
+    handoffStatusError = true;
+  }
+  void route();
+}
+
+function handoffCard(): HTMLElement {
+  const card = el("div", "card");
+  card.append(el("h2", "heading", "Use the chat I use"));
+  card.append(el("p", "body", "A different path from Ask: this app copies a day-level summary of your data to the clipboard, for you to paste into the chat you already use, signed in under your own account. The app holds no login and no key for it, and never reads the answer back."));
+  card.append(el("p", "caption muted", "What the text holds: values by day (steps, resting heart rate, sleep length, stress, energy reserve, a recent window against your own earlier days, the latest night's stages, recent workouts). What it does not hold: times of day, raw samples, file names, device or account identifiers."));
+
+  const windowGroup = el("div");
+  windowGroup.setAttribute("role", "radiogroup");
+  windowGroup.setAttribute("aria-label", "Window");
+  for (const days of [7, 28, 90] as const) {
+    const row = el("label", "choice body") as HTMLLabelElement;
+    const radio = el("input") as HTMLInputElement;
+    radio.type = "radio"; radio.name = "handoff-window"; radio.value = String(days); radio.checked = days === handoffWindow;
+    radio.onchange = () => { handoffWindow = days; };
+    row.append(radio, el("span", "", `${days} days`));
+    windowGroup.append(row);
+  }
+  card.append(windowGroup);
+  card.append(el("p", "caption muted", "Sleep detail is always the latest night."));
+
+  const prepare = el("button", "", handoffBuilding ? "Preparing…" : "Prepare the text") as HTMLButtonElement;
+  prepare.disabled = handoffBuilding;
+  prepare.onclick = () => void prepareHandoff();
+  card.append(prepare);
+
+  if (handoff) {
+    const preview = el("pre", "mono caption preview");
+    preview.textContent = handoff.text;
+    card.append(preview);
+    card.append(el("p", "caption muted", `${handoff.bytes} bytes`));
+    const s = handoff.shortened;
+    if (s.thinned + s.truncated + s.dropped_facts > 0) {
+      card.append(el("p", "caption muted", `Shortened to fit: ${s.thinned} series thinned, ${s.truncated} lists truncated, ${s.dropped_facts} facts dropped.`));
+    }
+  }
+
+  const providerRow = el("div", "actions");
+  for (const p of PROVIDERS) {
+    const btn = el("button", "secondary", p.name) as HTMLButtonElement;
+    if (p.id === handoffProvider) btn.setAttribute("aria-pressed", "true");
+    btn.onclick = () => { handoffProvider = p.id; void route(); };
+    providerRow.append(btn);
+  }
+  card.append(providerRow);
+
+  const chosen = PROVIDERS.find((p) => p.id === handoffProvider) ?? null;
+  if (chosen) {
+    card.append(el("p", "caption muted", `Opens ${chosen.host} in your browser.`));
+    card.append(el("p", "body", "The clipboard is yours, not the app's: any app on this Mac can read it, clipboard managers keep a history of it, and Universal Clipboard pushes it to your other Apple devices over iCloud if that is on."));
+    card.append(el("p", "body", "What the provider keeps, and whether it trains on what you paste, is set in your own account with that provider, not here. A long paste may be turned into an attachment by the provider."));
+    card.append(el("p", "body", AI_NOTICE));
+
+    const copyOpen = el("button", "", `Copy and open ${chosen.name}`) as HTMLButtonElement;
+    copyOpen.disabled = !handoff || handoffCopying;
+    copyOpen.onclick = () => {
+      if (!handoff || handoffCopying) return;
+      const text = handoff.text;
+      const bytes = handoff.bytes;
+      const provider = chosen.id;
+      const host = chosen.host;
+      handoffCopying = true;
+      copyOpen.disabled = true;
+      navigator.clipboard.writeText(text).then(
+        () => core.handoffOpen(provider).then(
+          () => {
+            handoffStatus = `Copied ${bytes} bytes; ${host} opened. Paste with ⌘V.`;
+            handoffStatusError = false;
+            handoffCopiedOnce = true;
+            handoffCopying = false;
+            void route();
+          },
+          (e) => {
+            handoffStatus = core.coachErrorText(e);
+            handoffStatusError = true;
+            handoffCopying = false;
+            void route();
+          },
+        ),
+        () => {
+          handoffStatus = "The clipboard refused the write; nothing was opened.";
+          handoffStatusError = true;
+          handoffCopying = false;
+          void route();
+        },
+      );
+    };
+    card.append(copyOpen);
+  }
+
+  if (handoffCopiedOnce) {
+    const replace = el("button", "secondary", "Replace the clipboard") as HTMLButtonElement;
+    replace.onclick = () => {
+      navigator.clipboard.writeText(" ").then(() => {
+        handoffStatus = "The clipboard now holds a space.";
+        handoffStatusError = false;
+        void route();
+      });
+    };
+    card.append(replace);
+  }
+
+  if (handoffStatus) card.append(el("p", `caption ${handoffStatusError ? "error" : "muted"}`, handoffStatus));
+  return card;
 }
 
 // ---- Coach settings ---------------------------------------------------------------------
@@ -781,7 +923,7 @@ async function screenCoachSettings(out: ParentNode): Promise<void> {
     group.append(row);
   }
   card.append(group);
-  card.append(el("p", "caption muted", "Local: an address on this computer or your network, over plain http. Cloud: https only, with your own key. Off sends nothing."));
+  card.append(el("p", "caption muted", "Local: an address on this computer or your network, over plain http. Cloud: https only, with your own key. Off opens no network connection."));
   url.type = "text"; url.value = s.base_url; url.placeholder = placeholder(mode); url.autocomplete = "off";
   url.setAttribute("aria-label", "Endpoint address");
   const model = el("input") as HTMLInputElement;

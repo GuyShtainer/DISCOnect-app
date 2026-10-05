@@ -4,6 +4,24 @@ export const PRODUCT = "DISCOnect";
 export const NOTICE = "Not affiliated with or endorsed by any watch manufacturer.";
 // The one sentence every coaching session shows (CLAIMS-POLICY.md); drift-pinned against identity.py.
 export const DISCLAIMER = "This describes patterns in your own data. It is not medical advice, a diagnosis or a treatment plan.";
+// The Off card's claim (Bet 15c pitch section 4): a hand-off makes health text leave by clipboard and
+// browser while the coach is off, so the previous, narrower claim no longer held.
+export const OFF_NETWORK = "This app opens no network connection while coaching is off.";
+// Shown beside the hand-off's provider picker (Bet 15c, legal review condition 5): no claim about any provider's
+// own behaviour, only what this app is and is not.
+export const AI_NOTICE =
+  "Not integrated with, endorsed by or responsible for any AI provider; a hand-off opens that provider's own site under your own account, governed by their terms, not ours.";
+
+// The hand-off's five chats (Bet 15c): plain names, no logos, no provider colours. `name` and `host` mirror
+// src-tauri/src/coach/handoff.rs's `name`/`host` literals exactly (test_lint_app.py pins the drift); the host
+// is shown before the click but never used to build anything.
+export const PROVIDERS: { id: "chat_gpt" | "claude" | "gemini" | "le_chat" | "deep_seek"; name: string; host: string }[] = [
+  { id: "chat_gpt", name: "ChatGPT", host: "chatgpt.com" },
+  { id: "claude", name: "Claude", host: "claude.ai" },
+  { id: "gemini", name: "Gemini", host: "gemini.google.com" },
+  { id: "le_chat", name: "Le Chat", host: "chat.mistral.ai" },
+  { id: "deep_seek", name: "DeepSeek", host: "chat.deepseek.com" },
+];
 
 // Names mirrored from identity.py (tests/test_identity_drift.py fails on drift).
 export const DATA_DIR = ".disconect";

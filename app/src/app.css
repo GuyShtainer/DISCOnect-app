@@ -41,6 +41,7 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
 
 button, .button { min-height: 44px; padding: 0 var(--space-4); border: 0; border-radius: var(--radius-md); background: var(--accent); color: var(--on-accent); font: inherit; font-weight: 600; cursor: pointer; }
 button.secondary { background: var(--surface); color: var(--ink); border: 1px solid var(--hairline); }
+button.secondary[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 button:disabled { opacity: 0.6; cursor: default; }
 input[type="password"], input[type="text"], select { min-height: 44px; padding: 0 var(--space-3); border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--surface); color: var(--ink); font: inherit; }
 label.switch { display: flex; justify-content: space-between; align-items: center; min-height: 44px; gap: var(--space-3); }
@@ -104,3 +105,6 @@ label.choice input { width: 20px; height: 20px; margin: 0; }
 .badge.good { color: var(--local); border-color: var(--local); }
 .badge.warn { color: var(--status-source-empty); border-color: var(--status-source-empty); }
 .badge.bad { color: var(--status-failed); border-color: var(--status-failed); }
+
+/* ---- Hand-off (Bet 15c): tokens only ---- */
+.preview { max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--hairline); border-radius: var(--radius-md); padding: var(--space-3); background: var(--surface); }

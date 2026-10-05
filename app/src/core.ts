@@ -113,6 +113,23 @@ export function coachErrorText(e: unknown): string {
   return "coach_failed: the request did not complete";
 }
 
+// ---- the hand-off to the user's own chat (Bet 15c). No login, no key, no session for any of the five. ----
+
+export type ProviderId = "chat_gpt" | "claude" | "gemini" | "le_chat" | "deep_seek";
+export type HandoffText = { text: string; bytes: number; shortened: { thinned: number; truncated: number; dropped_facts: number } };
+
+/** The hand-off text: the five sendable tools, through the identical gate the coach loop sends through. Works
+ *  whether the coach is on or off; rejects with the same CoachError shape a failed question rejects with. */
+export function handoffBuild(windowDays: 7 | 28 | 90, includePoints: boolean): Promise<HandoffText> {
+  return invoke<HandoffText>("handoff_build", { windowDays, includePoints });
+}
+
+/** Open one of the five fixed sites in the system browser. The one argument is always a closed enum value;
+ *  no string ever crosses from the webview into it. */
+export function handoffOpen(provider: ProviderId): Promise<void> {
+  return invoke("handoff_open", { provider });
+}
+
 // ---- the live link (Bet 9 follow-up). Dev builds only: the lab's Python reads the watch as a child process. ----
 
 /** One line from the live link: a status change or a reading (unix seconds, the product's metric id, an int). */
