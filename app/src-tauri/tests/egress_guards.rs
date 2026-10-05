@@ -292,24 +292,70 @@ fn network_types_appear_only_in_the_coach_egress_module() {
 #[test]
 fn child_processes_are_spawned_only_by_the_sidecar_module() {
     // `std::process::id()` (a unique temp-folder name) is not a spawn; naming `Command` or `Stdio` is.
-    // Verified when this test was written: `src/sidecar.rs` is the only file that names `Command` (it starts the
-    // bundled core); `lib.rs` and `inproc.rs` do not. `tests/inproc.rs` spawns the CLI, but a test file is not
-    // shipped code and is outside `src/`.
+    // Verified when this test was written: `src/sidecar.rs` starts the bundled core, and `src/coach/handoff.rs`
+    // (Bet 15c) opens one of five fixed sites in the system browser; no other file names `Command` or `Stdio`.
+    // `tests/inproc.rs` spawns the CLI, but a test file is not shipped code and is outside `src/`.
     let src = manifest().join("src");
     let sidecar = src.join("sidecar.rs");
+    let handoff = src.join("coach").join("handoff.rs");
     assert!(sidecar.is_file(), "the one spawning file exists");
+    assert!(handoff.is_file(), "the hand-off's opener exists");
     let files = files_under(&src, "rs");
     assert!(files.len() >= 6, "the sources are where the test looks: {files:?}");
     for path in files {
-        if path == sidecar {
+        if path == sidecar || path == handoff {
             continue;
         }
         let code = text(&path);
         for word in ["Command::new", "process::Command", "std::process::{", "process::{", "Stdio::", "tokio::process"] {
-            assert!(!code.contains(word), "{} names `{word}` outside sidecar.rs", path.display());
+            assert!(!code.contains(word), "{} names `{word}` outside sidecar.rs or handoff.rs", path.display());
         }
     }
     assert!(text(&sidecar).contains("Command::new("), "the pin would be empty if the sidecar stopped spawning");
+
+    // handoff.rs spawns exactly once, and only ever the fixed `/usr/bin/open` binary: no string built from
+    // input ever reaches `Command::new`, and no second egress route hides in the same file.
+    let handoff_code = text(&handoff);
+    let spawns: Vec<&str> = handoff_code.match_indices("Command::new(").map(|(i, _)| &handoff_code[i..]).collect();
+    assert_eq!(spawns.len(), 1, "handoff.rs spawns exactly once: {spawns:?}");
+    assert!(
+        spawns[0].starts_with("Command::new(\"/usr/bin/open\")"),
+        "handoff.rs's one spawn names the fixed opener literally: {}",
+        &spawns[0][..spawns[0].len().min(60)]
+    );
+    let handoff_non_test = non_test_code(&handoff_code);
+    for word in ["egress", "ureq", "Url::parse"] {
+        assert!(!handoff_non_test.contains(word), "handoff.rs's non-test code names `{word}`");
+    }
+    for line in handoff_non_test.lines() {
+        if line.contains("format!(") {
+            assert!(!line.to_lowercase().contains("http"), "a format! in handoff.rs's non-test code names a URL scheme: {line}");
+        }
+    }
+}
+
+#[test]
+fn handoff_never_touches_egress_and_handoff_build_never_touches_the_key_or_the_provider() {
+    // Bet 15c slice 1, evidence (a): the hand-off works while the coach is off and opens no egress of its own.
+    let handoff = manifest().join("src").join("coach").join("handoff.rs");
+    let handoff_code = text(&handoff);
+    let handoff_non_test = non_test_code(&handoff_code);
+    for word in ["egress", "send(", "ureq", "Egress"] {
+        assert!(!handoff_non_test.contains(word), "handoff.rs's non-test code names `{word}`");
+    }
+
+    // `commands.rs::handoff_build` (and its blocking half) never reads the provider settings, the key or the
+    // egress module: sliced from `fn handoff_build` to the next `#[tauri::command]` attribute, so the slice
+    // holds exactly `handoff_build` and `handoff_build_blocking`, never `handoff_open`.
+    let commands = manifest().join("src").join("coach").join("commands.rs");
+    let commands_code = text(&commands);
+    let start = commands_code.find("fn handoff_build").expect("handoff_build exists in commands.rs");
+    let rest = &commands_code[start..];
+    let end = rest[1..].find("#[tauri::command]").map_or(rest.len(), |i| i + 1);
+    let body = &rest[..end];
+    for word in ["provider", "KeyHolder", "egress"] {
+        assert!(!body.contains(word), "handoff_build's body names `{word}`: it must not touch the key or egress");
+    }
 }
 
 #[test]

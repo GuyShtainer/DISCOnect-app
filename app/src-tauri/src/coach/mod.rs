@@ -4,12 +4,17 @@
 //!
 //! What a tool answer may carry out of the machine is decided by three pure modules, in this order:
 //! [`views::project`] (an allowlist projection), [`schema::validate`] (a fail-closed positive schema) and
-//! [`caps::fit`] (byte budgets).
+//! [`caps::fit`] (byte budgets). [`gate::gate_tool`] runs a clamped tool call through all three, in that
+//! order; it is the one chain both [`chat_loop`] and [`handoff`] use.
 //!
 //! The loop (slice 5): [`prompt`] is the system prompt, [`wire`] the chat-completions format, [`chat_loop`] one
 //! question end to end with its window manager, [`commands::coach_ask`] the Tauri command over it.
 //!
 //! The probe (slice 6): [`probe`] asks an endpoint whether it calls tools and how much prompt it reads.
+//!
+//! The hand-off (Bet 15c slice 1): [`handoff`] builds the same five tool answers as one text block for the
+//! user's own chat, and opens one of five fixed sites in the system browser. It opens no network connection
+//! itself and does not touch [`settings`], [`key`] or [`provider`]: the hand-off works while the coach is off.
 //!
 //! Provider plumbing (slice 4): [`settings`] holds the non-secret provider settings (`Off` by default),
 //! [`key`] the user's key (OS keychain or session memory), [`egress`] the one choke point. [`provider`] is
@@ -19,6 +24,8 @@ pub mod caps;
 pub mod commands;
 pub mod egress;
 pub mod egress_guard;
+pub mod gate;
+pub mod handoff;
 pub mod key;
 pub mod probe;
 pub mod prompt;

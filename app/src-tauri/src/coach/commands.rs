@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 use super::chat_loop::{self, Conversation, ToolCallError, TraceEntry};
 use super::egress::EgressError;
+use super::handoff::{self, HandoffError, HandoffText, ProviderId};
 use super::key::{self, KeyError, KeyHolder, KeyState};
 use super::probe::{self, ProbeReport};
 use super::settings::{self, Mode, Settings, SettingsError};
@@ -73,6 +74,12 @@ impl From<SettingsError> for CoachError {
             _ => None,
         };
         CoachError::plain(e.code(), e.message(), status)
+    }
+}
+
+impl From<HandoffError> for CoachError {
+    fn from(e: HandoffError) -> Self {
+        CoachError::plain(e.code(), e.message(), None)
     }
 }
 
@@ -214,6 +221,41 @@ fn ask_blocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &Setting
     );
     let trace = conversation.trace.clone();
     answer.map(|text| CoachReply { text, trace }).map_err(|error| CoachError::with_sent(error, &conversation))
+}
+
+/// The hand-off text (Bet 15c slice 1): the five sendable tools, through the identical gate [`ask_blocking`]
+/// sends through, rendered as one block for the user's own chat. This never reads the saved settings, the
+/// key or an egress: it runs whether the coach is on or off, and the core is the only thing it calls.
+#[tauri::command]
+pub async fn handoff_build<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    window_days: u8,
+    include_points: bool,
+) -> Result<HandoffText, CoachErrorDto> {
+    tauri::async_runtime::spawn_blocking(move || handoff_build_blocking(&app, window_days, include_points))
+        .await
+        .map_err(|_| CoachError::from(KeyError::Busy))?
+}
+
+fn handoff_build_blocking<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    window_days: u8,
+    include_points: bool,
+) -> Result<HandoffText, CoachErrorDto> {
+    let core = app.state::<crate::Core>().0.clone();
+    let call_tool = move |name: &str, arguments: Value| -> Result<Value, ToolCallError> {
+        let core = core.as_ref().map_err(|e| ToolCallError { code: e.code.clone() })?;
+        let params = json!({"name": name, "arguments": arguments});
+        tauri::async_runtime::block_on(core.call("tools.call", params)).map_err(|e| ToolCallError { code: e.code })
+    };
+    handoff::build_text(window_days, include_points, &call_tool).map_err(CoachError::from)
+}
+
+/// Open one of the five fixed sites in the system browser (Bet 15c slice 1). The one argument is always one
+/// of five `&'static str` literals [`handoff::site`] names; no string ever crosses from the webview into it.
+#[tauri::command]
+pub fn handoff_open(provider: ProviderId) -> Result<(), CoachErrorDto> {
+    handoff::open_fixed_site(provider).map_err(CoachError::from)
 }
 
 /// Test the endpoint (slice 6): two synthetic requests, no tool, no core call, so a locked store is fine. The

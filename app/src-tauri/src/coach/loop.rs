@@ -6,9 +6,9 @@
 //! needs a key), pushes the user's words, and then repeats: build the request (the system prompt, the
 //! windowed turns, the five tools), send it through the one egress, read the answer. A text answer ends the
 //! turn. A tool answer is run: the name must be one of the five, the arguments must be a JSON object, they are
-//! forced inside the coach defaults ([`caps::clamp_with`]), the core runs the tool (`call_tool`), and the
-//! answer goes through the three gates in order, [`views::project_with`], [`caps::fit`] and
-//! [`schema::validated`]. Only the [`schema::Validated`] value, as compact JSON, becomes a tool message
+//! forced inside the coach defaults ([`caps::clamp_with`]), and the answer runs through the shared gate
+//! ([`gate::gate_tool`]): the core (`call_tool`), then `views::project_with`, [`caps::fit`] and
+//! [`schema::validated`], in order. Only the [`schema::Validated`] value, as compact JSON, becomes a tool message
 //! ([`wire::ToolMessage::result`]); everything else the model hears about a call is one of a few fixed strings
 //! ([`wire::ToolFailure`]). Never the core's message, never a raw answer.
 //!
@@ -32,13 +32,14 @@ use zeroize::Zeroizing;
 
 use disconect_core::identity::neutral_text;
 
-use super::caps::{self, CapError, CoachArgs};
+use super::caps::{self, CoachArgs};
 use super::egress::{Egress, EgressError, Endpoint, Outbound};
+use super::gate::{self, GateFailure};
 use super::prompt::system_prompt;
-use super::schema::{self, SENDABLE_TOOLS};
+use super::schema::SENDABLE_TOOLS;
 use super::settings::{Mode, Settings};
-use super::views::{self, ViewOptions};
-use super::wire::{self, ChatRequest, Message, ServeCode, ToolCall, ToolFailure, ToolMessage, WireError, CHAT_PATH};
+use super::views::ViewOptions;
+use super::wire::{self, ChatRequest, Message, ToolCall, ToolFailure, ToolMessage, WireError, CHAT_PATH};
 
 /// Most tool calls the model may make in one answer.
 pub const MAX_CALLS_PER_ROUND: usize = 4;
@@ -400,39 +401,9 @@ impl<'a> Coach<'a> {
         };
         let limits = CoachArgs { include_points: self.settings.include_points, ..CoachArgs::default() };
         let arguments = caps::clamp_with(name, &arguments, &limits);
-
-        let answer = match (self.call_tool)(name, arguments.clone()) {
-            Ok(answer) => answer,
-            Err(error) => {
-                let failure = ToolFailure::Serve(ServeCode::from_code(&error.code));
-                return Ok(failed(trace, arguments, failure, Outcome::ToolError(failure.label())));
-            }
-        };
-        let Some(result) = answer.get("result") else {
-            let failure = ToolFailure::Serve(ServeCode::ToolError);
-            return Ok(failed(trace, arguments, failure, Outcome::ToolError(failure.label())));
-        };
         let options = ViewOptions { include_points: self.settings.include_points };
-        let Ok(projected) = views::project_with(name, result, &options) else {
-            return Ok(failed(trace, arguments, ToolFailure::Withheld, Outcome::Rejected("view")));
-        };
-        let fitted = match caps::fit(name, &projected) {
-            Ok(fitted) => fitted,
-            Err(CapError::StillTooLarge) => {
-                trace.push(TraceEntry {
-                    tool: name.to_string(),
-                    arguments_sent: arguments,
-                    bytes_sent: 0,
-                    projected: Value::Null,
-                    outcome: Outcome::TooLarge,
-                });
-                return Err(CoachError::ToolTooLarge);
-            }
-            Err(CapError::UnknownTool) => {
-                return Ok(failed(trace, arguments, ToolFailure::UnknownTool, Outcome::ToolError(ToolFailure::UnknownTool.label())));
-            }
-        };
-        match schema::validated(name, fitted) {
+
+        match gate::gate_tool(name, &arguments, &options, self.call_tool) {
             Ok(validated) => {
                 let message = ToolMessage::result(id, &validated);
                 trace.push(TraceEntry {
@@ -444,8 +415,23 @@ impl<'a> Coach<'a> {
                 });
                 Ok(message)
             }
-            Err(refused) => {
-                Ok(failed(trace, arguments, ToolFailure::Withheld, Outcome::Rejected(refused.reason.text())))
+            Err(GateFailure::ToolError(serve_code)) => {
+                let failure = ToolFailure::Serve(serve_code);
+                Ok(failed(trace, arguments, failure, Outcome::ToolError(failure.label())))
+            }
+            Err(GateFailure::Withheld(reason)) => Ok(failed(trace, arguments, ToolFailure::Withheld, Outcome::Rejected(reason))),
+            Err(GateFailure::UnknownTool) => {
+                Ok(failed(trace, arguments, ToolFailure::UnknownTool, Outcome::ToolError(ToolFailure::UnknownTool.label())))
+            }
+            Err(GateFailure::TooLarge) => {
+                trace.push(TraceEntry {
+                    tool: name.to_string(),
+                    arguments_sent: arguments,
+                    bytes_sent: 0,
+                    projected: Value::Null,
+                    outcome: Outcome::TooLarge,
+                });
+                Err(CoachError::ToolTooLarge)
             }
         }
     }
@@ -454,6 +440,7 @@ impl<'a> Coach<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::schema;
     use serde_json::json;
 
     fn user(text: &str) -> Message {
