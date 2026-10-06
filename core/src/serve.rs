@@ -1531,8 +1531,29 @@ fn parse(line: &str) -> Result<Call, Rejected> {
     })
 }
 
+/// The server roles a phone never plays (the Mac serves the relay and offers pairing), refused before
+/// their handlers run. The names are the protocol's own; `ALLOWED_METHODS` in the app is unchanged.
+#[cfg(target_os = "ios")]
+const SERVER_ROLES: [&str; 5] =
+    ["relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel"];
+
+#[cfg(target_os = "ios")]
+fn refuse_server_roles(call: &Call) -> Option<String> {
+    SERVER_ROLES.iter().any(|name| call.method.equals(name)).then(|| {
+        error_line(
+            &call.id,
+            "unsupported_transport",
+            "this phone does not serve the relay or offer pairing; the Mac does",
+        )
+    })
+}
+
 /// The response line for `call`, or None when the handler answers later (the import worker).
 fn dispatch(session: &mut Session, call: &Call) -> Option<String> {
+    #[cfg(target_os = "ios")]
+    if let Some(refusal) = refuse_server_roles(call) {
+        return Some(refusal);
+    }
     let Some((_, handler)) = METHODS.iter().find(|(name, _)| call.method.equals(name)) else {
         return Some(error_line(&call.id, "unknown_method", "no such method"));
     };

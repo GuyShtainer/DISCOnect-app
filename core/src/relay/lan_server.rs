@@ -9,8 +9,9 @@
 //!
 //! * `GET /v1/health` -- unauthenticated: product, `"lan"`, version. No host name, no path.
 //! * `GET /v1/objects` -- the account's object names, a JSON array.
-//! * `GET|PUT|DELETE /v1/objects/<account>/<32 hex>` -- one object (`FolderRelay` semantics:
+//! * `GET|PUT /v1/objects/<account>/<32 hex>` -- one object (`FolderRelay` semantics:
 //!   a write is an atomic rename and replaces an existing object; a missing object is 404).
+//!   A signed DELETE is answered 405: nothing deletes an object over the network.
 //!
 //! * `POST /v1/pair/<id>` and `GET /v1/pair/<id>/payload` -- only when an offer is attached (`pair offer`),
 //!   unauthenticated by design; see `pair_routes.rs` and `docs/relay-protocol.md`, "Pairing routes".
@@ -325,10 +326,9 @@ fn handle_untagged(
             Ok(()) => Reply::status(204),
             Err(error) => relay_failure(&error),
         },
-        _ => match ctx.relay.delete(name) {
-            Ok(()) => Reply::status(204),
-            Err(error) => relay_failure(&error),
-        },
+        // an object is never deleted over the network (12-D): the token check above ran first, so an
+        // unauthenticated DELETE is still a 401 and only a signed one learns it is not allowed
+        _ => Reply::status(405),
     }
 }
 
@@ -820,9 +820,10 @@ mod tests {
             names,
             vec![path.trim_start_matches("/v1/objects/").to_string()]
         );
-        assert_eq!(signed(&ctx, "DELETE", &path, b"", 100, 100).status, 204);
-        assert_eq!(signed(&ctx, "GET", &path, b"", 100, 100).status, 404);
-        assert_eq!(signed(&ctx, "DELETE", &path, b"", 100, 100).status, 404);
+        // a signed DELETE is refused (12-D, at the Fenix8 session's request) and the object stays
+        assert_eq!(signed(&ctx, "DELETE", &path, b"", 100, 100).status, 405);
+        let kept = signed(&ctx, "GET", &path, b"", 100, 100);
+        assert_eq!((kept.status, kept.body.as_slice()), (200, &b"two"[..]));
     }
 
     #[test]

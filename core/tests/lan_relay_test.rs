@@ -332,18 +332,19 @@ fn put_get_list_delete_through_the_client_match_the_folder_relay() {
         client.list(&"f".repeat(64)).expect("other account"),
         Vec::<String>::new()
     );
-    client.delete(&name('a')).expect("delete");
-    assert_eq!(client.list(&account).expect("list"), vec![name('b')]);
-    assert!(
-        !lan.folder.join(name('a')).exists(),
-        "the object is gone from the server's folder"
-    );
-    let missing = client.get(&name('a')).expect_err("gone");
-    assert_eq!(missing.reason(), "FileNotFoundError");
+    // the server answers a signed DELETE 405 (12-D): the object stays, on the server and in the list
+    assert!(matches!(client.delete(&name('a')), Err(RelayError::Status(405))));
     assert_eq!(
-        client.delete(&name('a')).expect_err("gone").reason(),
-        "FileNotFoundError"
+        client.list(&account).expect("list"),
+        vec![name('a'), name('b')]
     );
+    assert!(
+        lan.folder.join(name('a')).exists(),
+        "the object is still in the server's folder"
+    );
+    assert_eq!(client.get(&name('a')).expect("still there"), b"one");
+    let missing = client.get(&name('e')).expect_err("never written");
+    assert_eq!(missing.reason(), "FileNotFoundError");
     assert!(matches!(client.put("../x", b"x"), Err(RelayError::BadName)));
     assert!(matches!(client.get("nope"), Err(RelayError::BadName)));
     // the folder relay reads what the client wrote, and the other way round

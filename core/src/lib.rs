@@ -15,6 +15,8 @@ pub mod fit;
 pub mod home;
 pub mod identity;
 pub mod keychain;
+#[cfg(target_os = "ios")]
+pub mod keychain_leftovers;
 pub mod keys;
 pub mod live;
 pub mod mcp;

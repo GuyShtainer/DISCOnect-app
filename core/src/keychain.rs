@@ -76,14 +76,14 @@ fn disabled() -> bool {
     std::env::var(BACKEND_ENV).is_ok_and(|v| v == "fail")
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 fn account(key_id: &[u8; 16]) -> String {
     hex::encode(key_id)
 }
 
 /// What a quiet (no dialog) attempt to read the secret came to.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Secret/Unreadable are built by the macOS backend only (12-D adds iOS)
+#[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))] // Secret/Unreadable are built by the macOS and iOS backends only
 enum Quiet {
     Secret(Vec<u8>),
     NotFound,
@@ -200,12 +200,158 @@ mod backend {
     }
 }
 
+#[cfg(target_os = "ios")]
+mod backend {
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
+    use security_framework::base::Error;
+    use security_framework::item::{CloudSync, ItemClass, ItemSearchOptions, Limit, SearchResult};
+    use security_framework::passwords::{
+        PasswordOptions, delete_generic_password, generic_password, set_generic_password_options,
+    };
+
+    use super::Quiet;
+
+    // errSecItemNotFound
+    const NOT_FOUND: i32 = -25300;
+    // errSecMissingEntitlement: what a process outside an app (a bare simulator test binary) gets
+    const MISSING_ENTITLEMENT: i32 = -34018;
+
+    /// iOS raises no dialog, so a read is a plain read. The item is the app's own (default access group).
+    pub fn read_quiet(service: &str, account: &str) -> Quiet {
+        match generic_password(PasswordOptions::new_generic_password(service, account)) {
+            Ok(bytes) => Quiet::Secret(bytes),
+            Err(e) if e.code() == NOT_FOUND => Quiet::NotFound,
+            Err(_) => Quiet::Unreadable,
+        }
+    }
+
+    /// Does an item exist at all? An attributes-only search. `None` = the search itself failed.
+    pub fn probe(service: &str, account: &str) -> Option<bool> {
+        let found = ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(service)
+            .account(account)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search();
+        match found {
+            Ok(items) => Some(!items.is_empty()),
+            Err(e) if e.code() == NOT_FOUND => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Delete first, then add: `set_generic_password_options` falls back to `SecItemUpdate` on a
+    /// duplicate, which keeps the old item's access control (kit gate E, kb/06). This device only,
+    /// available while unlocked, not synchronizable, no access group.
+    pub fn write(service: &str, account: &str, password: &[u8]) -> Result<(), Error> {
+        remove(service, account)?;
+        let access = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+            0,
+        )?;
+        let mut options = PasswordOptions::new_generic_password(service, account);
+        options.set_access_control(access);
+        set_generic_password_options(password, options)
+    }
+
+    /// `Ok(true)` when an item was removed, `Ok(false)` when there was none.
+    pub fn remove(service: &str, account: &str) -> Result<bool, Error> {
+        match delete_generic_password(service, account) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code() == NOT_FOUND => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every account stored under `service` (attributes-only search; no secret is read).
+    pub fn accounts(service: &str) -> Result<Vec<String>, Error> {
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::generic_password())
+            .service(service)
+            .load_attributes(true)
+            .limit(Limit::All);
+        match search.search() {
+            Ok(results) => Ok(results
+                .iter()
+                .filter_map(SearchResult::simplify_dict)
+                .filter_map(|mut attrs| attrs.remove("acct"))
+                .collect()),
+            Err(e) if e.code() == NOT_FOUND => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The class (`pdmn`) of the item and whether it is synchronizable, from attribute-only searches
+    /// (no data is loaded, so nothing secret is read). `None` = there is no such item.
+    pub fn class_of(service: &str, account: &str) -> Result<Option<(String, bool)>, Error> {
+        let search = |sync: CloudSync| {
+            let mut options = ItemSearchOptions::new();
+            options
+                .class(ItemClass::generic_password())
+                .service(service)
+                .account(account)
+                .cloud_sync(sync)
+                .load_attributes(true)
+                .limit(Limit::Max(1));
+            match options.search() {
+                Ok(results) => Ok(results),
+                Err(e) if e.code() == NOT_FOUND => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        };
+        let any = search(CloudSync::MatchSyncAny)?;
+        let Some(mut attrs) = any.iter().find_map(SearchResult::simplify_dict) else {
+            return Ok(None);
+        };
+        let synchronizable = !search(CloudSync::MatchSyncYes)?.is_empty();
+        Ok(Some((attrs.remove("pdmn").unwrap_or_default(), synchronizable)))
+    }
+
+    pub fn error_text(error: &Error) -> String {
+        if error.code() == MISSING_ENTITLEMENT {
+            return "OSStatus -34018: the keychain needs an app's entitlements (this process is not an app)"
+                .to_string();
+        }
+        format!("OSStatus {}", error.code())
+    }
+}
+
+/// iOS only: the accounts stored under `service`, and the removal of one (for the leftovers rule).
+#[cfg(target_os = "ios")]
+pub(crate) fn list_accounts(service: &str) -> Result<Vec<String>, KeychainError> {
+    if disabled() {
+        return Err(KeychainError::NoBackend);
+    }
+    backend::accounts(service).map_err(|e| KeychainError::Backend(backend::error_text(&e)))
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn delete_account(service: &str, account: &str) -> Result<bool, KeychainError> {
+    if disabled() {
+        return Err(KeychainError::NoBackend);
+    }
+    backend::remove(service, account).map_err(|e| KeychainError::Backend(backend::error_text(&e)))
+}
+
+/// iOS only, for the evidence door: the class (`pdmn`, e.g. `aku` = when unlocked, this device only) and the
+/// synchronizable flag of the master key's item for `key_id`; `None` when there is no such item. Attributes
+/// only: neither the account nor the secret is returned.
+#[cfg(target_os = "ios")]
+pub fn item_class(key_id: &[u8; 16]) -> Result<Option<(String, bool)>, KeychainError> {
+    if disabled() {
+        return Err(KeychainError::NoBackend);
+    }
+    backend::class_of(SERVICE, &account(key_id)).map_err(|e| KeychainError::Backend(backend::error_text(&e)))
+}
+
 fn quiet_read(service: &str, key_id: &[u8; 16]) -> Quiet {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         backend::read_quiet(service, &account(key_id))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (service, key_id);
         Quiet::NotFound
@@ -275,7 +421,7 @@ fn read_item(
         .map_err(|_| KeychainError::NotHex)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn write_item(service: &str, key_id: &[u8; 16], master: &[u8]) -> Result<(), KeychainError> {
     let password = Zeroizing::new(hex::encode(master));
     let account = account(key_id);
@@ -285,23 +431,23 @@ fn write_item(service: &str, key_id: &[u8; 16], master: &[u8]) -> Result<(), Key
     backend::write(service, &account, password.as_bytes()).map_err(|e| backend_error(&e))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn delete_item(service: &str, key_id: &[u8; 16]) -> Result<bool, KeychainError> {
     backend::remove(service, &account(key_id))
         .map_err(|e| KeychainError::Backend(backend::error_text(&e)))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn write_item(_service: &str, _key_id: &[u8; 16], _master: &[u8]) -> Result<(), KeychainError> {
     Err(KeychainError::NoBackend)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn delete_item(_service: &str, _key_id: &[u8; 16]) -> Result<bool, KeychainError> {
     Err(KeychainError::NoBackend)
 }
 
-/// macOS only: does an item for this key id exist at all, readable by us or not? In-process and
+/// macOS and iOS: does an item for this key id exist at all, readable by us or not? In-process and
 /// attributes-only: it never reads the secret and cannot raise a dialog. Anything wrong with the
 /// probe (not macOS, the search failing) means "no".
 pub fn item_exists(key_id: &[u8; 16]) -> bool {
@@ -309,11 +455,11 @@ pub fn item_exists(key_id: &[u8; 16]) -> bool {
 }
 
 fn item_exists_in(service: &str, key_id: &[u8; 16]) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         backend::probe(service, &account(key_id)).unwrap_or(false)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (service, key_id);
         false

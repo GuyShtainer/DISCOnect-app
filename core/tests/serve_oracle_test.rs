@@ -234,6 +234,22 @@ fn replay(store_file: &str, oracle_file: &str) {
             }
             continue;
         }
+        // the phone refuses the five server roles (12-D): every other entry is still compared
+        #[cfg(target_os = "ios")]
+        if matches!(
+            method,
+            "relay.addresses" | "relay.serve" | "pair.offer" | "pair.confirm" | "pair.cancel"
+        ) {
+            let ok = got.len() == 1
+                && got[0].get("error").and_then(|e| e.get("code"))
+                    == Some(&Json::Str(PyStr::from_text("unsupported_transport")));
+            if !ok {
+                differences.push(format!(
+                    "#{index} {method}: the phone must answer unsupported_transport"
+                ));
+            }
+            continue;
+        }
         let got: Vec<Json> = got.into_iter().map(|n| sorted(mask(n))).collect();
         let want: Vec<Json> = oracle[index]
             .1
