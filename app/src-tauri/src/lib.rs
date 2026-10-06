@@ -33,6 +33,9 @@ use sidecar::{CoreChoice, Launch};
 /// The core, or why it is not there. Stored in Tauri state so commands can reach it.
 pub struct Core(pub Result<Sidecar, CoreError>);
 
+/// The iOS start-up hook's notes when the core did not start (empty everywhere else): what [`core_stderr`] answers then.
+pub struct StartupNotes(pub Vec<String>);
+
 pub(crate) struct WindowSink(pub(crate) tauri::AppHandle);
 
 impl EventSink for WindowSink {
@@ -49,9 +52,20 @@ fn core_of(state: &State<'_, Core>) -> Result<Sidecar, CoreError> {
 /// `tests/egress_guards.rs` keeps the two in step). `import.run` is deliberately absent: an import starts only from
 /// the OS drop handled in Rust (`import_drop.rs`), so a script in the webview cannot name a path. `key.unlock` is the
 /// keychain path only (the sidecar refuses it with a passphrase; see [`core_unlock`]).
+#[cfg(not(target_os = "ios"))]
 pub const ALLOWED_METHODS: &[&str] = &[
     "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
     "sync.status", "sync.run", "relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel",
+];
+
+/// The phone's list (12-F, S5): the four server-side methods are gone, because a phone serves nothing and the core
+/// refuses them anyway (`unsupported_transport`). `pair.cancel` stays until the joiner's own cancel replaces it.
+/// `pair.join`, `pair.land` and the forget method join this list when those methods exist (12-F rows 3 and 5b).
+/// `tests/egress_guards.rs` reads the first list above for the page's calls and this one for the four.
+#[cfg(target_os = "ios")]
+pub const ALLOWED_METHODS: &[&str] = &[
+    "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
+    "sync.status", "sync.run", "pair.cancel",
 ];
 
 /// `Ok` when the page may call `method`; otherwise a fixed refusal that never echoes the method.
@@ -104,7 +118,7 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 /// Release filter: drop every `--debug-*` flag and, unless it is one of the flags that take no operand,
 /// the operand after it (so `--debug-window 390x844` leaves nothing behind).
 fn release_args(args: Vec<String>) -> Vec<String> {
-    const NO_OPERAND: [&str; 5] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock"];
+    const NO_OPERAND: [&str; 6] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock", "--debug-forget-open"];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
     while let Some(a) = it.next() {
@@ -154,8 +168,12 @@ fn launch_args() -> Vec<String> {
 /// Last stderr lines of the core for a diagnostics panel (never key material: the core keeps
 /// that off stderr; this is for "why did it stop" questions).
 #[tauri::command]
-fn core_stderr(state: State<'_, Core>) -> Result<Vec<String>, CoreError> {
-    Ok(core_of(&state)?.stderr_tail())
+fn core_stderr(state: State<'_, Core>, notes: State<'_, StartupNotes>) -> Result<Vec<String>, CoreError> {
+    match core_of(&state) {
+        Ok(core) => Ok(core.stderr_tail()),
+        Err(e) if notes.0.is_empty() => Err(e),
+        Err(_) => Ok(notes.0.clone()),
+    }
 }
 
 /// The passphrase named by `DISCONECT_DEBUG_PASSPHRASE_FILE` (evidence runs on scratch stores).
@@ -442,12 +460,19 @@ pub fn run() {
             #[cfg(all(debug_assertions, target_os = "ios"))]
             let proof_notes = ios_notes.clone();
             let core = start_core(app.handle());
+            // N1: with no core there is no tail to hold the hook's notes; they wait in `StartupNotes` for `core_stderr`.
             #[cfg(target_os = "ios")]
-            if let Ok(core) = &core {
-                for line in ios_notes {
-                    core.note(line);
+            let orphan_notes = match &core {
+                Ok(core) => {
+                    for line in ios_notes {
+                        core.note(line);
+                    }
+                    Vec::new()
                 }
-            }
+                Err(_) => ios_notes,
+            };
+            #[cfg(not(target_os = "ios"))]
+            let orphan_notes: Vec<String> = Vec::new();
             // Evidence runs (debug builds, scratch stores): unlock before the window asks, so a
             // screenshot shows the unlocked screens; nothing is typed into the webview.
             #[cfg(debug_assertions)]
@@ -460,6 +485,7 @@ pub fn run() {
                 debug_sync_on_start_door(core);
             }
             app.manage(Core(core));
+            app.manage(StartupNotes(orphan_notes));
             app.manage(coach::key::KeyHolder::default());
             app.manage(coach::commands::CoachState::default());
             app.manage(live::LiveState::default());
@@ -477,7 +503,7 @@ pub fn run() {
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
         coach::commands::support_sites, coach::commands::support_open,
         live::live_start, live::live_stop, live::live_state]);
-    #[cfg(all(debug_assertions, not(target_os = "macos")))]
+    #[cfg(all(debug_assertions, desktop, not(target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
         live::live_start, live::live_stop, live::live_state]);
@@ -486,9 +512,17 @@ pub fn run() {
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
         coach::commands::support_sites, coach::commands::support_open,
         live::live_start, live::live_stop, live::live_state]);
-    #[cfg(all(not(debug_assertions), not(target_os = "macos")))]
+    #[cfg(all(not(debug_assertions), desktop, not(target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command,
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
+        live::live_start, live::live_stop, live::live_state]);
+    // 12-F S5: the phone's lists carry no coach command (the coach is the product's one internet egress and is not on
+    // the phone), so the phone binary registers none of them. `live_*` stay until Bet 14 decides the phone's link.
+    #[cfg(all(debug_assertions, mobile))]
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,
+        live::live_start, live::live_stop, live::live_state]);
+    #[cfg(all(not(debug_assertions), mobile))]
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command,
         live::live_start, live::live_stop, live::live_state]);
     let app = builder
         .build(tauri::generate_context!())

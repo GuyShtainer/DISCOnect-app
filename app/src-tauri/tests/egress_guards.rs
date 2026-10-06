@@ -618,6 +618,18 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
 }
 
 #[test]
+fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_none() {
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let mut lists = lib.split("pub const ALLOWED_METHODS: &[&str] = &[").skip(1).map(|t| t.split("];").next().expect("closed list"));
+    let names = |body: &str| -> BTreeSet<String> { body.split('"').skip(1).step_by(2).map(str::to_string).collect() };
+    let (desktop, phone) = (names(lists.next().expect("the desktop list")), names(lists.next().expect("the phone list")));
+    assert!(lists.next().is_none(), "two lists, one per platform");
+    let dropped: BTreeSet<String> = desktop.difference(&phone).cloned().collect();
+    assert_eq!(dropped, ["pair.confirm", "pair.offer", "relay.addresses", "relay.serve"].map(String::from).into_iter().collect(), "only the four server-side methods go");
+    assert!(phone.is_subset(&desktop), "the phone's list adds nothing: {:?}", phone.difference(&desktop).collect::<Vec<_>>());
+}
+
+#[test]
 fn the_page_hears_a_drag_only_as_a_bare_over_flag_and_a_release_build_drops_debug_flags() {
     let lib = text(&manifest().join("src").join("lib.rs"));
     let emits: Vec<&str> = lib.lines().filter(|l| l.contains("\"core://drag\"")).collect();
