@@ -595,4 +595,15 @@ fn the_page_hears_a_drag_only_as_a_bare_over_flag_and_a_release_build_drops_debu
     let args = lib.split("fn launch_args()").nth(1).expect("launch_args").split("\n}\n").next().expect("body");
     let at = args.find("args.retain(|a| !a.starts_with(\"--debug-\"))").expect("the filter");
     assert!(args[..at].trim_end().ends_with("if !cfg!(debug_assertions) {"), "the filter is release-only");
+    // 7b-5: `--debug-window` sets the window size only inside a debug-only item, and only in the window build
+    let door = "--debug-window";
+    for (n, _) in lib.match_indices(door) {
+        let line_start = lib[..n].rfind('\n').map_or(0, |i| i + 1);
+        if lib[line_start..n].trim_start().starts_with("//") {
+            continue;
+        }
+        let attr = lib[..n].rfind("#[cfg(debug_assertions)]").expect("--debug-window sits after a debug-only attribute");
+        assert!(!lib[attr..n].contains("\n}\n"), "--debug-window sits outside a `#[cfg(debug_assertions)]` item");
+    }
+    assert!(lib.contains("fn debug_window_size") && lib.contains("config.width = w;"), "the door sets the built window's size");
 }

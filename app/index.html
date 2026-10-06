@@ -2,12 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>DISCOnect</title>
     <link rel="stylesheet" href="/src/tokens.css" />
     <link rel="stylesheet" href="/src/app.css" />
   </head>
   <body>
+    <header id="topbar" class="topbar">
+      <button id="menu" class="menu" type="button" aria-expanded="false" aria-controls="nav">Menu</button>
+      <span class="name"></span>
+      <span class="keyword caption muted"></span>
+    </header>
+    <div id="scrim" class="scrim" hidden></div>
     <div id="app" class="shell">
       <nav id="nav" class="sidebar" aria-label="Screens"></nav>
       <main id="main" class="main" tabindex="-1"></main>

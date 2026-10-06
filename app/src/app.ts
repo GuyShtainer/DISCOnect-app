@@ -45,18 +45,20 @@ const DAILY_MEAN = new Set(["heart_rate", "stress"]);
 function trendLabel(metric: string): string {
   return DAILY_MEAN.has(metric) ? `${metricLabel(metric)}, daily mean` : metricLabel(metric);
 }
-const SCREENS: { id: string; title: string }[] = [
-  { id: "today", title: "Today" },
-  { id: "sleep", title: "Sleep" },
-  { id: "watch", title: "Watch" },
-  { id: "sync", title: "Sync" },
-  { id: "import", title: "Import" },
-  { id: "trend", title: "Trends" },
-  { id: "health", title: "Data health" },
-  { id: "coach", title: "Coach" },
-  { id: "coach-settings", title: "Coach settings" },
-  { id: "key", title: "Your key" },
-  { id: "support", title: "Support" },
+const GROUPS = ["Your data", "Getting data in", "Coach", "This app"] as const;
+// One ordered list, grouped: the sidebar, the drawer, the route code and the lint all read it.
+const SCREENS: { id: string; title: string; group: (typeof GROUPS)[number] }[] = [
+  { id: "today", title: "Today", group: "Your data" },
+  { id: "sleep", title: "Sleep", group: "Your data" },
+  { id: "trend", title: "Trends", group: "Your data" },
+  { id: "health", title: "Data health", group: "Your data" },
+  { id: "import", title: "Import", group: "Getting data in" },
+  { id: "sync", title: "Sync", group: "Getting data in" },
+  { id: "watch", title: "Watch", group: "Getting data in" },
+  { id: "coach", title: "Coach", group: "Coach" },
+  { id: "coach-settings", title: "Coach settings", group: "Coach" },
+  { id: "key", title: "Your key", group: "This app" },
+  { id: "support", title: "Support", group: "This app" },
 ];
 
 const nav = document.getElementById("nav") as HTMLElement;
@@ -128,17 +130,53 @@ function liveFlag(): HTMLElement {
   return flag;
 }
 
+const topbar = document.getElementById("topbar") as HTMLElement;
+const menuButton = document.getElementById("menu") as HTMLButtonElement;
+const scrim = document.getElementById("scrim") as HTMLElement;
+const narrow = window.matchMedia("(max-width: 720px)");
+(topbar.querySelector(".name") as HTMLElement).textContent = PRODUCT;
+
+/** The drawer (under 720 px): the sidebar shown over a scrim, the page behind it inert. */
+function drawerOpen(): boolean {
+  return nav.hasAttribute("data-open");
+}
+function setDrawer(open: boolean, returnFocus = true): void {
+  if (open === drawerOpen()) return;
+  if (open) nav.setAttribute("data-open", ""); else nav.removeAttribute("data-open");
+  scrim.hidden = !open;
+  main.inert = open;
+  menuButton.setAttribute("aria-expanded", String(open));
+  if (open) focusDrawer();
+  else if (returnFocus) menuButton.focus();
+}
+function focusDrawer(): void {
+  const target = nav.querySelector<HTMLElement>('a[aria-current="page"]') ?? nav.querySelector<HTMLElement>("a");
+  target?.focus();
+}
+menuButton.addEventListener("click", () => setDrawer(!drawerOpen()));
+scrim.addEventListener("click", () => setDrawer(false));
+nav.addEventListener("click", (e) => { if ((e.target as HTMLElement).closest("a")) setDrawer(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && drawerOpen()) { e.preventDefault(); setDrawer(false); } });
+narrow.addEventListener("change", () => { if (!narrow.matches) setDrawer(false, false); });
+
 function renderNav(): void {
   nav.replaceChildren();
   nav.append(el("div", "brand", PRODUCT));
-  for (const s of SCREENS) {
-    if (s.id === "support" && !supportShown) continue;
-    const a = el("a", "", s.title) as HTMLAnchorElement;
-    a.href = `#/${s.id}`;
-    if (current().split("/")[0] === s.id) a.setAttribute("aria-current", "page");
-    if (s.id === "coach") a.append(coachFlag());
-    if (s.id === "watch" && liveRunning) a.append(liveFlag());
-    nav.append(a);
+  for (const g of GROUPS) {
+    const box = el("div", "navgroup");
+    box.setAttribute("role", "group");
+    box.setAttribute("aria-label", g);
+    box.append(el("div", "group muted", g));
+    for (const s of SCREENS) {
+      if (s.group !== g || (s.id === "support" && !supportShown)) continue;
+      const a = el("a", "", s.title) as HTMLAnchorElement;
+      a.href = `#/${s.id}`;
+      if (current().split("/")[0] === s.id) a.setAttribute("aria-current", "page");
+      if (s.id === "coach") a.append(coachFlag());
+      if (s.id === "watch" && liveRunning) a.append(liveFlag());
+      box.append(a);
+    }
+    nav.append(box);
   }
   nav.append(el("div", "spacer"));
   const status = el("div", "status caption muted");
@@ -149,6 +187,10 @@ function renderNav(): void {
     : "";
   nav.append(status);
   nav.append(el("footer", "notice", NOTICE));
+  (topbar.querySelector(".keyword") as HTMLElement).textContent = keyStatus
+    ? keyStatus.encrypted ? (keyStatus.unlocked ? "Unlocked" : "Locked") : "Not encrypted"
+    : "";
+  if (drawerOpen() && !nav.contains(document.activeElement)) focusDrawer(); // a redraw must not strand the focus
 }
 
 async function refreshKey(): Promise<KeyStatus | null> {
@@ -2438,4 +2480,6 @@ void (async () => {
   } else {
     await route();
   }
+  // evidence runs, debug builds only (Rust drops --debug-* argv in release): the drawer drawn open
+  if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
 })();

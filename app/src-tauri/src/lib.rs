@@ -258,17 +258,38 @@ fn drag_over(app: &tauri::AppHandle, over: bool) {
     let _ = app.emit("core://drag", serde_json::json!({ "over": over }));
 }
 
+/// `--debug-window <W>x<H>` from argv: both sides whole numbers of 1 to 4 digits, 300 to 4000 px; anything else is ignored.
+#[cfg(debug_assertions)]
+fn debug_window_size(args: &[String]) -> Option<(f64, f64)> {
+    let at = args.iter().position(|a| a == "--debug-window")?;
+    let (w, h) = args.get(at + 1)?.split_once('x')?;
+    let ok = |t: &str| t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit());
+    if !ok(w) || !ok(h) {
+        return None;
+    }
+    let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+    ((300..=4000).contains(&w) && (300..=4000).contains(&h)).then_some((f64::from(w), f64::from(h)))
+}
+
 /// The main window is declared in `tauri.conf.json` with `"create": false` and built here, after the core
 /// is in state, so it can carry the egress hooks (ADR 0010): top-level navigation is limited to the app's
 /// own origin ([`coach::egress_guard::navigation_allowed`]) and `window.open` / `target=_blank` is denied.
 fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let config = app
+    #[allow(unused_mut)]
+    let mut config = app
         .config()
         .app
         .windows
         .first()
         .cloned()
         .ok_or("tauri.conf.json declares no window")?;
+    // Evidence runs, debug builds only: `--debug-window <W>x<H>` sets the window's inner size at build
+    // (the page ignores the flag; a release build never reads argv here).
+    #[cfg(debug_assertions)]
+    if let Some((w, h)) = debug_window_size(&std::env::args().collect::<Vec<_>>()) {
+        config.width = w;
+        config.height = h;
+    }
     // Pitch 7b-3: the OS drop is handled here, in Rust. The webview never listens to the `tauri://drag-*` events
     // (they carry the dragged paths into the page); it hears only `core://drag` with a bare `over` flag.
     let handle = app.handle().clone();
