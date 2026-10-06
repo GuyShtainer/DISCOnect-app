@@ -505,7 +505,7 @@ fn contract_lists_the_numeric_metrics_with_their_declared_scopes_and_answers_loc
         assert_eq!(by("heart_rate")["cadence"], "sample");
         assert_eq!(by("stress")["cadence"], "sample");
         assert_eq!(by("steps")["cadence"], "daily");
-        assert_eq!(by("steps")["scopes"], json!(["local"]));
+        assert_eq!(by("steps")["scopes"], json!(["vendor_cloud", "local"]));
         assert_eq!(rows[0]["metric"], "heart_rate");
         for row in rows {
             assert_eq!(row.as_object().expect("object").len(), 4);
