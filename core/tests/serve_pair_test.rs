@@ -300,6 +300,7 @@ fn error_of(reply: &Value) -> (&str, &str) {
 // ---- tests ----
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_first_pull_succeeds_with_keep_off_and_the_server_stops_at_expiry() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(Some(9), 600));
@@ -356,6 +357,7 @@ fn the_first_pull_succeeds_with_keep_off_and_the_server_stops_at_expiry() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn wrong_digits_abort_with_codes_differ_and_the_joiner_reads_410_within_the_linger() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(None, 4000));
@@ -382,6 +384,7 @@ fn wrong_digits_abort_with_codes_differ_and_the_joiner_reads_410_within_the_ling
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_second_device_aborts_with_another_device() {
     let (_dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, fast(None, 200));
@@ -402,6 +405,7 @@ fn a_second_device_aborts_with_another_device() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn cancel_ends_the_offer_once_and_is_idempotent() {
     let (_dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, fast(None, 300));
@@ -421,6 +425,7 @@ fn cancel_ends_the_offer_once_and_is_idempotent() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn cancel_with_keep_on_leaves_the_server_serving() {
     let (_dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, fast(None, 100));
@@ -436,6 +441,7 @@ fn cancel_with_keep_on_leaves_the_server_serving() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_second_offer_is_busy_and_sync_run_runs_during_an_open_offer() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(None, 200));
@@ -456,6 +462,7 @@ fn a_second_offer_is_busy_and_sync_run_runs_during_an_open_offer() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_held_import_makes_pair_offer_busy_and_leaves_no_reservation_behind() {
     let (dir, db) = serving_store(true);
     let (release, gate) = mpsc::channel::<()>();
@@ -474,6 +481,7 @@ fn a_held_import_makes_pair_offer_busy_and_leaves_no_reservation_behind() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn relay_serve_switches_the_server_with_and_without_an_offer() {
     let (_dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, fast(None, 100));
@@ -510,6 +518,7 @@ fn relay_serve_switches_the_server_with_and_without_an_offer() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_delivered_offer_does_not_block_stop_serving() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(None, 200));
@@ -528,6 +537,7 @@ fn a_delivered_offer_does_not_block_stop_serving() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_prefix_runs_in_order_on_all_five_methods() {
     let calls = [
         ("relay.addresses", json!({})),
@@ -611,6 +621,7 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn listen_refusals_name_the_rule_and_never_the_address() {
     let (_dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, Hooks::default());
@@ -670,6 +681,7 @@ fn listen_refusals_name_the_rule_and_never_the_address() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn relay_addresses_lists_the_network_first_and_loopback_last() {
     let (_dir, db) = serving_store(false);
     let list: Vec<IpAddr> = ["127.0.0.1", "fe80::1", "10.1.2.3", "::1", "169.254.4.4", "192.168.0.5", "2001:db8::7"]
@@ -706,6 +718,7 @@ fn relay_addresses_lists_the_network_first_and_loopback_last() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_address_watcher_stops_the_server_when_its_address_is_gone() {
     let (_dir, db) = serving_store(false);
     let present = Arc::new(AtomicBool::new(true));
@@ -734,6 +747,7 @@ fn the_address_watcher_stops_the_server_when_its_address_is_gone() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_session_end_stops_the_server_before_the_import_wait() {
     let (dir, db) = serving_store(true);
     let (release, gate) = mpsc::channel::<()>();
@@ -782,6 +796,7 @@ fn pair_states(live: &mut Live) -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_cancel_after_delivery_stops_the_server_after_the_linger_with_no_pair_event() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(None, 300));
@@ -797,6 +812,7 @@ fn a_cancel_after_delivery_stops_the_server_after_the_linger_with_no_pair_event(
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_cancel_stops_the_server_after_the_linger_and_says_offer_ended_once() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(None, 200));
@@ -812,6 +828,7 @@ fn a_cancel_stops_the_server_after_the_linger_and_says_offer_ended_once() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn keep_on_across_a_delivered_offer_that_reaches_its_expiry_keeps_the_server() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(Some(4), 200));
@@ -827,6 +844,7 @@ fn keep_on_across_a_delivered_offer_that_reaches_its_expiry_keeps_the_server() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_address_watcher_takes_an_open_offer_silently_and_the_offer_is_gone() {
     let (_dir, db) = serving_store(false);
     let present = Arc::new(AtomicBool::new(true));
@@ -852,6 +870,7 @@ fn the_address_watcher_takes_an_open_offer_silently_and_the_offer_is_gone() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_second_offer_after_a_delivery_reuses_the_running_server_and_refuses_another_address() {
     let (_dir, db) = serving_store(true);
     let mut live = Live::unlocked(&db, fast(Some(30), 200));
@@ -871,6 +890,7 @@ fn a_second_offer_after_a_delivery_reuses_the_running_server_and_refuses_another
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifetime_rule() {
     let (_dir, db) = serving_store(false);
     let present = Arc::new(AtomicBool::new(true));
@@ -899,6 +919,7 @@ fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifeti
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn the_stop_paths_work_without_the_relay_checks() {
     let (dir, db) = serving_store(false);
     let mut live = Live::unlocked(&db, fast(None, 200));
@@ -946,6 +967,7 @@ fn library_env(linger_ms: u64) -> (tempfile::TempDir, Env, Site) {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_reserved_push_outlasting_the_linger_keeps_the_server_and_is_not_busy() {
     let (_dir, env, site) = library_env(150);
     let listen: std::net::SocketAddr = listen_on_free_port().parse().expect("addr");
@@ -966,6 +988,7 @@ fn a_reserved_push_outlasting_the_linger_keeps_the_server_and_is_not_busy() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "the phone refuses the server roles (12-D 4b: unsupported_transport); the Mac serves the relay and offers pairing")]
 fn a_cancel_during_the_push_ends_the_offer_with_pair_failed() {
     let (_dir, env, site) = library_env(150);
     let listen: std::net::SocketAddr = listen_on_free_port().parse().expect("addr");
