@@ -338,7 +338,7 @@ fn the_first_pull_succeeds_with_keep_off_and_the_server_stops_at_expiry() {
     assert_eq!(pulled.records_new, 2);
     assert_eq!(
         live.serving(),
-        json!({"url": format!("http://{listen}"), "keep": false, "offer": "released"})
+        json!({"url": format!("http://{listen}"), "keep": false, "offer": "delivered"})
     );
     assert_eq!(http_status(&listen, "/v1/health"), Some(200), "delivery does not end serving");
 

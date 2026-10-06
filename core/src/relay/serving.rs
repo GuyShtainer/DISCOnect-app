@@ -416,7 +416,8 @@ pub fn serve_off(env: &Env) -> Option<String> {
     None
 }
 
-/// `sync.status.serving`: null, or `{"url", "keep", "offer": null|"open"|"bound"|"released"}`.
+/// `sync.status.serving`: null, or `{"url", "keep", "offer": null|"open"|"bound"|"released"|"delivered"}`
+/// (`delivered`: the key is fetched; the server only outlives the offer for the first pull).
 pub fn serving_value(shared: &Shared) -> Value {
     let st = lock(shared);
     let Some(running) = &st.server else {
@@ -425,6 +426,7 @@ pub fn serving_value(shared: &Shared) -> Value {
     let offer = st.offer.as_ref().and_then(|o| match o.handle.state() {
         PairState::Open => Some("open"),
         PairState::Bound => Some("bound"),
+        PairState::Released if o.handle.wait_delivered(Duration::ZERO) => Some("delivered"),
         PairState::Released => Some("released"),
         PairState::Aborted | PairState::Expired => None,
     });
