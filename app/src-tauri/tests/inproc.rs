@@ -461,3 +461,18 @@ async fn an_empty_folder_dropped_through_the_import_entry_point_answers_started_
     assert_eq!(seen[1]["ok"], 0);
     core.shutdown();
 }
+
+#[tokio::test]
+async fn data_contract_lists_the_trend_metrics_and_marks_heart_rate_a_sample() {
+    // stands in for the un-capturable open Trends select (pitch 7b-6 section 4)
+    env_init();
+    let dir = scratch();
+    let db = synthetic_copy(&dir, "synthetic.hbdb");
+    let core = Sidecar::start_inproc(db, collect()).expect("in-process core");
+    let c = core.call("data.contract", json!({})).await.expect("data.contract");
+    let metrics = c["metrics"].as_array().expect("metrics");
+    assert!(metrics.len() >= 10, "{} metrics", metrics.len());
+    let hr = metrics.iter().find(|m| m["metric"] == "heart_rate").expect("heart_rate");
+    assert_eq!(hr["cadence"], "sample");
+    core.shutdown();
+}

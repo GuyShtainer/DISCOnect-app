@@ -1,5 +1,5 @@
 // ECharts drawing with the design tokens read at paint time (so a theme change re-reads them).
-// A missing day is null and connectNulls is off: a line never bridges a gap. Days no import
+// A missing day is null and connectNulls is off: a line never bridges a gap. Days no source's import
 // covered get a hatched band from the status-not-covered token.
 import * as echarts from "echarts";
 import { scopeWord } from "./identity";
@@ -12,20 +12,25 @@ export function token(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-/** Contiguous runs of not_covered days as [first, last] pairs, for markArea. */
-export function notCoveredRuns(days: { day: string; status: string }[]): [string, string][] {
+/** Contiguous runs of hatched days as [first, last] pairs, for markArea; `gap` is the intersection day list. */
+export function gapRuns(days: { day: string }[], gap: Set<string>): [string, string][] {
   const runs: [string, string][] = [];
   let start: string | null = null;
   for (let i = 0; i < days.length; i++) {
-    const gap = days[i].status === "not_covered";
-    if (gap && start === null) start = days[i].day;
-    if (!gap && start !== null) {
+    const hit = gap.has(days[i].day);
+    if (hit && start === null) start = days[i].day;
+    if (!hit && start !== null) {
       runs.push([start, days[i - 1].day]);
       start = null;
     }
   }
   if (start !== null) runs.push([start, days[days.length - 1].day]);
   return runs;
+}
+
+/** Days a run spans, by index in the window's day list. */
+export function runDays(days: { day: string }[], a: string, b: string): number {
+  return days.findIndex((d) => d.day === b) - days.findIndex((d) => d.day === a) + 1;
 }
 
 let active: { chart: echarts.ECharts; observer: ResizeObserver } | null = null;
@@ -64,6 +69,9 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
   active = { chart, observer };
   const days = series[0].days.map((d) => d.day);
   const hatch = token("--status-not-covered");
+  // a day is hatched only when every drawn non-live series has it not_covered
+  const drawn = series.filter((t) => t.scope !== "live");
+  const gap = new Set(drawn.length ? drawn[0].days.filter((_d, i) => drawn.every((t) => t.days[i]?.status === "not_covered")).map((d) => d.day) : []);
   const unit = series[0].unit ?? "";
   chart.setOption({
     backgroundColor: "transparent",
@@ -92,7 +100,7 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       splitLine: { lineStyle: { color: token("--hairline") } },
       scale: true,
     },
-    // the hatched bands follow the first non-live series: a live session claims no day
+    // the band draws once, on the first non-live series: a live session claims no day
     series: series.map((s, i) => ({
       name: scopeWord(s.scope),
       // live is a diamond per session day and never a line: a session is not a day of monitoring
@@ -110,7 +118,12 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
             silent: true,
             itemStyle: { color: { image: hatchImage(hatch), repeat: "repeat" }, opacity: 0.6 },
             label: { show: true, position: "insideBottom", color: token("--ink-muted"), formatter: "not covered" },
-            data: notCoveredRuns(s.days).map(([a, b]) => [{ xAxis: a }, { xAxis: b }]),
+            // a band narrower than a tenth of the window cannot hold the words: adjacent labels
+            // collided and the right-edge one clipped; the caption's count still names every band
+            data: gapRuns(s.days, gap).map(([a, b]) => [
+              { xAxis: a, label: { show: runDays(s.days, a, b) >= Math.ceil(s.days.length / 10) } },
+              { xAxis: b },
+            ]),
           }
         : undefined,
     })),

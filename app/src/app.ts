@@ -39,11 +39,13 @@ const LIVE_FOLDED: { metric: string; unit: string | null }[] = [
   { metric: "spo2", unit: "%" }, { metric: "energy_reserve", unit: null },
 ];
 const SCOPES = ["device", "vendor_cloud", "local"];
-const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "heart_rate", "steps", "sleep_score", "stress_avg", "stress", "hrv_last_night_average", "sleep_duration"];
-// Sample-cadence metrics: data.metric returns each day's mean of its stored minutes (every scope, live included).
-const DAILY_MEAN = new Set(["heart_rate", "stress"]);
+// The Trends metric list is read once per session from data.contract (contract order; sample cadence = daily mean).
+type ContractMetric = { metric: string; unit: string | null; cadence: "daily" | "sample"; scopes: string[] };
+let trendList: ContractMetric[] | null = null;
+let trendArg: string | null = null; // --trend <id>, resolved after the first contract read
 function trendLabel(metric: string): string {
-  return DAILY_MEAN.has(metric) ? `${metricLabel(metric)}, daily mean` : metricLabel(metric);
+  const m = trendList?.find((c) => c.metric === metric);
+  return m?.cadence === "sample" ? `${metricLabel(metric)}, daily mean` : metricLabel(metric);
 }
 const GROUPS = ["Your data", "Getting data in", "Coach", "This app"] as const;
 // One ordered list, grouped: the sidebar, the drawer, the route code and the lint all read it.
@@ -1097,13 +1099,29 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
 }
 
 // ---- Trend ------------------------------------------------------------------------------
-let trendMetric = TREND_METRICS[0];
+let trendMetric = "";
 let trendDays = 90;
 
 async function screenTrend(out: ParentNode, later: Later): Promise<void> {
+  if (trendList === null) {
+    const c = await core.call<{ metrics: ContractMetric[] }>("data.contract").catch(() => null);
+    trendList = c ? c.metrics.filter((m) => m.scopes.length > 0) : null;
+  }
+  const list = trendList ?? [];
+  if (trendArg !== null) {
+    if (list.some((m) => m.metric === trendArg)) trendMetric = trendArg;
+    trendArg = null;
+  }
+  if (!list.some((m) => m.metric === trendMetric)) trendMetric = list[0]?.metric ?? "";
+  if (!list.length) {
+    trendList = null; // a failed read is asked again on the next visit
+    header(out, "Trends", "");
+    out.append(el("p", "caption muted", "The core did not answer with its metric list."));
+    return;
+  }
   const controls = el("div", "row");
   const select = el("select") as HTMLSelectElement;
-  for (const m of TREND_METRICS) {
+  for (const { metric: m } of list) {
     const o = el("option", "", trendLabel(m)) as HTMLOptionElement;
     o.value = m;
     o.selected = m === trendMetric;
@@ -1147,16 +1165,21 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
     card.append(el("span", "muted body", "No source has values for this metric in the window."));
     return;
   }
-  // the hatched bands follow the first non-live series: a live session claims no day, so its gaps mean nothing
-  const lead = series.find((s) => s.scope !== "live") ?? series[0];
-  const gapDays = lead.scope === "live" ? 0 : lead.days.filter((d) => d.status === "not_covered").length;
+  // a day is hatched only when every drawn non-live series lacks it: a live session claims no day, so its gaps mean nothing
+  const drawn = series.filter((x) => x.scope !== "live");
+  const gapDays = drawn.length ? drawn[0].days.filter((_d, i) => drawn.every((x) => x.days[i]?.status === "not_covered")).length : 0;
+  const plural = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
+  const extra = drawn
+    .map((x) => ({ x, n: x.days.filter((d) => d.status === "not_covered").length - gapDays }))
+    .filter((e) => e.n > 0)
+    .map((e, i) => `${i === 0 ? "The" : "the"} ${scopeWord(e.x.scope)} line lacks ${plural(e.n)} more`);
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
   const liveNote = series.some((s) => s.scope === "live") ? ` Diamonds: days with a live-link session, the mean of the minutes the link recorded; a session claims no day, so it draws no band.` : "";
-  card.append(el("span", "caption muted", (lead.scope === "live"
+  card.append(el("span", "caption muted", (!drawn.length
     ? "Only live-link sessions have values for this metric in the window."
     : gapDays
-      ? `Hatched bands: ${gapDays} days no import covered the ${scopeWord(lead.scope)} source. Nothing is drawn there; a line never bridges a gap.`
-      : `Every day in the window was covered by an import of the ${scopeWord(lead.scope)} source.`) + liveNote + ends));
+      ? `Hatched bands: ${plural(gapDays)} no source was covered by an import.${extra.length ? ` ${extra.join(", ")}.` : ""} Nothing is drawn there; a line never bridges a gap.`
+      : "Every day in the window was covered by an import of at least one source.") + liveNote + ends));
   later(() => drawTrend(chart, series, trendLabel(trendMetric)));
 }
 
@@ -2477,7 +2500,7 @@ void (async () => {
   const sc = args.indexOf("--scroll"); // evidence runs: scroll the drawn screen
   if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
-  if (t >= 0 && TREND_METRICS.includes(args[t + 1])) trendMetric = args[t + 1];
+  if (t >= 0 && args[t + 1]) trendArg = args[t + 1];
   const dl = args.indexOf("--debug-listen");
   const m = dl >= 0 ? /^(.+):(\d{1,5})$/.exec(args[dl + 1] ?? "") : null;
   if (m) debugListen = { ip: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) };
