@@ -119,6 +119,11 @@ label.choice input { width: 20px; height: 20px; margin: 0; }
 .livemark { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--live); font-size: 12px; line-height: 16px; font-weight: 600; }
 .unit { font-family: var(--font-sans); font-size: 12px; line-height: 16px; font-weight: 400; color: var(--ink-muted); }
 .vcard .caption.top { display: flex; justify-content: space-between; gap: var(--space-2); }
+.notlist { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-1) var(--space-6); }
+.notlist > span { display: flex; justify-content: space-between; gap: var(--space-2); min-height: 28px; align-items: center; border-bottom: 1px solid var(--hairline); font-size: 14px; line-height: 20px; }
+.notlist > span > .caption { flex: 0 1 auto; text-align: right; }
+.notlist > span[hidden] { display: none; }
+details.drawer > .cards { margin-top: var(--space-3); }
 .live-grid { grid-template-columns: 1fr auto 1fr; }
 .steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: row; flex-wrap: wrap; gap: var(--space-4); }
 .steps li { display: grid; grid-template-columns: 24px 1fr; gap: var(--space-2); color: var(--ink-muted); }

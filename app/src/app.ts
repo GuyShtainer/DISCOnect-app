@@ -253,21 +253,14 @@ async function screenToday(out: ParentNode): Promise<void> {
   const [today, facts] = await Promise.all([core.call<Today>("data.today"), core.call<Facts>("data.facts", { days: 7, baseline_days: 28 })]);
   header(out, "Today", today.day);
   await liveCard(out, today.day);
+  // Design pass 2026-10-06 (decision 2): the device and local figures first, a value from an earlier day
+  // muted with its date; the vendor cloud's figures in a closed drawer; pairs never stored as a list.
+  const fresh = today.metrics.filter((r) => r.value !== null && r.scope !== "vendor_cloud");
+  const cloud = today.metrics.filter((r) => r.value !== null && r.scope === "vendor_cloud");
+  const never = today.metrics.filter((r) => r.value === null);
   const cards = el("div", "cards");
-  for (const row of today.metrics) {
-    const card = el("div", "card");
-    card.append(el("span", "caption muted", metricLabel(row.metric)));
-    const v = el("span", "value", fmt(row.value, row.unit));
-    if (row.value === null) v.classList.add("muted");
-    card.append(v);
-    const line = el("span", "caption");
-    line.append(scopeTag(row.scope));
-    const note = row.value === null ? missingWord(row.status) : row.day && row.day !== today.day ? `latest · ${row.day}` : "";
-    if (note) line.append(el("span", "muted", ` · ${note}`));
-    card.append(line);
-    cards.append(card);
-  }
-  out.append(cards);
+  for (const row of fresh) cards.append(todayCard(row, today.day));
+  if (fresh.length) out.append(cards);
   const card = el("div", "card");
   card.append(el("h2", "heading", `Last ${facts.window.days} days vs your ${facts.baseline.days}-day baseline`));
   const grid = el("div", "grid3 body");
@@ -286,6 +279,58 @@ async function screenToday(out: ParentNode): Promise<void> {
   card.append(grid);
   card.append(el("span", "caption muted", "Comparisons are against your own history only. They describe; they do not diagnose."));
   out.append(card);
+  if (never.length) {
+    const box = el("section", "card");
+    box.append(el("h2", "heading", "No value stored"));
+    const list = el("div", "notlist");
+    const SHOWN = 6;
+    never.forEach((row, i) => {
+      const item = el("span");
+      if (i >= SHOWN) item.hidden = true;
+      const name = el("span");
+      name.append(document.createTextNode(`${metricLabel(row.metric)} `), scopeTag(row.scope));
+      item.append(name, el("span", "caption muted", missingWord(row.status) || "never stored"));
+      list.append(item);
+    });
+    box.append(list);
+    if (never.length > SHOWN) {
+      const more = el("button", "secondary", `Show all ${never.length}`) as HTMLButtonElement;
+      more.onclick = () => { for (const item of list.children) (item as HTMLElement).hidden = false; more.remove(); };
+      box.append(more);
+    }
+    out.append(box);
+  }
+  if (cloud.length) {
+    const drawer = el("details", "drawer");
+    const latest = cloud.reduce<string | null>((m, r) => (r.day && (!m || r.day > m) ? r.day : m), null);
+    drawer.append(el("summary", "", `${scopeWord("vendor_cloud")} · ${cloud.length} figure${cloud.length === 1 ? "" : "s"}${latest ? ` · latest ${latest}` : ""}`));
+    const grid = el("div", "cards");
+    for (const row of cloud) grid.append(todayCard(row, today.day));
+    drawer.append(grid);
+    out.append(drawer);
+  }
+}
+
+/** One Today value card: label and scope on top, the value (muted when it is from an earlier day), then the day. */
+function todayCard(row: TodayRow, todayDay: string): HTMLElement {
+  const card = el("div", "card vcard");
+  const top = el("span", "caption muted top");
+  top.append(document.createTextNode(metricLabel(row.metric)), scopeTag(row.scope));
+  card.append(top);
+  const stale = !!row.day && row.day !== todayDay;
+  const v = el("span", stale ? "value muted" : "value", fmtValue(row.value, row.unit));
+  card.append(v);
+  card.append(el("span", "caption muted", stale ? `latest · ${row.day}` : "today"));
+  return card;
+}
+
+/** `fmt`, with minutes of an hour or more read as hours and minutes ("7 h 00 min"). */
+function fmtValue(value: number | null, unit: string | null): string {
+  if (value !== null && unit === "min" && Math.abs(value) >= 60) {
+    const total = Math.round(Math.abs(value));
+    return `${value < 0 ? "−" : ""}${Math.floor(total / 60)} h ${String(total % 60).padStart(2, "0")} min`;
+  }
+  return fmt(value, unit);
 }
 
 // ---- Watch (the live link, Bet 9 follow-up) -----------------------------------------------
