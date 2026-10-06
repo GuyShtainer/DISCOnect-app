@@ -2421,6 +2421,8 @@ void (async () => {
   const wanted = i >= 0 && (night || SCREENS.some((s) => s.id === arg)) ? arg : null;
   const h = args.indexOf("--health-days");
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
+  const th = args.indexOf("--theme"); // evidence runs and trials: force a palette (pastel follows the system scheme)
+  if (th >= 0 && ["pastel", "light", "dark", "pastel-light", "pastel-dark"].includes(args[th + 1])) document.documentElement.dataset.theme = args[th + 1];
   const sc = args.indexOf("--scroll"); // evidence runs: scroll the drawn screen
   if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
