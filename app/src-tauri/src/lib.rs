@@ -15,6 +15,8 @@ pub mod coach;
 pub mod import_drop;
 pub mod inproc;
 #[cfg(target_os = "ios")]
+mod cover;
+#[cfg(target_os = "ios")]
 mod ios;
 pub mod live;
 pub mod sidecar;
@@ -458,6 +460,13 @@ pub fn run() {
             // store opens and before the page asks `key.unlock`. Its notes reach the core's diagnostics below.
             #[cfg(target_os = "ios")]
             let ios_notes = ios::prepare(app.handle());
+            // iOS only: the app-switcher cover (`cover.rs`): a plain view over the windows while the app is not active
+            #[cfg(target_os = "ios")]
+            if let Some(mtm) = objc2::MainThreadMarker::new() {
+                cover::install(mtm);
+            }
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            let proof_notes = ios_notes.clone();
             let core = start_core(app.handle());
             // N1: with no core there is no tail to hold the hook's notes; they wait in `StartupNotes` for `core_stderr`.
             #[cfg(target_os = "ios")]
