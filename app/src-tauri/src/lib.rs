@@ -62,12 +62,14 @@ pub const ALLOWED_METHODS: &[&str] = &[
 
 /// The phone's list (12-F, S5): the four server-side methods are gone, because a phone serves nothing and the core
 /// refuses them anyway (`unsupported_transport`). `pair.cancel` stays until the joiner's own cancel replaces it.
-/// `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy. `pair.join` and `pair.land` join it
+/// `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy. `key.lock` (row 5c) is too: the
+/// phone drops its master after five minutes away (see [`AwayClock`]); the app calls it in-process, the list says the
+/// page may too. `pair.join` and `pair.land` join it
 /// when those methods exist (12-F row 3).
 /// `tests/egress_guards.rs` reads the first list above for the page's calls and this one for the four.
 #[cfg(target_os = "ios")]
 pub const ALLOWED_METHODS: &[&str] = &[
-    "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
+    "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "key.lock", "import.last",
     "sync.status", "sync.run", "pair.cancel", "pair.forget",
 ];
 
@@ -392,6 +394,87 @@ fn debug_keychain_proof_door(app: &tauri::AppHandle, startup_notes: &[String]) {
     let _ = std::fs::write(std::env::temp_dir().join("keychain-proof.json"), proof.to_string());
 }
 
+/// How long the phone may be away (not the active app) before its master key leaves memory: 12-F pitch, "The master in
+/// memory". Debug builds read `DISCONECT_DEBUG_AWAY_SECS` instead (evidence runs); that code is compiled out of release.
+const AWAY_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(debug_assertions)]
+fn away_limit() -> std::time::Duration {
+    std::env::var("DISCONECT_DEBUG_AWAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(AWAY_LIMIT, std::time::Duration::from_secs)
+}
+
+#[cfg(not(debug_assertions))]
+fn away_limit() -> std::time::Duration {
+    AWAY_LIMIT
+}
+
+/// Whether coming back at `back` after leaving at `left` must drop the master: `limit` or more has passed, or the wall
+/// clock went backwards (then the time away is unknown, so the safe answer is to lock). Wall-clock times on purpose:
+/// `Instant` does not count the time a sleeping phone spends asleep.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+fn away_requires_lock(left: std::time::SystemTime, back: std::time::SystemTime, limit: std::time::Duration) -> bool {
+    back.duration_since(left).map_or(true, |away| away >= limit)
+}
+
+/// When the app last stopped being the active one (Tauri's `Suspended`, applicationWillResignActive). Every `Suspended`
+/// overwrites it, so a Control Center pull-down that ended in the app again is not counted as time away.
+#[cfg(target_os = "ios")]
+#[derive(Default)]
+struct AwayClock(std::sync::Mutex<Option<std::time::SystemTime>>);
+
+#[cfg(target_os = "ios")]
+impl AwayClock {
+    fn left(&self, at: std::time::SystemTime) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(at);
+        }
+    }
+
+    /// Back in the foreground at `now`: true when the master must go. No recorded departure also answers true.
+    fn back(&self, now: std::time::SystemTime, limit: std::time::Duration) -> bool {
+        let left = self.0.lock().ok().and_then(|mut slot| slot.take());
+        left.is_none_or(|left| away_requires_lock(left, now, limit))
+    }
+}
+
+/// Drop the master through the same router the page uses, then tell the page (`core://locked`, no payload) so it draws
+/// Unlock. Synchronous: the in-process call is a lock and a reply, and it must finish before the cover comes off.
+#[cfg(target_os = "ios")]
+fn lock_after_absence(app: &tauri::AppHandle) {
+    let state = app.state::<Core>();
+    let Ok(core) = core_of(&state) else { return };
+    if tauri::async_runtime::block_on(core.call("key.lock", serde_json::json!({}))).is_ok() {
+        let _ = app.emit("core://locked", serde_json::json!({}));
+    }
+}
+
+#[cfg(test)]
+mod away_tests {
+    use super::{away_requires_lock, AWAY_LIMIT};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn under_the_limit_keeps_the_master_the_limit_and_over_lock_and_a_clock_gone_back_locks() {
+        let left = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let back = |secs: u64| left + Duration::from_secs(secs);
+        assert!(!away_requires_lock(left, left, AWAY_LIMIT), "no time away");
+        assert!(!away_requires_lock(left, back(299), AWAY_LIMIT), "299 s keeps");
+        assert!(away_requires_lock(left, back(300), AWAY_LIMIT), "300 s locks");
+        assert!(away_requires_lock(left, back(86_400), AWAY_LIMIT), "a day locks");
+        assert!(away_requires_lock(left, left - Duration::from_secs(1), AWAY_LIMIT), "a clock one second back locks");
+        assert!(away_requires_lock(left, SystemTime::UNIX_EPOCH, AWAY_LIMIT), "a clock far back locks");
+        assert!(!away_requires_lock(left, back(5), Duration::from_secs(6)) && away_requires_lock(left, back(6), Duration::from_secs(6)), "the limit is a parameter");
+    }
+
+    #[test]
+    fn the_limit_is_five_minutes() {
+        assert_eq!(AWAY_LIMIT, Duration::from_secs(300));
+    }
+}
+
 /// Tell the page whether something is hovering. The payload is only the flag, never a path.
 fn drag_over(app: &tauri::AppHandle, over: bool) {
     let _ = app.emit("core://drag", serde_json::json!({ "over": over }));
@@ -432,22 +515,28 @@ fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     // Pitch 7b-3: the OS drop is handled here, in Rust. The webview never listens to the `tauri://drag-*` events
     // (they carry the dragged paths into the page); it hears only `core://drag` with a bare `over` flag.
     let handle = app.handle().clone();
+    #[cfg(target_os = "ios")]
+    let away = AwayClock::default();
     let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
         .on_navigation(coach::egress_guard::navigation_allowed)
         .on_new_window(|_url, _features| NewWindowResponse::Deny)
         .build()?;
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::DragDrop(drag) = event {
-            match drag {
-                tauri::DragDropEvent::Enter { .. } => drag_over(&handle, true),
-                tauri::DragDropEvent::Leave => drag_over(&handle, false),
-                tauri::DragDropEvent::Drop { paths, .. } => {
-                    drag_over(&handle, false);
-                    import_drop::handle_drop(&handle, paths.clone());
-                }
-                _ => {} // Over: nothing to tell the page
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::DragDrop(drag) => match drag {
+            tauri::DragDropEvent::Enter { .. } => drag_over(&handle, true),
+            tauri::DragDropEvent::Leave => drag_over(&handle, false),
+            tauri::DragDropEvent::Drop { paths, .. } => {
+                drag_over(&handle, false);
+                import_drop::handle_drop(&handle, paths.clone());
             }
-        }
+            _ => {} // Over: nothing to tell the page
+        },
+        // 12-F row 5c: five minutes away drops the master (the page then shows Unlock)
+        #[cfg(target_os = "ios")]
+        tauri::WindowEvent::Suspended => away.left(std::time::SystemTime::now()),
+        #[cfg(target_os = "ios")]
+        tauri::WindowEvent::Resumed if away.back(std::time::SystemTime::now(), away_limit()) => lock_after_absence(&handle),
+        _ => {}
     });
     Ok(())
 }

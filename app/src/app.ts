@@ -717,6 +717,7 @@ type SyncStatus = {
   bundles: Record<string, number>; records_unsent: number; records_seen: number; conflicts: number; superseded: number;
   gaps: unknown[]; last_pushed_at: string | null; last_pulled_at: string | null;
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
+  relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
 };
 type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
 type OfferReply = { offer: string; url: string; expires_at: number };
@@ -2474,9 +2475,9 @@ function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.C
   const when = status?.last_pulled_at
     ? new Date(status.last_pulled_at).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
     : "never";
-  // no address row: nothing the page may call returns the relay's address (sync.status has no such field); the board's
-  // "Your Mac · address" row waits for a core field
   const kv = el("dl", "kv");
+  // the board's "Your Mac · address" row: the core's `relay_url`; with none, no row
+  if (status?.relay_url) kv.append(el("dt", "", "Your Mac"), el("dd", "mono caption wrap", status.relay_url));
   kv.append(el("dt", "", "Last pull"), el("dd", "", when));
   mac.append(kv);
   const go = el("button", "wide", f ? "Pull again" : "Pull now") as HTMLButtonElement;
@@ -3031,6 +3032,8 @@ window.addEventListener("hashchange", () => {
   void route();
 });
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
+// 12-F row 5c: the shell dropped the master after five minutes away (`key.lock`, in Rust); draw Unlock, never the old screen
+void core.onCoreEvent("locked", () => void route());
 void core.onCoreEvent("restarted", () => {
   if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core stopped; the offer is gone.", error: true });
   banner = "The core restarted after an error; the last request was lost.";
