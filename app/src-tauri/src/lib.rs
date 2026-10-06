@@ -338,16 +338,17 @@ fn debug_sync_on_start_door(core: &Sidecar) {
             }
             Err(e) => format!("debug door: sync.run failed ({})", e.code),
         };
+        let _ = std::fs::write(std::env::temp_dir().join("sync-proof.json"), serde_json::json!({ "note": note }).to_string());
         core.note(note);
     });
 }
 
 /// Evidence door, debug builds on iOS only: with `DISCONECT_DEBUG_KEYCHAIN_PROOF=1`, write `keychain-proof.json` to the
 /// container's `tmp/`: the number of items under each service and, for the key file's key id, the item's class
-/// (`pdmn`) and synchronizable flag. Never the account, never the value.
+/// (`pdmn`) and synchronizable flag, and the start-up hook's notes (counts and plain words). Never the account, never the value.
 #[cfg(debug_assertions)]
 #[cfg(target_os = "ios")]
-fn debug_keychain_proof_door(app: &tauri::AppHandle) {
+fn debug_keychain_proof_door(app: &tauri::AppHandle, startup_notes: &[String]) {
     use disconect_core::keychain_leftovers::{Keychain, RealKeychain, SERVICES};
     if !debug_flag("DISCONECT_DEBUG_KEYCHAIN_PROOF") {
         return;
@@ -364,7 +365,7 @@ fn debug_keychain_proof_door(app: &tauri::AppHandle) {
         .and_then(|dir| disconect_core::keys::read_key_file(&disconect_core::keys::key_path_for(&dir.join(PHONE_DB_FILE))).ok())
         .and_then(|file| disconect_core::keychain::item_class(&file.key_id).ok().flatten())
         .map_or(Value::Null, |(pdmn, synchronizable)| serde_json::json!({ "pdmn": pdmn, "synchronizable": synchronizable }));
-    let proof = serde_json::json!({ "items": items, "key_item": key_item });
+    let proof = serde_json::json!({ "items": items, "key_item": key_item, "startup_notes": startup_notes });
     let _ = std::fs::write(std::env::temp_dir().join("keychain-proof.json"), proof.to_string());
 }
 
@@ -436,6 +437,8 @@ pub fn run() {
             // store opens and before the page asks `key.unlock`. Its notes reach the core's diagnostics below.
             #[cfg(target_os = "ios")]
             let ios_notes = ios::prepare(app.handle());
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            let proof_notes = ios_notes.clone();
             let core = start_core(app.handle());
             #[cfg(target_os = "ios")]
             if let Ok(core) = &core {
@@ -461,7 +464,7 @@ pub fn run() {
             build_main_window(app)?;
             debug_import_door(app.handle());
             #[cfg(all(debug_assertions, target_os = "ios"))]
-            debug_keychain_proof_door(app.handle());
+            debug_keychain_proof_door(app.handle(), &proof_notes);
             Ok(())
         });
     // Bet 17: `support_sites`/`support_open` exist only on macOS (`coach/commands.rs`'s own `#[cfg]`), so the
