@@ -66,6 +66,7 @@ use crate::read::ReadError;
 use crate::read::coverage::{self, NOT_COVERED, PRESENT};
 use crate::read::health;
 use crate::read::insight::{self, FactsQuery};
+use crate::read::mcp_paths;
 use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
 use crate::relay::config as relay_config;
@@ -513,6 +514,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("data.metric", Handler::Reply(data_metric)),
     ("data.today", Handler::Reply(data_today)),
     ("data.live", Handler::Reply(data_live)),
+    ("data.sleep", Handler::Reply(data_sleep)),
     ("data.facts", Handler::Reply(data_facts)),
     ("import.run", Handler::Spawn(import_run)),
     ("import.last", Handler::Reply(import_last)),
@@ -810,6 +812,17 @@ fn data_live(session: &mut Session, call: &Call) -> Result<Value, Failure> {
         None => PyStr::from_text(&queries::local_today(conn)?),
     };
     Ok(queries::live_day(conn, contract, &day)?)
+}
+
+/// `data.sleep`: one night (default the latest stored), every source's record, stages also on the watch's clock.
+fn data_sleep(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    let date = optional_text_param(call, "date")?;
+    let store = session.reader()?;
+    let night = mcp_paths::sleep_detail_local(store.conn(), date.as_ref())?;
+    night
+        .to_serde()
+        .ok_or_else(|| Failure::serve("internal", "sleep result is not JSON"))
 }
 
 /// `_contract_pairs`: every (numeric metric, scope) the contract declares a stream for, in contract order.

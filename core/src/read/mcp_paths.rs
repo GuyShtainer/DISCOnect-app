@@ -21,6 +21,7 @@ use super::queries::{
     self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS, clean, parse_day, parse_moment, scopes_for, text, window,
 };
 use crate::contract::Contract;
+use crate::model::Instant;
 use crate::wirejson::{Json, PyStr};
 use crate::writer::py_round;
 
@@ -275,6 +276,8 @@ const SLEEP_COLUMNS: [&str; 31] = [
     "sleep_id",
 ];
 /// Where `sleep_id` and `retro` sit in [`SLEEP_COLUMNS`].
+const START_UTC: usize = 2;
+const END_UTC: usize = 3;
 const SLEEP_ID: usize = 30;
 const RETRO: usize = 29;
 // The five columns that end in `_s` (`deep_s` .. `unmeasurable_s`) are the stage durations: they become
@@ -294,6 +297,17 @@ fn minutes(cell: ValueRef<'_>) -> Result<f64, ReadError> {
 /// minutes and the stage timeline. A stage or score the source did not state is absent, never 0. The
 /// integers the store holds stay integers. `date`, when given, must be exactly `YYYY-MM-DD`.
 pub fn sleep_detail(conn: &Connection, date: Option<&PyStr>) -> Result<Json, ReadError> {
+    sleep_detail_in(conn, date, false)
+}
+
+/// `sleep_detail(conn, date, local=True)`, the `data.sleep` read: the same answer plus, per session,
+/// `utc_offset_s` (the stored offset nearest the session's end, its start when it has no end) and, per
+/// stage, `start_local`/`end_local` as `HH:MM` on that offset; all of it absent while no offset is stored.
+pub fn sleep_detail_local(conn: &Connection, date: Option<&PyStr>) -> Result<Json, ReadError> {
+    sleep_detail_in(conn, date, true)
+}
+
+fn sleep_detail_in(conn: &Connection, date: Option<&PyStr>, local: bool) -> Result<Json, ReadError> {
     let contract = Contract::get()?;
     let missing = Json::text(&contract.conventions.missing_values);
     if let Some(given) = date {
@@ -323,6 +337,11 @@ pub fn sleep_detail(conn: &Connection, date: Option<&PyStr>) -> Result<Json, Rea
             latest
         }
     };
+    let offsets = if local {
+        Some(queries::load_offsets(conn)?)
+    } else {
+        None
+    };
     let mut sessions = Vec::new();
     let mut statement = conn.prepare(&format!(
         "SELECT {} FROM sleep_sessions WHERE date=? ORDER BY source_scope",
@@ -347,7 +366,27 @@ pub fn sleep_detail(conn: &Connection, date: Option<&PyStr>) -> Result<Json, Rea
         // assigned after `stage_minutes`, but an existing key keeps its place in a dict
         entry.set("retro", Json::Bool(truthy(row.get_ref(RETRO)?)));
         let sleep_id = text(row.get_ref(SLEEP_ID)?)?;
-        let stages = stage_timeline(conn, sleep_id)?;
+        // the session's end (its start when it has none or an empty one), as `end_utc or start_utc`
+        let anchor = [END_UTC, START_UTC]
+            .iter()
+            .filter_map(|&index| match row.get_ref(index) {
+                Ok(ValueRef::Text(bytes)) if !bytes.is_empty() => Some(Ok(bytes)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .next()
+            .transpose()?;
+        let offset = match (&offsets, anchor) {
+            (Some(offsets), Some(bytes)) => {
+                let stamp = std::str::from_utf8(bytes).map_err(|_| ReadError::Unexpected("TypeError"))?;
+                offsets.offset_at(parse_moment(stamp)?)
+            }
+            _ => None,
+        };
+        if let Some(seconds) = offset {
+            entry.set("utc_offset_s", Json::int(seconds));
+        }
+        let stages = stage_timeline(conn, sleep_id, offset)?;
         if !stages.is_empty() {
             entry.set("stages", Json::Array(stages));
         }
@@ -379,7 +418,21 @@ pub fn sleep_detail(conn: &Connection, date: Option<&PyStr>) -> Result<Json, Rea
 }
 
 /// The stage rows of one night, oldest first, each with its length in minutes.
-fn stage_timeline(conn: &Connection, sleep_id: &str) -> Result<Vec<Json>, ReadError> {
+/// `HH:MM` of a UTC instant on a clock `offset` seconds ahead of UTC.
+fn hhmm(moment: Instant, offset: i64) -> Result<String, ReadError> {
+    let moved = chrono::Duration::try_seconds(offset)
+        .and_then(|shift| moment.checked_add_signed(shift))
+        .ok_or(ReadError::Overflow)?;
+    Ok(moved.format("%H:%M").to_string())
+}
+
+/// The stage rows of one night, oldest first, each with its length in minutes and, when `offset` (the
+/// session's, in seconds) is known, its local start and end.
+fn stage_timeline(
+    conn: &Connection,
+    sleep_id: &str,
+    offset: Option<i64>,
+) -> Result<Vec<Json>, ReadError> {
     let mut statement = conn.prepare(
         "SELECT stage, start_utc, end_utc FROM sleep_stages WHERE sleep_id=? ORDER BY start_utc",
     )?;
@@ -395,12 +448,17 @@ fn stage_timeline(conn: &Connection, sleep_id: &str) -> Result<Vec<Json>, ReadEr
         let ended = parse_moment(text(row.get_ref(2)?)?)?;
         let started = parse_moment(text(row.get_ref(1)?)?)?;
         let seconds = (ended - started).num_seconds();
-        stages.push(object([
+        let mut item = object([
             ("stage", stage),
             ("start_utc", start),
             ("end_utc", end),
             ("minutes", Json::Float(py_round(seconds as f64 / 60.0, 1))),
-        ]));
+        ]);
+        if let Some(offset) = offset {
+            item.set("start_local", Json::text(&hhmm(started, offset)?));
+            item.set("end_local", Json::text(&hhmm(ended, offset)?));
+        }
+        stages.push(item);
     }
     Ok(stages)
 }

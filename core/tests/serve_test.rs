@@ -261,6 +261,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "data.metric",
             "data.today",
             "data.live",
+            "data.sleep",
             "data.facts",
             "import.run",
             "import.last",
@@ -354,6 +355,113 @@ fn live_day_of_a_watch_behind_utc_is_the_local_day_not_the_utc_day() {
                 "start_local": "2025-03-05T20:00", "end_local": "2025-03-05T20:05", "minutes": 6}])
     );
     assert_eq!(live_minutes(&evening, "heart_rate"), (6, json!(72.0)));
+}
+
+// ---- data.sleep ----
+
+fn stages_local(session: &Value) -> Vec<(String, String)> {
+    session["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .map(|g| {
+            (
+                g["start_local"].as_str().expect("start_local").to_string(),
+                g["end_local"].as_str().expect("end_local").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn pair(a: &str, b: &str) -> (String, String) {
+    (a.to_string(), b.to_string())
+}
+
+#[test]
+fn sleep_night_latest_and_named_in_the_watchs_own_clock() {
+    let (_dir, db) = live_copy();
+    let mut rig = Rig::new(&db);
+    let latest = rig.send("data.sleep", json!({}))["result"].clone();
+    assert_eq!(latest["date"], "2025-06-30");
+    // the offset nearest the session's end (04:00Z on 06-30) is the +03:30 one stored on 06-20
+    let device = &latest["sessions"][0];
+    assert_eq!(latest["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(device["utc_offset_s"], 12600);
+    assert_eq!(stages_local(device), [pair("00:30", "01:30")]);
+    let named = rig.send("data.sleep", json!({"date": "2025-06-15"}))["result"].clone();
+    let scopes: Vec<&str> = named["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|s| s["source_scope"].as_str().expect("scope"))
+        .collect();
+    assert_eq!(scopes, ["device", "vendor_cloud"]);
+    assert_eq!(named["sessions"][0]["utc_offset_s"], 10800);
+    assert_eq!(
+        stages_local(&named["sessions"][0]),
+        [pair("23:00", "00:00"), pair("00:00", "02:00"), pair("02:00", "06:00")]
+    );
+    // scores only: the offset, no stage keys
+    assert!(named["sessions"][1].get("stages").is_none());
+    assert_eq!(named["sessions"][1]["utc_offset_s"], 10800);
+}
+
+#[test]
+fn sleep_night_with_no_record_or_no_sleep_says_why() {
+    let (_dir, db) = live_copy();
+    let mut rig = Rig::new(&db);
+    let none = rig.send("data.sleep", json!({"date": "2025-06-20"}))["result"].clone();
+    assert_eq!(none["sessions"], json!([]));
+    assert_eq!(none["reason"], "no record of that night from any source");
+    assert_eq!(none["date"], "2025-06-20");
+    assert!(none.get("units").is_some());
+    rusqlite::Connection::open(&db)
+        .expect("open")
+        .execute("DELETE FROM sleep_sessions", [])
+        .expect("delete");
+    let empty = Rig::new(&db).send("data.sleep", json!({}))["result"].clone();
+    assert_eq!(empty["date"], Value::Null);
+    assert_eq!(empty["reason"], "no sleep stored yet");
+}
+
+#[test]
+fn sleep_night_bad_date_is_bad_params() {
+    let (_dir, db) = live_copy();
+    let mut rig = Rig::new(&db);
+    for bad in [json!("20250615"), json!("2025-02-30"), json!(""), json!(5)] {
+        assert_eq!(rig.code("data.sleep", json!({"date": bad})), "bad_params", "{bad}");
+    }
+}
+
+#[test]
+fn sleep_night_without_an_offset_has_no_local_keys_and_a_stage_can_cross_midnight() {
+    let (_dir, db) = live_copy();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "UPDATE sleep_stages SET start_utc='2025-06-14T20:30:00Z', end_utc='2025-06-14T21:30:00Z' \
+         WHERE stage='light' AND sleep_id LIKE '2025-06-15|device%'",
+        [],
+    )
+    .expect("update");
+    let mut rig = Rig::new(&db);
+    let night = rig.send("data.sleep", json!({"date": "2025-06-15"}))["result"].clone();
+    // +03:00: the stage runs over local midnight
+    assert_eq!(stages_local(&night["sessions"][0])[0], pair("23:30", "00:30"));
+    conn.execute("DELETE FROM clock_offsets", []).expect("delete");
+    let bare = rig.send("data.sleep", json!({"date": "2025-06-15"}))["result"].clone();
+    for session in bare["sessions"].as_array().expect("sessions") {
+        assert!(session.get("utc_offset_s").is_none());
+        for stage in session["stages"].as_array().unwrap_or(&Vec::new()) {
+            assert!(stage.get("start_local").is_none() && stage.get("end_local").is_none());
+        }
+    }
+    assert_eq!(bare["sessions"][0]["stages"][0]["start_utc"], "2025-06-14T20:30:00Z");
+}
+
+#[test]
+fn sleep_needs_the_store_unlocked() {
+    let (_dir, db) = encrypted_copy();
+    assert_eq!(Rig::new(&db).code("data.sleep", json!({})), "locked");
 }
 
 // ---- data.facts ----
