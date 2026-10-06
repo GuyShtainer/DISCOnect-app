@@ -133,9 +133,9 @@ fn spawn_join(
 /// The whole honest dance; the joiner's result and its code.
 fn pair_once(o: &Offerer) -> (Joined, String) {
     let (worker, rx) = spawn_join(o.text.clone(), Some(o.handle.clone()));
-    let sas = o.handle.wait_joined(Duration::from_secs(10)).expect("joined");
+    assert!(o.handle.wait_joined(Duration::from_secs(10)), "joined");
     let shown = rx.recv_timeout(Duration::from_secs(10)).expect("the joiner's code");
-    assert_eq!(shown, sas_text(sas), "both screens show the same code");
+    // the offerer never learns its own code through the API; a release on the joiner's code proves both agree
     o.handle.release(&shown, &master(), &key_file_bytes()).expect("release");
     (worker.join().expect("thread").expect("joined"), shown)
 }
@@ -270,19 +270,27 @@ fn two_offers_commit_to_two_nonces_and_two_joiners_draw_two_keys() {
     let (a, _) = PairOffer::new("http://127.0.0.1:1").expect("offer");
     let (b, _) = PairOffer::new("http://127.0.0.1:1").expect("offer");
     assert_ne!(Offer::parse(&a).expect("a").c, Offer::parse(&b).expect("b").c);
-    // the same text twice is two joiners with two keys: a key is never reused across offers by construction
-    let (j1, j2) = (Joiner::new(&a).expect("joiner"), Joiner::new(&a).expect("joiner"));
+    // 12-G attack M1: a second text with the SAME id but another c and s (a re-planted offer) is another
+    // joiner with another key; a key is never reused across offers by construction
+    let parsed_a = Offer::parse(&a).expect("a");
+    let mut planted = parsed_a.clone();
+    planted.c = pair::commit(&[0x77u8; 32]);
+    planted.s = [0x55u8; 16];
+    let (j1, j2) = (Joiner::new(&a).expect("joiner"), Joiner::new(&planted.encode()).expect("joiner"));
+    assert_eq!(j1.offer().id, j2.offer().id);
     assert_ne!(j1.joiner_pub(), j2.joiner_pub());
-    assert_eq!(j1.offer().c, Offer::parse(&a).expect("a").c);
+    assert_eq!(j1.offer().c, parsed_a.c);
+    assert_eq!(j2.offer().c, planted.c);
+    assert_eq!(j1.offer().s, [0u8; 16], "the joiner keeps no copy of s once K exists");
 }
 
 #[test]
 fn a_wrong_typed_code_aborts_and_releases_nothing() {
     let o = Offerer::start();
     let (worker, rx) = spawn_join(o.text.clone(), None);
-    let sas = o.handle.wait_joined(Duration::from_secs(10)).expect("joined");
-    rx.recv_timeout(Duration::from_secs(10)).expect("code");
-    let wrong = sas_text((sas + 1) % 1_000_000);
+    assert!(o.handle.wait_joined(Duration::from_secs(10)), "joined");
+    let shown = rx.recv_timeout(Duration::from_secs(10)).expect("code");
+    let wrong = sas_text((shown.parse::<u32>().expect("digits") + 1) % 1_000_000);
     assert_eq!(o.handle.release(&wrong, &master(), &key_file_bytes()), Err(PairError::CodesDiffer));
     assert_eq!(worker.join().expect("thread").err(), Some(PairError::OfferEnded));
     o.server.stop();
@@ -587,9 +595,9 @@ fn write_atomic_leaves_no_half_file_when_the_write_fails_and_makes_the_parent_07
 fn wait_delivered_turns_true_only_after_the_first_200_of_the_payload() {
     let o = Offerer::start();
     let (worker, rx) = spawn_join(o.text.clone(), None);
-    let sas = o.handle.wait_joined(Duration::from_secs(10)).expect("joined");
-    let _ = rx.recv_timeout(Duration::from_secs(10)).expect("code");
-    o.handle.release(&sas_text(sas), &master(), &key_file_bytes()).expect("release");
+    assert!(o.handle.wait_joined(Duration::from_secs(10)), "joined");
+    let shown = rx.recv_timeout(Duration::from_secs(10)).expect("code");
+    o.handle.release(&shown, &master(), &key_file_bytes()).expect("release");
     // released, but nobody has fetched yet (the joiner polls every 500 ms; a short wait may race it,
     // so assert the order the other way round below)
     let delivered = o.handle.wait_delivered(Duration::from_secs(10));
@@ -769,6 +777,20 @@ fn start_offer_process(tmp: &Path, db: &Path) -> (Kill, BufReader<std::process::
     (Kill(child), stderr, line.trim().to_string())
 }
 
+/// Every stderr line up to and including the first that contains `needle`.
+fn lines_until(reader: &mut BufReader<std::process::ChildStderr>, needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).expect("read") > 0, "stream ended before {needle:?}");
+        let done = line.contains(needle);
+        out.push(line);
+        if done {
+            return out;
+        }
+    }
+}
+
 fn line_with(reader: &mut BufReader<std::process::ChildStderr>, needle: &str) -> String {
     loop {
         let mut line = String::new();
@@ -807,10 +829,10 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
     let join_out = joiner.stdout.take().expect("stdout");
     let joiner_code = code_in(&line_with(&mut join_err, "Code on this device"));
-    // the offerer never prints its own code (ADR 0011 v2)
-    let answered = line_with(&mut offer_err, "A device answered");
-    assert!(!answered.chars().any(|c| c.is_ascii_digit()), "{answered}");
-    line_with(&mut offer_err, "Type the code shown on the other device");
+    // the offerer never prints its own code (ADR 0011 v2): no line before the prompt carries the digits
+    let before_prompt = lines_until(&mut offer_err, "Type the code shown on the other device");
+    assert!(before_prompt.iter().any(|l| l.contains("A device answered")), "{before_prompt:?}");
+    assert!(before_prompt.iter().all(|l| !l.contains(&joiner_code)), "{before_prompt:?}");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "released");
     line_with(&mut offer_err, "Pairing done");
@@ -858,7 +880,9 @@ fn pair_offer_with_the_wrong_digits_aborts_and_the_joiner_ends_without_a_store()
     joiner.stdin.take().expect("stdin").write_all(format!("{offer}\n").as_bytes()).expect("offer");
     let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
     let code = code_in(&line_with(&mut join_err, "Code on this device"));
-    line_with(&mut offer_err, "A device answered");
+    let before_prompt = lines_until(&mut offer_err, "Type the code shown on the other device");
+    assert!(before_prompt.iter().any(|l| l.contains("A device answered")), "{before_prompt:?}");
+    assert!(before_prompt.iter().all(|l| !l.contains(&code)), "the offerer printed its code: {before_prompt:?}");
     let wrong = format!("{:06}", (code.parse::<u32>().expect("digits") + 1) % 1_000_000);
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{wrong}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "the codes differ");

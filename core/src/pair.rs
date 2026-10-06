@@ -732,6 +732,7 @@ mod wire_constants {
         assert!(Offer::parse(&offer_text_of(&obj(GOOD_FIELDS))).is_ok());
         bad(obj(&GOOD_FIELDS.replace("8520f0098930", "8520F0098930")));
         bad(obj(&format!("{GOOD_FIELDS},\"pub\":\"{}\"", ALICE_PUB)));
+        bad(obj(&format!("{GOOD_FIELDS},\"c\":\"{C_HEX}\"")));
         bad(obj(&format!("{GOOD_FIELDS},\"extra\":1")));
         bad(format!("{{\"v\":1,{GOOD_FIELDS}}}"));
         // the commitment: upper case, short, missing

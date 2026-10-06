@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::canon;
 use crate::keys::{self, Secret32};
-use crate::pair::{self, JOIN_BODY_LEN, Keys, OFFERER_REPLY_LEN, Offer, PairError, TRANSCRIPT_LEN, sas, sas_text};
+use crate::pair::{self, JOIN_BODY_LEN, Keys, Offer, PairError, TRANSCRIPT_LEN, sas, sas_text};
 use crate::relay::config::{self as relay_cfg, RelayConfig};
 use crate::relay::lan::{LanRelay, wall_clock};
 use crate::relay::pair_routes::PAIR;
@@ -110,10 +110,12 @@ impl Joiner {
         let mut body = [0u8; JOIN_BODY_LEN];
         body[..32].copy_from_slice(&joiner_pub);
         body[32..].copy_from_slice(&pair::joiner_tag(&keys));
+        let mut offer = offer;
+        offer.s = [0u8; 16]; // the secret did its work in K; the joiner keeps url, id, exp and c only
         Ok(Joiner { offer, joiner_pub, keys, transcript, body })
     }
 
-    /// The offer this joiner was made for.
+    /// The offer this joiner was made for (`s` zeroed: it is spent once `K` exists).
     pub fn offer(&self) -> &Offer {
         &self.offer
     }
@@ -162,7 +164,8 @@ fn join_with(
             .header("Content-Type", "application/octet-stream")
             .send(&body[..])
             .map_err(|_| PairError::Network)
-            .and_then(|r| finish(r, OFFERER_REPLY_LEN as u64 + 1));
+            // read well past 64 so a long forged 202 is BadTag (shows no code), not a network error
+            .and_then(|r| finish(r, 4096));
         match sent {
             Err(PairError::Network) if attempt < POST_ATTEMPTS => {
                 attempt += 1;

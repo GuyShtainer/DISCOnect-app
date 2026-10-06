@@ -175,21 +175,24 @@ impl PairHandle {
         }
     }
 
-    /// Block until a joiner is bound (its six-digit code is returned), or the slot is aborted or
-    /// expired, or `timeout` passes (all `None`; [`PairHandle::state`] says which).
-    pub fn wait_joined(&self, timeout: Duration) -> Option<u32> {
+    /// Block until a joiner is bound (`true`), or the slot is aborted or expired, or `timeout` passes
+    /// (`false`; [`PairHandle::state`] says which). The offerer's own code never leaves the slot: the
+    /// offerer compares typed digits ([`PairHandle::release`]) and displays nothing (ADR 0011 v2).
+    pub fn wait_joined(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut slot = self.shared.lock();
         loop {
             match &slot.state {
-                SlotState::Bound(b) => return Some(b.sas),
-                SlotState::Aborted | SlotState::Expired => return None,
+                SlotState::Bound(_) => return true,
+                SlotState::Aborted | SlotState::Expired => return false,
                 SlotState::Open => {}
             }
             if slot.retire_if_expired(wall_clock()) {
-                return None;
+                return false;
             }
-            let left = deadline.checked_duration_since(Instant::now())?;
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
             let step = left.min(Duration::from_secs(1));
             slot = self
                 .shared

@@ -550,16 +550,14 @@ fn run_pair_offer(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, 
 /// The offer's life: wait for a joiner, show the code, read the digits, release, wait for the fetch.
 /// `Err` is what to tell the user when the offer ended without a delivery.
 fn offer_session(handle: &PairHandle, master: &[u8; 32], key_file_bytes: &[u8]) -> Result<(), String> {
-    let sas = handle.wait_joined(std::time::Duration::from_secs(EXPIRY_S + 5));
-    let Some(sas) = sas else {
+    if !handle.wait_joined(std::time::Duration::from_secs(EXPIRY_S + 5)) {
         return Err(match handle.state() {
             PairState::Aborted => "another device answered — start over".to_string(),
             _ => "the offer expired".to_string(),
         });
-    };
-    // the offerer never shows its own code (ADR 0011 v2): a user who typed a visible offerer code into a
-    // planted offer's victim would release the key with no guess at all
-    let _ = sas;
+    }
+    // the offerer never shows its own code (ADR 0011 v2; the handle does not even return it): a user who
+    // typed a visible offerer code into a planted offer's victim would release the key with no guess at all
     eprintln!("A device answered.");
     eprintln!("Type the code shown on the other device:");
     let mut line = Zeroizing::new(String::new());
