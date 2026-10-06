@@ -176,7 +176,8 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
     assert_eq!(
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
-               "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null})
+               "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
+               "serving": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");

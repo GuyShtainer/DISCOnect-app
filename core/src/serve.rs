@@ -18,6 +18,10 @@
 //! response when it is done (so a read such as `import.last` is answered while it runs); at EOF the loop
 //! waits for the worker, like the oracle.
 //!
+//! Serve mode (pitch 7b-2, Rust only): `relay.addresses`, `relay.serve`, `pair.offer`, `pair.confirm` and
+//! `pair.cancel` run the LAN relay and a pairing offer for the app, through [`crate::relay::serving`] (the
+//! state machine, the watchers, the lifetime rule); the session end stops them before the import wait.
+//!
 //! Boundaries, drawn as hard as the oracle draws them:
 //!
 //! * **One private descriptor.** At start the real stdout is duplicated and fd 1 is pointed at
@@ -65,7 +69,8 @@ use crate::read::insight::{self, FactsQuery};
 use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
 use crate::relay::config as relay_config;
-use crate::relay::folder::{Relay, RelayError};
+use crate::relay::folder::{FolderRelay, Relay, RelayError};
+use crate::relay::serving::{self, Env, Hooks, Refusal, Shared, Site};
 use crate::relay::sync::{self as relay_sync, SyncError};
 use crate::sources::{self, SourceError};
 use crate::store::{self, StoreError};
@@ -288,6 +293,14 @@ impl From<SyncError> for Failure {
         Failure::Sync(error)
     }
 }
+impl From<Refusal> for Failure {
+    fn from(refusal: Refusal) -> Failure {
+        Failure::Serve {
+            code: refusal.code,
+            message: refusal.message,
+        }
+    }
+}
 impl From<ContractError> for Failure {
     fn from(error: ContractError) -> Failure {
         Failure::Contract(error)
@@ -379,6 +392,9 @@ pub struct Session {
     workers: Vec<JoinHandle<()>>,
     /// Test hook: the next import worker waits for this channel to deliver or close first.
     hold: Option<Receiver<()>>,
+    /// The relay this session serves: at most one LAN server, its offer, the watchers (process memory only).
+    relay: Shared,
+    relay_hooks: Hooks,
 }
 
 impl Session {
@@ -390,6 +406,28 @@ impl Session {
             import_slot: Arc::new(AtomicBool::new(false)),
             workers: Vec::new(),
             hold: None,
+            relay: serving::new_state(),
+            relay_hooks: Hooks::default(),
+        }
+    }
+
+    /// Test hook: shorten the relay's linger, the offer's life and the address check, or inject the
+    /// address list (never an environment variable or a flag).
+    #[doc(hidden)]
+    pub fn set_relay_hooks(&mut self, hooks: Hooks) {
+        self.relay_hooks = hooks;
+    }
+
+    /// What the relay's workers and watchers need: the state, the hooks, and a writer of event lines.
+    fn relay_env(&self) -> Env {
+        let channel = Arc::clone(&self.channel);
+        Env {
+            shared: Arc::clone(&self.relay),
+            hooks: self.relay_hooks.clone(),
+            emit: Arc::new(move |line| {
+                // the bridge being gone is not the relay's problem: EOF on stdin ends the process
+                let _ = channel.write_line(&line);
+            }),
         }
     }
 
@@ -480,6 +518,11 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("import.last", Handler::Reply(import_last)),
     ("sync.status", Handler::Reply(sync_status)),
     ("sync.run", Handler::Spawn(sync_run)),
+    ("relay.addresses", Handler::Reply(relay_addresses)),
+    ("relay.serve", Handler::Reply(relay_serve)),
+    ("pair.offer", Handler::Spawn(pair_offer)),
+    ("pair.confirm", Handler::Reply(pair_confirm)),
+    ("pair.cancel", Handler::Reply(pair_cancel)),
     ("tools.call", Handler::Ordered(tools_call)),
 ];
 
@@ -991,7 +1034,12 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     session.require_unlocked()?;
     let store = session.reader()?;
     let report = relay_sync::status_or_fresh(store.conn())?;
-    Ok(relay_sync::status_value(&report))
+    let mut status = relay_sync::status_value(&report);
+    if let Some(object) = status.as_object_mut() {
+        // Rust only: what the relay of this session is doing right now (null when it serves nothing)
+        object.insert("serving".into(), serving::serving_value(&session.relay));
+    }
+    Ok(status)
 }
 
 /// One sync request: everything the worker needs.
@@ -1004,10 +1052,10 @@ struct SyncJob {
     slot: Arc<AtomicBool>,
 }
 
-/// A `progress` event of `op` `sync`: `phase` is `push` or `pull`, `state` `start` or `done`; a
+/// A `progress` event of `op` `sync` (or `pair`, whose only phase is `push`): `phase` is `push` or `pull`, `state` `start` or `done`; a
 /// `done` event carries the phase's counts.
-fn sync_event(phase: &str, state: &str, counts: Option<&Value>) -> String {
-    let mut event = json!({"event": "progress", "op": "sync", "phase": phase, "state": state});
+fn sync_event(op: &str, phase: &str, state: &str, counts: Option<&Value>) -> String {
+    let mut event = json!({"event": "progress", "op": op, "phase": phase, "state": state});
     if let (Some(Value::Object(extra)), Some(object)) = (counts, event.as_object_mut()) {
         for (key, value) in extra {
             object.insert(key.clone(), value.clone());
@@ -1027,11 +1075,11 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         // the bridge being gone is not the sync's problem: EOF on stdin ends the process
         let _ = job.channel.write_line(&line);
     };
-    emit(sync_event("push", "start", None));
+    emit(sync_event("sync", "push", "start", None));
     let pushed = relay_sync::push(conn, job.master.as_slice(), &*job.relay)?;
     let push = json!({"bundles": pushed.bundles.len(), "records": pushed.records, "ranges": pushed.ranges});
-    emit(sync_event("push", "done", Some(&push)));
-    emit(sync_event("pull", "start", None));
+    emit(sync_event("sync", "push", "done", Some(&push)));
+    emit(sync_event("sync", "pull", "start", None));
     let pulled = relay_sync::pull(conn, job.master.as_slice(), &*job.relay)?;
     let pull = json!({
         "applied": pulled.applied.len(),
@@ -1046,7 +1094,7 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         "gaps": pulled.gaps.len(),
         "status": pulled.status,
     });
-    emit(sync_event("pull", "done", Some(&pull)));
+    emit(sync_event("sync", "pull", "done", Some(&pull)));
     Ok(json!({"push": push, "pull": pull}))
 }
 
@@ -1119,6 +1167,227 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
             Err(Failure::Io(error))
         }
     }
+}
+
+// ---- relay and pairing (serve mode) ----
+
+/// The checks `relay.addresses`, `relay.serve`, `pair.offer`, `pair.confirm` and `pair.cancel` share, in this
+/// order on both cores: unlocked (`locked`); a relay configured (`not_found`, the `sync.run` text); a `lan`
+/// relay serves nothing (`bad_params`); an encrypted store (`not_encrypted`); no `<keys>.next` rotation file
+/// (`busy`, the CLI's `resolve_master` refusal, which `key.unlock` does not apply). Parameter shapes come after.
+fn relay_prefix(session: &Session) -> Result<Site, Failure> {
+    session.require_unlocked()?;
+    let config = relay_config::read(&relay_json_path(&session.db_path)).ok_or_else(|| {
+        Failure::serve(
+            "not_found",
+            "no relay is configured (relay.json in the data folder)",
+        )
+    })?;
+    let folder = match config {
+        relay_config::RelayConfig::Folder(folder) => keys::expand_user(Path::new(&folder)),
+        relay_config::RelayConfig::Lan(_) => {
+            return Err(Failure::serve(
+                "bad_params",
+                "this device is a joiner; it serves nothing",
+            ));
+        }
+    };
+    let Some(master) = session.unlocked_master().cloned() else {
+        return Err(Failure::serve(
+            "not_encrypted",
+            format!(
+                "the relay needs an encrypted store: run '{} key init' first",
+                identity::COMMAND
+            ),
+        ));
+    };
+    if keys::next_path_for(&session.key_path()).exists() {
+        return Err(Failure::serve(
+            "busy",
+            "a key rotation is in progress; finish it first",
+        ));
+    }
+    Ok(Site { folder, master })
+}
+
+/// `listen`: absent or null is None; anything else must be a string that [`serving::parse_listen`] accepts.
+fn listen_param(call: &Call) -> Result<Option<std::net::SocketAddr>, Failure> {
+    let text = match call.params.get("listen") {
+        None | Some(Json::Null) => return Ok(None),
+        Some(Json::Str(text)) if !text.is_empty() => text,
+        Some(_) => {
+            return Err(Failure::serve(
+                "bad_params",
+                "listen must be a non-empty string",
+            ));
+        }
+    };
+    let Some(plain) = text.to_text() else {
+        return Err(Failure::serve(
+            "bad_params",
+            "listen must be an IP address and a port, like 192.168.1.20:24816",
+        ));
+    };
+    serving::parse_listen(&plain)
+        .map(Some)
+        .map_err(|message| Failure::serve("bad_params", message))
+}
+
+fn required_listen(call: &Call) -> Result<std::net::SocketAddr, Failure> {
+    listen_param(call)?.ok_or_else(|| Failure::serve("bad_params", "listen must be a non-empty string"))
+}
+
+/// The Mac's assigned addresses and the port to suggest (Rust only: the Python core serves nothing).
+fn relay_addresses(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    relay_prefix(session)?;
+    Ok(serving::addresses_value(&session.relay_env()))
+}
+
+/// The user's switch: serve the relay on `listen` while the app runs (`on` true), or stop (`on` false: the
+/// server stays while an offer still needs it, then follows the offer's lifetime rule).
+fn relay_serve(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    let site = relay_prefix(session)?;
+    let on = bool_param(call, "on")?;
+    let listen = listen_param(call)?;
+    let env = session.relay_env();
+    if on {
+        let listen = listen
+            .ok_or_else(|| Failure::serve("bad_params", "listen must be a non-empty string"))?;
+        let url = serving::serve_on(&env, listen, &site)?;
+        Ok(json!({"serving": true, "url": url}))
+    } else {
+        let url = serving::serve_off(&env);
+        Ok(json!({"serving": url.is_some(), "url": url}))
+    }
+}
+
+/// One `pair.offer` request: everything the worker needs.
+struct PairJob {
+    id: Id,
+    db_path: PathBuf,
+    site: Site,
+    listen: std::net::SocketAddr,
+    env: Env,
+    channel: Arc<Channel>,
+    slot: Arc<AtomicBool>,
+}
+
+/// Push the store to the relay folder (the joiner bootstraps from what was last pushed), releasing the
+/// write lock when it is done. Two `progress` events, `op` `pair`.
+fn pair_push(job: &PairJob) -> Result<(), Failure> {
+    let store = store::open_for_write_with(&job.db_path, "pair", 0.0, Some(&job.site.master))?;
+    let emit = |line: String| {
+        let _ = job.channel.write_line(&line);
+    };
+    emit(sync_event("pair", "push", "start", None));
+    let relay = FolderRelay::new(job.site.folder.clone());
+    let pushed = relay_sync::push(store.conn(), job.site.master.as_slice(), &relay)?;
+    let counts = json!({"bundles": pushed.bundles.len(), "records": pushed.records, "ranges": pushed.ranges});
+    emit(sync_event("pair", "push", "done", Some(&counts)));
+    Ok(())
+}
+
+fn pair_panic() -> Failure {
+    Failure::serve("internal", "unexpected panic in the pair worker")
+}
+
+/// `pair.offer`'s worker: push (holding the import slot for the push only), then start the server if none
+/// runs, attach the offer and answer `{"offer", "url", "expires_at"}`; the offer's watcher takes over.
+fn pair_worker(job: PairJob) {
+    let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pair_push(&job)))
+        .unwrap_or_else(|_| Err(pair_panic()));
+    job.slot.store(false, Ordering::SeqCst);
+    let outcome = match pushed {
+        Err(failure) => {
+            serving::drop_reservation(&job.env);
+            Err(failure)
+        }
+        Ok(()) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                serving::finish_offer(&job.env, job.listen, &job.site).map_err(Failure::from)
+            }))
+            .unwrap_or_else(|_| {
+                serving::drop_reservation(&job.env);
+                Err(pair_panic())
+            })
+        }
+    };
+    let line = match outcome {
+        Ok((offer, url, expires_at)) => {
+            result_line(&job.id, &json!({"offer": offer, "url": url, "expires_at": expires_at}))
+        }
+        Err(failure) => failure_line(&job.id, &failure),
+    };
+    let _ = job.channel.write_line(&line);
+}
+
+/// Open an offer on `listen`. On the request loop: the shared prefix, `listen`, `busy` when an offer is open
+/// (the offer is reserved here, so a second `pair.offer` or a `relay.serve` off cannot slip in during the
+/// push) and `busy` when an import or a sync holds the slot.
+fn pair_offer(session: &mut Session, call: &Call) -> Result<(), Failure> {
+    let site = relay_prefix(session)?;
+    let listen = required_listen(call)?;
+    let env = session.relay_env();
+    serving::reserve_offer(&env, listen)?;
+    if session
+        .import_slot
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        serving::drop_reservation(&env);
+        return Err(Failure::serve(
+            "busy",
+            "an import or a sync is already running",
+        ));
+    }
+    let job = PairJob {
+        id: call.id.clone(),
+        db_path: session.db_path.clone(),
+        site,
+        listen,
+        env,
+        channel: Arc::clone(&session.channel),
+        slot: Arc::clone(&session.import_slot),
+    };
+    let (slot, env) = (Arc::clone(&session.import_slot), session.relay_env());
+    match std::thread::Builder::new()
+        .name("pair".into())
+        .spawn(move || pair_worker(job))
+    {
+        Ok(handle) => {
+            session.workers.push(handle);
+            Ok(())
+        }
+        Err(error) => {
+            slot.store(false, Ordering::SeqCst);
+            serving::drop_reservation(&env);
+            Err(Failure::Io(error))
+        }
+    }
+}
+
+/// The digits the user typed from the other device: exactly six ASCII digits, or `bad_params` (a malformed
+/// entry does not abort the offer; the webview gets its one real try).
+fn pair_confirm(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    let site = relay_prefix(session)?;
+    let digits = match call.params.get("digits") {
+        Some(Json::Str(text)) => text.to_text().filter(|plain| {
+            plain.len() == 6 && plain.bytes().all(|b| b.is_ascii_digit())
+        }),
+        _ => None,
+    }
+    .ok_or_else(|| Failure::serve("bad_params", "digits must be exactly six digits"))?;
+    let key_file_bytes = std::fs::read(session.key_path())
+        .map_err(|_| Failure::serve("internal", "cannot read the key file"))?;
+    serving::confirm(&session.relay_env(), &digits, &site.master, &key_file_bytes)?;
+    Ok(json!({"state": "released"}))
+}
+
+/// End the open offer (idempotent); `not_found` when there is none.
+fn pair_cancel(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    relay_prefix(session)?;
+    serving::cancel(&session.relay_env())?;
+    Ok(json!({"state": "aborted"}))
 }
 
 // ---- tools ----
@@ -1255,6 +1524,9 @@ fn is_blank(line: &str) -> bool {
 /// Lines end at `\n` only; bytes that are not UTF-8 become U+FFFD. Returns the process exit code.
 pub fn serve_lines(session: &mut Session, input: impl Read) -> i32 {
     read_requests(session, input);
+    // the relay ends first: an open offer is aborted and the server stopped, so no listener outlives the
+    // session while a worker is awaited (a worker that has not bound yet sees `ended` and does not)
+    serving::end_session(&session.relay_env());
     session.wait_for_imports();
     0
 }

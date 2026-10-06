@@ -110,6 +110,16 @@ fn mask(node: Json) -> Json {
             }
         }
     }
+    // 7b-2: the Rust core's `sync.status` gained `serving` (null when the relay serves nothing, always so in this
+    // script); the committed oracle predates it. The Python slice regenerates the oracles with `serving: null`;
+    // delete this allowance with that regeneration.
+    for (key, value) in &mut pairs {
+        if key.equals("result")
+            && let Json::Object(inner) = value
+        {
+            inner.retain(|(name, field)| !(name.equals("serving") && matches!(field, Json::Null)));
+        }
+    }
     Json::Object(pairs)
 }
 

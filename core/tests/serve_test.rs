@@ -266,6 +266,11 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "import.last",
             "sync.status",
             "sync.run",
+            "relay.addresses",
+            "relay.serve",
+            "pair.offer",
+            "pair.confirm",
+            "pair.cancel",
             "tools.call"
         ]
     );

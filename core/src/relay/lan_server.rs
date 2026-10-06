@@ -42,7 +42,7 @@
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -124,7 +124,8 @@ pub struct Ctx {
     limits: Limits,
     lingers: Arc<AtomicUsize>,
     /// The pairing offer, if this server carries one (`pair offer`); `None`: every pair route is 404.
-    offer: Option<Arc<PairShared>>,
+    /// Attachable while the server runs (the app's serve mode: one server, offers come and go).
+    offer: Mutex<Option<Arc<PairShared>>>,
 }
 
 impl Ctx {
@@ -139,14 +140,22 @@ impl Ctx {
             key: token_key(master),
             limits,
             lingers: Arc::new(AtomicUsize::new(0)),
-            offer: None,
+            offer: Mutex::new(None),
         }
     }
 
     /// This context also serves `handle`'s offer on the pairing routes.
-    pub fn with_offer(mut self, offer: Arc<PairShared>) -> Ctx {
-        self.offer = Some(offer);
+    pub fn with_offer(self, offer: Arc<PairShared>) -> Ctx {
+        self.set_offer(Some(offer));
         self
+    }
+
+    fn set_offer(&self, offer: Option<Arc<PairShared>>) {
+        *self.offer.lock().unwrap_or_else(|e| e.into_inner()) = offer;
+    }
+
+    fn current_offer(&self) -> Option<Arc<PairShared>> {
+        self.offer.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -194,7 +203,8 @@ pub fn handle(
         return Reply::status(404);
     }
     if url == PAIR || url.starts_with(&format!("{PAIR}/")) {
-        return pair_routes::handle(ctx.offer.as_deref(), method, url, declared_len, body, now);
+        let offer = ctx.current_offer();
+        return pair_routes::handle(offer.as_deref(), method, url, declared_len, body, now);
     }
     if url == HEALTH {
         if method != "GET" {
@@ -294,6 +304,7 @@ fn bind(listen: &str) -> Result<TcpListener, String> {
 /// A running server: an accept loop and one thread per connection, until [`LanServer::stop`] (or drop).
 pub struct LanServer {
     addr: SocketAddr,
+    ctx: Arc<Ctx>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     acceptor: Option<JoinHandle<()>>,
@@ -352,17 +363,28 @@ impl LanServer {
         let ctx = Arc::new(ctx);
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
-        let (loop_stop, loop_active) = (Arc::clone(&stop), Arc::clone(&active));
+        let (loop_stop, loop_active, loop_ctx) = (Arc::clone(&stop), Arc::clone(&active), Arc::clone(&ctx));
         let acceptor = std::thread::Builder::new()
             .name("lan-relay-accept".into())
-            .spawn(move || accept_loop(&listener, &ctx, &loop_stop, &loop_active, &log))
+            .spawn(move || accept_loop(&listener, &loop_ctx, &loop_stop, &loop_active, &log))
             .map_err(|_| "cannot start the accept thread".to_string())?;
         Ok(LanServer {
             addr,
+            ctx,
             stop,
             active,
             acceptor: Some(acceptor),
         })
+    }
+
+    /// Serve `offer` on the pairing routes from now on (replacing any offer attached before).
+    pub fn attach_offer(&self, offer: Arc<PairShared>) {
+        self.ctx.set_offer(Some(offer));
+    }
+
+    /// Stop serving the pairing routes (they answer `404` again).
+    pub fn detach_offer(&self) {
+        self.ctx.set_offer(None);
     }
 
     /// The address actually bound (the port when 0 was asked for).

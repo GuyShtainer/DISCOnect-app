@@ -39,6 +39,7 @@ getrandom = "0.4"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 ureq = { version = "3", default-features = false }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+if-addrs = "0.15.0"
 
 # The OS keychain behind `key.cache` (MIT/Apache-2.0; talks to the Security framework in-process,
 # so the master key never appears in a child process's argv). Other platforms: no keychain.
