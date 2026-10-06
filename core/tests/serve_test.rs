@@ -273,7 +273,9 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "pair.offer",
             "pair.confirm",
             "pair.cancel",
-            "tools.call"
+            "tools.call",
+            // 12-F: the phone's own method; every core that is not a phone refuses it (`serve_forget_test`)
+            "pair.forget"
         ]
     );
     assert!(DEFERRED_METHODS.is_empty(), "slice 3D ported the last deferred methods");
