@@ -271,10 +271,16 @@ pub fn live_stop(state: State<'_, LiveState>) -> Result<Value, CoreError> {
     Ok(json!({ "running": false }))
 }
 
-/// Whether a link runs and whether this build can start one.
+/// Whether the lab is replaced by a stub (`DISCONECT_LIVE_LAB`, debug builds only): the screen then says so,
+/// so an evidence run's invented readings are never taken for the watch's.
+pub fn stub_lab() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("DISCONECT_LIVE_LAB").is_some()
+}
+
+/// Whether a link runs, whether this build can start one, and whether a stub stands in for the lab.
 #[tauri::command]
 pub fn live_state(state: State<'_, LiveState>) -> Result<Value, CoreError> {
-    Ok(json!({ "running": state.running(), "available": lab_program().is_some(), "seq": state.seq.load(Ordering::SeqCst) }))
+    Ok(json!({ "running": state.running(), "available": lab_program().is_some(), "stub": stub_lab(), "seq": state.seq.load(Ordering::SeqCst) }))
 }
 
 #[cfg(test)]

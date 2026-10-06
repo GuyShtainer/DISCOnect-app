@@ -20,8 +20,13 @@ type LedgerRow = {
   metric: string; source_scope: string; sparse: boolean; present: number; failed: number; source_empty: number;
   not_covered: number; gaps: { from?: string; to?: string; status?: string; days?: number }[]; gaps_truncated: boolean;
 };
-type Health = { coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[] }; never_imported: boolean };
+type LiveBlock = { records: number; samples: number; first_day: string | null; last_day: string | null };
+type Health = { live?: LiveBlock; coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[] }; never_imported: boolean };
 
+const LIVE_FOLDED: { metric: string; unit: string | null }[] = [
+  { metric: "heart_rate", unit: "bpm" }, { metric: "stress", unit: null }, { metric: "respiration_rate", unit: "breaths/min" },
+  { metric: "spo2", unit: "%" }, { metric: "energy_reserve", unit: null },
+];
 const SCOPES = ["device", "vendor_cloud", "local"];
 const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "steps", "sleep_score", "stress_avg", "hrv_last_night_average", "sleep_duration"];
 const SCREENS: { id: string; title: string }[] = [
@@ -95,6 +100,15 @@ function coachFlag(): HTMLElement {
 // at boot flips this off when `support_sites` is absent, so the row is absent there, never present-and-broken.
 let supportShown = true;
 
+/** The Watch entry's indicator while the link runs: a diamond and the word "live". */
+function liveFlag(): HTMLElement {
+  const flag = el("span", "flag");
+  const mark = el("span", "livemark");
+  mark.append(el("span", "swatch live"), document.createTextNode(liveStub ? "stub" : "live"));
+  flag.append(mark);
+  return flag;
+}
+
 function renderNav(): void {
   nav.replaceChildren();
   nav.append(el("div", "brand", PRODUCT));
@@ -104,6 +118,7 @@ function renderNav(): void {
     a.href = `#/${s.id}`;
     if (current() === s.id) a.setAttribute("aria-current", "page");
     if (s.id === "coach") a.append(coachFlag());
+    if (s.id === "watch" && liveRunning) a.append(liveFlag());
     nav.append(a);
   }
   nav.append(el("div", "spacer"));
@@ -194,9 +209,42 @@ function header(out: ParentNode, title: string, sub: string): void {
 }
 
 // ---- Today -----------------------------------------------------------------------------
+/** The live-link card: the day's means of the folded minute samples, apart from every other scope. Nothing when no link was ever stored. */
+async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
+  const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
+  const live = health?.live;
+  if (!live || !live.records || !live.last_day) return;
+  const lastDay = live.last_day;
+  const results = await Promise.all(LIVE_FOLDED.map((m) => core.call<Metric>("data.metric", { metric: m.metric, scope: "live", days: 1, last_day: lastDay }).catch(() => null)));
+  const card = el("section", "card");
+  card.setAttribute("aria-label", "Live link");
+  const row = el("div", "row");
+  row.append(el("h2", "heading", "Live link"));
+  const tag = el("span", "caption scope-live");
+  tag.append(el("span", "swatch live"), document.createTextNode(scopeWord("live")));
+  row.append(tag);
+  card.append(row);
+  card.append(el("span", "caption muted", `${live.records} session records · ${live.samples} minute samples · ${lastDay === todayDay ? "today" : `latest ${lastDay}`}`));
+  const grid = el("div", "grid3 body live-grid");
+  results.forEach((m, i) => {
+    const d = m?.days.find((x) => x.day === lastDay) ?? m?.days[m.days.length - 1];
+    if (!m || !d || d.value === null) return;
+    const spec = LIVE_FOLDED[i];
+    grid.append(el("span", "", metricLabel(spec.metric)));
+    const v = el("span", "value-small scope-live", fmt(d.value, null));
+    if (spec.unit) v.append(el("span", "unit", ` ${spec.unit}`));
+    grid.append(v);
+    grid.append(el("span", "muted caption", "daily mean of the link's minutes"));
+  });
+  card.append(grid);
+  card.append(el("span", "caption muted", "Means of the minutes the watch sent while the link ran. Kept apart from the device's own figures and never combined with them. Data health lists every session."));
+  out.append(card);
+}
+
 async function screenToday(out: ParentNode): Promise<void> {
   const [today, facts] = await Promise.all([core.call<Today>("data.today"), core.call<Facts>("data.facts", { days: 7, baseline_days: 28 })]);
   header(out, "Today", today.day);
+  await liveCard(out, today.day);
   const cards = el("div", "cards");
   for (const row of today.metrics) {
     const card = el("div", "card");
@@ -242,8 +290,13 @@ let liveStop: string | null = null;
 let liveRunning = false;
 let liveSeq = 0; // the current link's number: a stored event of another link is ignored
 let liveStored: string | null = null; // what the sweep of the readings folder said after the last link ended
-const liveNodes: { values: Map<string, HTMLElement>; since: Map<string, HTMLElement>; status: HTMLElement | null; button: HTMLButtonElement | null } = {
-  values: new Map(), since: new Map(), status: null, button: null,
+let liveReadings = 0; // reading lines since this link started
+let liveClock: number | null = null; // ms epoch of the first "connected" status or first reading of this link
+let liveStopAt: number | null = null; // when this link was first drawn as stopped: the clock freezes there
+let liveNavShown = false;
+let liveStub = false; // a stub stands in for the lab (evidence runs): every reading is invented
+const liveNodes: { values: Map<string, HTMLElement>; since: Map<string, HTMLElement>; status: HTMLElement | null; steps: HTMLElement[]; button: HTMLButtonElement | null } = {
+  values: new Map(), since: new Map(), status: null, steps: [], button: null,
 };
 
 function liveStatusWord(): string {
@@ -259,8 +312,39 @@ function ago(t: number): string {
   return s < 60 ? `${s} s ago` : `${Math.round(s / 60)} min ago`;
 }
 
+const LIVE_UNITS: Record<string, string> = { heart_rate: "bpm", steps: "steps", respiration_rate: "breaths/min", spo2: "%" };
+
+/** Which of the four steps is done / current, from the existing state. */
+function liveStep(): { done: number; now: number } {
+  if (liveStatus === "stopped") return { done: 3, now: 4 };
+  if (liveReadings > 0) return { done: 2, now: 3 };
+  if (liveStatus === "connected") return { done: 1, now: 2 };
+  if (liveStatus === "starting" || liveStatus === "scanning" || liveStatus === "connecting") return { done: 0, now: 1 };
+  return { done: 0, now: 0 };
+}
+
+function liveStepText(n: number): string {
+  if (n === 1) return "connecting";
+  if (n === 2) return "connected";
+  if (n === 3) {
+    if (liveStatus === "stopped") liveStopAt ??= Date.now(); else liveStopAt = null;
+    const secs = liveClock === null ? 0 : Math.max(0, Math.floor(((liveStopAt ?? Date.now()) - liveClock) / 1000));
+    if (liveReadings === 0 && liveStatus !== "stopped") return "reading";
+    return `reading · ${liveReadings} readings · for ${Math.floor(secs / 60)} min ${secs % 60} s`;
+  }
+  return liveStatus === "stopped" ? liveStatusWord() : "stopped";
+}
+
 function drawLive(): void {
-  if (liveNodes.status) liveNodes.status.textContent = liveStatusWord();
+  const step = liveStep();
+  liveNodes.steps.forEach((li, i) => {
+    li.classList.toggle("done", i < step.done);
+    li.classList.toggle("now", i + 1 === step.now);
+    if (i + 1 === step.now) li.setAttribute("aria-current", "step"); else li.removeAttribute("aria-current");
+    const label = li.lastElementChild;
+    if (label) label.textContent = liveStepText(i + 1);
+  });
+  if (liveNavShown !== liveRunning) { liveNavShown = liveRunning; renderNav(); }
   if (liveNodes.button) {
     liveNodes.button.textContent = liveRunning ? "Disconnect" : "Connect to watch";
     liveNodes.button.disabled = liveStatus === "starting" || liveStatus === "scanning" || liveStatus === "connecting";
@@ -269,6 +353,8 @@ function drawLive(): void {
     const latest = liveLatest.get(metric);
     node.textContent = latest ? String(latest.value) : "—";
     node.classList.toggle("muted", !latest);
+    const unit = LIVE_UNITS[metric];
+    if (latest && unit) node.append(el("span", "unit", ` ${unit}`));
     const since = liveNodes.since.get(metric);
     if (since) since.textContent = latest ? ago(latest.t) : "no reading yet";
   }
@@ -279,9 +365,12 @@ function onLive(line: core.LiveLine): void {
     liveStatus = line.status;
     liveStop = typeof line.stop === "string" ? line.stop : null;
     liveRunning = line.status !== "stopped"; // any other status line comes from a running link
+    if (line.status === "connected" && liveClock === null) liveClock = Date.now();
   }
   if (typeof line.metric === "string" && typeof line.value === "number" && typeof line.t === "number") {
     liveLatest.set(line.metric, { value: line.value, t: line.t });
+    liveReadings += 1;
+    if (liveClock === null) liveClock = Date.now();
   }
   drawLive();
 }
@@ -295,6 +384,8 @@ async function toggleLive(): Promise<void> {
       liveStop = null;
     } else {
       liveLatest.clear();
+      liveReadings = 0;
+      liveClock = null;
       liveStop = null;
       liveStored = null;
       liveStatus = "starting";
@@ -316,8 +407,9 @@ async function toggleLive(): Promise<void> {
 async function screenWatch(out: ParentNode, later: Later): Promise<void> {
   const state = await core.liveState().catch((): core.LiveStatus => ({ running: false, available: false }));
   liveRunning = state.running;
+  liveStub = state.stub === true;
   liveSeq = state.seq ?? liveSeq;
-  header(out, "Watch", "live readings over Bluetooth, read-only");
+  header(out, "Watch", liveStub ? "STUB LAB: every reading below is invented, not your watch's" : "live readings over Bluetooth, read-only · development builds only");
   const card = el("div", "card");
   const row = el("div", "actions");
   const button = el("button", "", "Connect to watch");
@@ -331,16 +423,31 @@ async function screenWatch(out: ParentNode, later: Later): Promise<void> {
   cable.title = "Not wired yet";
   row.append(button, cable);
   card.append(row);
-  const status = el("p", "caption");
-  card.append(status);
-  card.append(el("p", "caption muted", "Turn the phone's Bluetooth off first: the watch talks to one device at a time, and it stays silent while the phone holds the link. The first connection shows a code on the watch; confirm it. Cable sync will copy the watch's files over USB for days without Bluetooth; it is not wired yet."));
+  const steps = el("ol", "steps");
+  liveNodes.steps = [1, 2, 3, 4].map((n) => {
+    const li = el("li");
+    li.append(el("span", "n", String(n)), el("span", "", liveStepText(n)));
+    steps.append(li);
+    return li;
+  });
+  card.append(steps);
   out.append(card);
+  if (liveStub) {
+    const stub = el("section", "banner error");
+    stub.append(el("span", "lead", "Stub lab"), el("span", "", "This run replaces the Bluetooth lab with a script. The numbers on this screen are made up for a screenshot; nothing is read from any watch."));
+    out.append(stub);
+  }
+  const caution = el("section", "banner");
+  caution.append(el("span", "lead", "Before you connect"), el("span", "", "Turn the phone's Bluetooth off first: the watch talks to one device at a time, and it stays silent while the phone holds the link. The first connection shows a code on the watch; confirm it. Cable sync will copy the watch's files over USB for days without Bluetooth; it is not wired yet."));
+  out.append(caution);
   const cards = el("div", "cards");
   liveNodes.values.clear();
   liveNodes.since.clear();
   for (const metric of LIVE_ORDER) {
-    const tile = el("div", "card");
-    tile.append(el("span", "caption muted", metricLabel(metric)));
+    const tile = el("div", "card vcard");
+    const top = el("span", "caption top");
+    top.append(el("span", "muted", metricLabel(metric)), el("span", "scope-live", scopeWord("live")));
+    tile.append(top);
     const value = el("span", "value", "—");
     const since = el("span", "caption muted", "no reading yet");
     tile.append(value, since);
@@ -350,7 +457,7 @@ async function screenWatch(out: ParentNode, later: Later): Promise<void> {
   }
   out.append(cards);
   out.append(el("p", "caption muted", "Every reading is collected in the lab's raw folder on this Mac, and stored when the link ends. The watch is only read; nothing is written to it."));
-  liveNodes.status = status;
+  liveNodes.status = steps;
   liveNodes.button = button;
   later(drawLive);
 }

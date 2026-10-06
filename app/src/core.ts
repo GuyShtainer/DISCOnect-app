@@ -159,7 +159,7 @@ export function supportOpen(id: SupportSiteId): Promise<void> {
 
 /** One line from the live link: a status change or a reading (unix seconds, the product's metric id, an int). */
 export type LiveLine = { status?: string; stop?: string; t?: number; metric?: string; value?: number };
-export type LiveStatus = { running: boolean; available: boolean; seq?: number };
+export type LiveStatus = { running: boolean; available: boolean; stub?: boolean; seq?: number };
 
 export function liveStart(): Promise<LiveStatus> {
   return invoke<LiveStatus>("live_start");
