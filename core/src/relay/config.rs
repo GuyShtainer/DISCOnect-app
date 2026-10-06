@@ -68,6 +68,12 @@ pub fn open(config: &RelayConfig, master: &[u8]) -> Result<Box<dyn Relay + Send>
     }
 }
 
+/// The normalised base address (`http://host[:port]`, no trailing slash) of a LAN relay `url`, or `None` when
+/// [`check_lan_url`] would refuse it. What `sync.status.relay_url` shows.
+pub fn lan_base_url(url: &str) -> Option<String> {
+    parse_base_url(url).ok()
+}
+
 /// `Ok` when `url` is acceptable as a LAN relay address (the check `open` applies).
 pub fn check_lan_url(url: &str) -> Result<(), String> {
     parse_base_url(url).map(|_| ())

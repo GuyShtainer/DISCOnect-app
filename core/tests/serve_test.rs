@@ -235,6 +235,23 @@ fn locked_until_unlocked_then_unlocked() {
 }
 
 #[test]
+fn key_lock_drops_the_master_and_is_idempotent() {
+    let (_dir, db) = encrypted_copy();
+    let mut rig = Rig::new(&db);
+    let locked = json!({"state": "locked"});
+    assert_eq!(rig.send("key.lock", json!({}))["result"], locked, "already locked");
+    rig.send("key.unlock", json!({"passphrase": PASSPHRASE}));
+    assert_eq!(rig.send("key.status", json!({}))["result"]["unlocked"], true);
+    assert_eq!(rig.send("key.lock", json!({"x": 1}))["result"], locked, "params are ignored");
+    assert_eq!(rig.send("key.status", json!({}))["result"]["unlocked"], false);
+    assert_eq!(rig.code("sync.status", json!({})), "locked");
+    assert_eq!(rig.code("key.cache", json!({"enable": true})), "locked");
+    assert_eq!(rig.send("key.lock", json!({}))["result"], locked, "twice");
+    assert_eq!(rig.send("key.unlock", json!({"passphrase": PASSPHRASE}))["result"], json!({"unlocked": true}));
+    assert_eq!(rig.send("key.status", json!({}))["result"]["unlocked"], true, "unlock works again");
+}
+
+#[test]
 fn the_lone_surrogate_passphrase_is_bad_params_like_the_encoder_error() {
     let (_dir, db) = encrypted_copy();
     let mut rig = Rig::new(&db);
@@ -257,6 +274,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "key.status",
             "key.unlock",
             "key.cache",
+            "key.lock",
             "data.health",
             "data.metric",
             "data.today",

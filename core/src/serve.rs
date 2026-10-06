@@ -512,6 +512,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("key.status", Handler::Reply(key_status)),
     ("key.unlock", Handler::Reply(key_unlock)),
     ("key.cache", Handler::Reply(key_cache)),
+    ("key.lock", Handler::Reply(key_lock)),
     ("data.health", Handler::Reply(data_health)),
     ("data.metric", Handler::Reply(data_metric)),
     ("data.today", Handler::Reply(data_today)),
@@ -698,6 +699,13 @@ fn key_unlock(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     };
     session.unlocked = Some(master);
     Ok(json!({"unlocked": true}))
+}
+
+/// Drop this session's master key: the session reads as locked until `key.unlock` runs again. Idempotent (already
+/// locked, or nothing to lock, answers the same). The keychain item, if any, is left alone.
+fn key_lock(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.unlocked = None;
+    Ok(json!({"state": "locked"}))
 }
 
 /// Store or remove the master key in the OS keychain. Needs the store unlocked.
@@ -1072,6 +1080,14 @@ fn relay_json_path(db_path: &Path) -> PathBuf {
     home::relay_config_beside(db_path)
 }
 
+/// `relay_url` of `sync.status`: the normalised base address of the LAN relay `relay.json` names, else null.
+fn relay_url_value(path: &Path) -> Value {
+    match relay_config::read(path) {
+        Some(relay_config::RelayConfig::Lan(url)) => relay_config::lan_base_url(&url).map_or(Value::Null, Value::String),
+        _ => Value::Null,
+    }
+}
+
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay
 /// tables answers what a fresh one would.
 fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
@@ -1082,6 +1098,9 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     if let Some(object) = status.as_object_mut() {
         // Rust only: what the relay of this session is doing right now (null when it serves nothing)
         object.insert("serving".into(), serving::serving_value(&session.relay));
+        // The address this device pulls from, `http://host:port` from `relay.json`; null with no LAN relay named
+        // (a folder relay has no address). Never a path, a credential or a folder name.
+        object.insert("relay_url".into(), relay_url_value(&relay_json_path(&session.db_path)));
     }
     Ok(status)
 }
