@@ -31,22 +31,43 @@ impl Kind {
     }
 }
 
-/// Exactly one path; a `.zip` file is an export, a directory is a copied watch folder, anything else (two paths,
-/// none, a missing path, another kind of file) is refused.
+/// The fixed text for a path that is gone by the time the core looks (the core's own message names the path).
+pub const GONE: &str = "The item is gone; drop it again.";
+
+/// Exactly one path, judged by what it is: a directory that looks like an unzipped account export is an export, any
+/// other directory is a copied watch folder, a `.zip` file is an export only when it holds an export's folder, and
+/// anything else (two paths, none, a missing path, another kind of file, a zip that is not an export) is refused.
 pub fn classify(paths: &[PathBuf]) -> Result<(Kind, &Path), &'static str> {
     let [path] = paths else { return Err(REFUSAL) };
     if path.is_dir() {
-        return Ok((Kind::Usb, path));
+        let kind = if disconect_core::sources::looks_like_export(path) { Kind::Export } else { Kind::Usb };
+        return Ok((kind, path));
     }
     let zip = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"));
-    if zip && path.is_file() {
+    if zip && path.is_file() && disconect_core::sources::looks_like_export(path) {
         return Ok((Kind::Export, path));
     }
     Err(REFUSAL)
 }
 
+/// What a drop becomes: a refusal with its fixed text, or an import of this kind and path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Decision {
+    Refuse(&'static str),
+    Run(Kind, PathBuf),
+}
+
+pub fn decide(paths: &[PathBuf]) -> Decision {
+    match classify(paths) {
+        Ok((kind, path)) => Decision::Run(kind, path.to_path_buf()),
+        Err(text) => Decision::Refuse(text),
+    }
+}
+
 fn failed(error: &CoreError) -> Value {
-    json!({ "state": "failed", "code": error.code, "message": error.message })
+    // the core's `not_found` message carries the path; the page gets a fixed text instead
+    let message = if error.code == "not_found" { GONE } else { error.message.as_str() };
+    json!({ "state": "failed", "code": error.code, "message": message })
 }
 
 /// Call `import.run` through the door and tell `emit` ("core://import", payload) what happens. The counts of the
@@ -72,9 +93,9 @@ pub async fn run_import(door: &dyn CoreDoor, emit: &(dyn Fn(&str, Value) + Sync)
 /// The drop entry point (a real drop and the debug door both end here). Classifies, refuses with `bad_drop`, or
 /// runs the import on the async runtime so the window never waits for it.
 pub fn handle_drop<R: Runtime>(app: &tauri::AppHandle<R>, paths: Vec<PathBuf>) {
-    let (kind, path) = match classify(&paths) {
-        Ok((kind, path)) => (kind, path.to_path_buf()),
-        Err(text) => {
+    let (kind, path) = match decide(&paths) {
+        Decision::Run(kind, path) => (kind, path),
+        Decision::Refuse(text) => {
             let _ = app.emit("core://import", json!({ "state": "failed", "code": "bad_drop", "message": text }));
             return;
         }
@@ -105,29 +126,86 @@ mod tests {
         dir
     }
 
+    /// A one-entry stored zip named like an export's folder (`looks_like_export` reads only the entry names).
+    fn tiny_zip(path: &Path, entry: &str) {
+        let name = entry.as_bytes();
+        let n = name.len() as u16;
+        let mut z = Vec::new();
+        z.extend(0x0403_4b50u32.to_le_bytes());
+        z.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // version, flags, method, time, date
+        z.extend([0u8; 12]); // crc, sizes
+        z.extend(n.to_le_bytes());
+        z.extend([0, 0]);
+        z.extend(name);
+        let cd_at = z.len() as u32;
+        z.extend(0x0201_4b50u32.to_le_bytes());
+        z.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend([0u8; 12]);
+        z.extend(n.to_le_bytes());
+        z.extend([0u8; 12]); // extra, comment, disk, internal attrs, external attrs (4 bytes: 2+2+2+2+4 = 12)
+        z.extend([0u8; 4]); // local header offset
+        z.extend(name);
+        let cd_len = z.len() as u32 - cd_at;
+        z.extend(0x0605_4b50u32.to_le_bytes());
+        z.extend([0, 0, 0, 0, 1, 0, 1, 0]);
+        z.extend(cd_len.to_le_bytes());
+        z.extend(cd_at.to_le_bytes());
+        z.extend([0, 0]);
+        std::fs::write(path, z).expect("write zip");
+    }
+
     #[test]
-    fn a_zip_file_is_an_export_and_a_directory_is_a_watch_folder() {
+    fn an_export_zip_and_an_unzipped_export_are_exports_and_another_directory_is_a_watch_folder() {
         let dir = scratch("kinds");
         let zip = dir.join("export.ZIP");
-        std::fs::write(&zip, b"x").expect("write");
+        tiny_zip(&zip, &format!("{}/a.json", disconect_core::sources::EXPORT_ROOT));
         assert_eq!(classify(std::slice::from_ref(&zip)).map(|(k, _)| k), Ok(Kind::Export));
         assert_eq!(classify(&[dir.clone()]).map(|(k, _)| k), Ok(Kind::Usb));
+        let unzipped = dir.join("unzipped");
+        std::fs::create_dir_all(unzipped.join(disconect_core::sources::EXPORT_ROOT)).expect("mkdir");
+        assert_eq!(classify(&[unzipped]).map(|(k, _)| k), Ok(Kind::Export));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn two_paths_none_a_missing_path_and_another_file_are_refused_with_the_fixed_text() {
+    fn two_paths_none_a_missing_path_another_file_and_a_zip_that_is_not_an_export_are_refused_with_the_fixed_text() {
         let dir = scratch("refused");
         let other = dir.join("notes.txt");
         let zip = dir.join("a.zip");
         std::fs::write(&other, b"x").expect("write");
-        std::fs::write(&zip, b"x").expect("write");
+        std::fs::write(&zip, b"not a zip at all").expect("write");
         assert_eq!(classify(&[zip.clone(), dir.clone()]).err(), Some(REFUSAL));
         assert_eq!(classify(&[]).err(), Some(REFUSAL));
         assert_eq!(classify(&[dir.join("gone.zip")]).err(), Some(REFUSAL), "a zip name that is not there");
         assert_eq!(classify(&[other]).err(), Some(REFUSAL));
+        assert_eq!(classify(&[zip]).err(), Some(REFUSAL), "a .zip of random bytes");
+        let other_zip = dir.join("other.zip");
+        tiny_zip(&other_zip, "somewhere/else.json");
+        assert_eq!(classify(&[other_zip]).err(), Some(REFUSAL), "a real zip that is not an export");
         assert_eq!(REFUSAL, "Drop one export zip or one copied watch folder");
+        assert_eq!(decide(&[]), Decision::Refuse(REFUSAL));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_dropped_paths_emit_exactly_one_bad_drop_failure_and_no_started() {
+        use tauri::Listener;
+        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).expect("mock app");
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.handle().listen("core://import", move |event| {
+            let _ = tx.send(serde_json::from_str::<Value>(event.payload()).expect("json payload"));
+        });
+        handle_drop(app.handle(), vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        let first = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("one event");
+        assert_eq!(first, json!({ "state": "failed", "code": "bad_drop", "message": REFUSAL }));
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "no second event, no started");
+    }
+
+    #[test]
+    fn a_not_found_core_error_reaches_the_page_without_its_path() {
+        let door = Fake(Err(CoreError::new("not_found", "no such file or folder: /Users/someone/secret")), Mutex::new(Vec::new()));
+        let events = drive(&door, Kind::Usb);
+        assert_eq!(events[1], json!({ "state": "failed", "code": "not_found", "message": GONE }));
     }
 
     struct Fake(Result<Value, CoreError>, Mutex<Vec<(String, Value)>>);

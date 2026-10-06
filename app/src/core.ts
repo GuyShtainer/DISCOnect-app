@@ -23,15 +23,11 @@ export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | 
   return listen(`core://${name}`, (e) => cb(e.payload));
 }
 
-/** Whether something is being dragged over the window. The OS event carries the dragged paths; this wrapper
- *  drops them on the floor: the page only ever learns "hovering" or "not", and sends nothing (the drop itself is
- *  handled in Rust, `import_drop.rs`). */
-export function onDragHover(cb: (over: boolean) => void): Promise<UnlistenFn[]> {
-  return Promise.all([
-    listen("tauri://drag-enter", () => cb(true)),
-    listen("tauri://drag-leave", () => cb(false)),
-    listen("tauri://drag-drop", () => cb(false)),
-  ]);
+/** Whether something is being dragged over the window. Rust watches the OS drag (the window's own drag events carry
+ *  the dragged paths, so this page never listens to them) and tells the page only `{ over }`; the drop itself is
+ *  handled in Rust, `import_drop.rs`. */
+export function onDragHover(cb: (over: boolean) => void): Promise<UnlistenFn> {
+  return listen<{ over?: boolean }>("core://drag", (e) => cb(e.payload?.over === true));
 }
 
 /** Debug builds only: types the six digits read from DISCONECT_DEBUG_DIGITS_FILE (evidence runs). */

@@ -509,3 +509,90 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
         }
     }
 }
+
+// ---- the page's door to the core, and what the page hears about a drag (7b-3 review) -----------------
+
+/// The method literals a TypeScript source passes to `call(...)` / `call<T>(...)` or names as `method: "..."`.
+fn called_methods(ts: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let bytes = ts.as_bytes();
+    let literal_at = |from: usize| -> Option<String> {
+        let rest = ts[from..].trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    };
+    for (at, _) in ts.match_indices("call") {
+        let mut i = at + 4;
+        if bytes.get(i) == Some(&b'<') {
+            let mut depth = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        if bytes.get(i) == Some(&b'(') {
+            if let Some(m) = literal_at(i + 1) {
+                found.insert(m);
+            }
+        }
+    }
+    for (at, _) in ts.match_indices("method:") {
+        if let Some(m) = literal_at(at + 7) {
+            found.insert(m);
+        }
+    }
+    found
+}
+
+fn allowed_methods_in_lib() -> BTreeSet<String> {
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let body = lib.split("pub const ALLOWED_METHODS: &[&str] = &[").nth(1).expect("the allow-list is in lib.rs").split("];").next().expect("closed list");
+    body.split('"').skip(1).step_by(2).map(str::to_string).collect()
+}
+
+#[test]
+fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_import_run() {
+    let allowed = allowed_methods_in_lib();
+    assert!(allowed.len() >= 10, "the list was parsed: {allowed:?}");
+    let mut used = BTreeSet::new();
+    for path in files_under(&app_dir().join("src"), "ts") {
+        used.extend(called_methods(&text(&path)));
+    }
+    assert!(used.contains("data.today") && used.contains("key.unlock"), "the scanner sees the calls: {used:?}");
+    assert!(used.is_subset(&allowed), "a method the page calls is missing from ALLOWED_METHODS: {:?}", used.difference(&allowed).collect::<Vec<_>>());
+    assert!(!allowed.contains("import.run"), "an import starts only from the OS drop, never from the page");
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let core_call = lib.split("async fn core_call(").nth(1).expect("core_call").split("\n}\n").next().expect("body");
+    assert!(core_call.contains("method_refusal(&method)?"), "core_call checks the list before it reaches the core");
+    // the refusal is fixed and never echoes the method
+    let err = disconect_app_lib::method_refusal("import.run").expect_err("off the list");
+    assert_eq!((err.code.as_str(), err.message.as_str()), ("refused", "that method is not available to the page"));
+    assert!(disconect_app_lib::method_refusal("data.today").is_ok());
+}
+
+#[test]
+fn the_page_hears_a_drag_only_as_a_bare_over_flag_and_a_release_build_drops_debug_flags() {
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let emits: Vec<&str> = lib.lines().filter(|l| l.contains("\"core://drag\"")).collect();
+    assert_eq!(emits.len(), 1, "one place emits core://drag: {emits:?}");
+    assert!(emits[0].contains("json!({ \"over\": over })") && !emits[0].contains("paths"), "{}", emits[0]);
+    // nothing in the page listens to the window's own drag events (they deliver the dragged paths to the page)
+    for path in files_under(&app_dir().join("src"), "ts") {
+        assert!(!text(&path).contains("tauri://drag"), "{} listens to a tauri drag event", path.display());
+    }
+    // a release build ignores `--debug-*` typed on the command line
+    let args = lib.split("fn launch_args()").nth(1).expect("launch_args").split("\n}\n").next().expect("body");
+    let at = args.find("args.retain(|a| !a.starts_with(\"--debug-\"))").expect("the filter");
+    assert!(args[..at].trim_end().ends_with("if !cfg!(debug_assertions) {"), "the filter is release-only");
+}

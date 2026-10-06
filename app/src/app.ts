@@ -183,6 +183,10 @@ async function route(): Promise<void> {
   if (mine !== generation) return;
   renderNav();
   const [id, sub] = current().split("/");
+  if (id !== "import") {
+    importUi.error = null; // an import failure is shown on Import; leaving the screen ends it
+    importUi.notice = null;
+  }
   // the coach settings need no data from the store (the probe works on a locked one), so they stay reachable
   // the watch screen reads the link, not the store
   if (locked() && id !== "key" && id !== "coach-settings" && id !== "watch" && id !== "support") {
@@ -1112,13 +1116,20 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
 type ImportUi = {
   running: boolean; kind: "export" | "usb" | null; done: number; total: number | null; note: string; seen: boolean;
   error: { code: string; message: string } | null;
+  /** A second drop answered `busy` while this app's own import runs: said once under the cards, then gone. */
+  notice: string | null;
+  /** Drops that sent `started` while an import of this app already ran: each will be answered `busy`. */
+  extra: number;
 };
-const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null };
+const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null, notice: null, extra: 0 };
 let dropOverDebug = false;
 let importBusyTimer: ReturnType<typeof setTimeout> | null = null;
-const IMPORT_HOW: Record<string, string> = { connect_export: "Account export", usb: "Watch folder or cable", ble: "Live link", drop: "Dropped files" };
+const IMPORT_BUSY = "An import or a sync is already running. Drop it again when that ends.";
+const IMPORT_SECOND = "Another import is already running; drop it again when that ends.";
+const IMPORT_GONE = "The item is gone; drop it again.";
+const IMPORT_KEPT = "What you drop stays where it is, unencrypted. Delete it when you no longer need it.";
 
-/** Redraw only while the Import screen is on (a progress tick repaints the bar in place, see importPaint). */
+/** Redraw only while the Import screen is on. */
 function importRedraw(): void {
   if (current().split("/")[0] === "import") void route();
 }
@@ -1129,23 +1140,26 @@ function importLink(): HTMLElement {
   return a;
 }
 
-/** The running card's bar and line, repainted in place from the module state. */
+/** The running card's bar and line, repainted in place from the module state (a tick never redraws the screen). */
 function importPaint(): void {
   const text = document.getElementById("import-progress-text");
+  const bar = document.getElementById("import-progress-bar");
   const fill = document.getElementById("import-progress-fill");
   if (text) text.textContent = importProgressLine();
+  if (bar) bar.hidden = importUi.total === null;
   if (fill) fill.style.width = importUi.total ? `${Math.min(100, Math.round((importUi.done / importUi.total) * 100))}%` : "0%";
 }
 
 function importProgressLine(): string {
   if (!importUi.seen) return "Starting";
   // only an export's JSON phase reports no total (a folder counts its files from the first event)
-  if (importUi.total === null) return importUi.note ? `Reading the export's records: ${importUi.note}` : "Reading the export's records";
+  if (importUi.total === null) return `Reading the export's records · ${importUi.done} read`;
   return `${importUi.done} of ${importUi.total} files`;
 }
 
 function importIdleLater(): void {
-  // a `busy` answer means something else runs (another import, a sync); if no progress arrives for a while, ask again
+  // a `busy` answer with nothing of ours running means something else holds the slot (a sync, a pair push); if no
+  // progress arrives for a while, stop waiting
   if (importBusyTimer) clearTimeout(importBusyTimer);
   importBusyTimer = setTimeout(() => {
     importBusyTimer = null;
@@ -1158,31 +1172,46 @@ function importIdleLater(): void {
 
 function onImportEvent(payload: unknown): void {
   const p = payload as { state?: string; kind?: string; code?: string; message?: string };
+  const ours = importUi.running && importUi.kind !== null; // an import of this app is running now
   if (p.state === "started") {
-    importUi.running = true;
-    importUi.kind = p.kind === "usb" ? "usb" : "export";
-    importUi.done = 0;
-    importUi.total = null;
-    importUi.note = "";
-    importUi.seen = false;
-    importUi.error = null;
+    if (ours) {
+      importUi.extra += 1; // a second drop: the core will answer `busy`; the live state stays as it is
+    } else {
+      importUi.running = true;
+      importUi.kind = p.kind === "usb" ? "usb" : "export";
+      importUi.done = 0;
+      importUi.total = null;
+      importUi.note = "";
+      importUi.seen = false;
+      importUi.error = null;
+      importUi.notice = null;
+    }
   } else if (p.state === "done") {
     importUi.running = false;
     importUi.kind = null;
     importUi.error = null;
+    importUi.extra = 0;
   } else if (p.state === "failed") {
-    if (p.code === "busy") {
-      importUi.running = true;
+    if (p.code === "bad_drop" || p.code === "core_unavailable") {
+      importUi.error = { code: p.code, message: p.message ?? "" }; // never touches a run in progress
+    } else if (p.code === "busy" && importUi.extra > 0) {
+      importUi.extra -= 1;
+      importUi.notice = IMPORT_SECOND;
+    } else if (p.code === "busy") {
+      importUi.running = true; // nothing of ours runs: a sync or a pair push holds the slot
       importUi.kind = null;
       importUi.error = null;
       importIdleLater();
     } else {
       importUi.running = false;
       importUi.kind = null;
-      importUi.error = { code: p.code ?? "error", message: p.message ?? "The import failed." };
+      importUi.extra = 0;
+      importUi.error = { code: p.code ?? "error", message: p.message ?? "" };
     }
   } else return;
-  importRedraw();
+  // a drop on any screen shows its outcome on Import (the route draws the running or failed state there)
+  if (current().split("/")[0] !== "import") location.hash = "#/import";
+  else importRedraw();
 }
 
 function onImportProgress(p: { done?: number; total?: number | null; note?: string }): void {
@@ -1192,9 +1221,7 @@ function onImportProgress(p: { done?: number; total?: number | null; note?: stri
   importUi.total = typeof p.total === "number" ? p.total : null;
   importUi.note = p.note ?? "";
   if (importUi.kind === null) importIdleLater();
-  const wasBar = !!document.getElementById("import-progress-fill");
-  if (wasBar === (importUi.total !== null)) importPaint();
-  else importRedraw(); // the export phase (no total) became the counted phase: the bar appears
+  importPaint();
 }
 
 function onDragHover(over: boolean): void {
@@ -1211,12 +1238,14 @@ function dropCard(kind: "export" | "usb", title: string, hint: string): HTMLElem
   if (dropOverDebug && !importUi.running) card.classList.add("over");
   if (running) {
     const bar = el("div", "progress");
+    bar.id = "import-progress-bar";
+    bar.hidden = importUi.total === null;
     bar.setAttribute("role", "progressbar");
     const fill = el("span");
     fill.id = "import-progress-fill";
     bar.append(fill);
     card.append(el("p", "body", "Importing"));
-    if (importUi.total !== null) card.append(bar);
+    card.append(bar);
     const line = el("span", "caption", importProgressLine());
     line.id = "import-progress-text";
     card.append(line);
@@ -1227,11 +1256,22 @@ function dropCard(kind: "export" | "usb", title: string, hint: string): HTMLElem
   return card;
 }
 
+/** Plain words for a failed import: never a code name, never the core's own message. */
+function importErrorText(e: { code: string; message: string }): string {
+  if (e.code === "bad_drop") return e.message;
+  if (e.code === "not_found") return IMPORT_GONE;
+  if (e.code === "busy") return IMPORT_BUSY;
+  if (e.code === "locked") return "Unlock the store first.";
+  if (e.code === "core_unavailable") return "The core is not running.";
+  return "The import failed. The command line says more: disconect import <path>.";
+}
+
 function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
-  if (importUi.error) return bannerEl(importUi.error.code === "bad_drop" ? "Not imported" : importUi.error.code, importUi.error.message, true);
+  if (importUi.error) return bannerEl("Not imported", importErrorText(importUi.error), true);
   if (importUi.running && importUi.kind !== null) {
     return bannerEl("Importing", `${importUi.kind === "usb" ? "The copied watch folder" : "The account export"} is being read · the counts arrive when it ends`);
   }
+  if (importUi.running) return bannerEl("Busy", IMPORT_BUSY); // nothing of ours runs, yet the slot is held
   if (!run) return bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder below. Every screen fills from the first import.");
   if (run.status === "running") {
     // the newest run never ended and nothing runs now: the app or the core stopped under it
@@ -1244,6 +1284,8 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
   const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
   const text = failedRun
     ? `${when} · the import failed${run.error ? ` · ${run.error}` : ""}`
+    : run.files_seen === 0
+    ? `${when} · nothing to import was found in it`
     : `${when} · ${run.files_imported} of ${run.files_seen} file${run.files_seen === 1 ? "" : "s"} imported · ${run.files_duplicate} already held · ${run.files_failed} failed`;
   const b = bannerEl(lead, text, failedRun);
   if (failedRun || withFailures) {
@@ -1265,7 +1307,6 @@ async function screenImport(out: ParentNode): Promise<void> {
   if (keyStatus && !keyStatus.encrypted) {
     out.append(bannerEl("Not encrypted", "This store is not encrypted yet. Run disconect key init from the command line before pairing a phone."));
   }
-  if (importUi.running && importUi.kind === null) out.append(bannerEl("Busy", "An import or a sync is already running. This screen waits for it."));
   out.append(importOutcomeBanner(runs[0]));
   const drops = el("div", "drops");
   drops.append(dropCard("export", "Account export", "Drop your account export zip here"));
@@ -1275,7 +1316,10 @@ async function screenImport(out: ParentNode): Promise<void> {
   cable.setAttribute("aria-disabled", "true");
   cable.append(el("h2", "heading", "Cable sync"));
   cable.append(el("p", "body", "Needs the watch over USB with the vendor's sync fully quit — command line only for now"));
-  out.append(drops, cable);
+  out.append(drops);
+  if (importUi.notice) out.append(el("span", "caption", importUi.notice));
+  importUi.notice = null; // said once
+  out.append(el("span", "caption muted", IMPORT_KEPT), cable);
   const recent = el("section", "card");
   recent.setAttribute("aria-label", "Recent imports");
   recent.append(el("h2", "heading", "Recent imports"));
@@ -1285,7 +1329,7 @@ async function screenImport(out: ParentNode): Promise<void> {
     const grid = el("div", "runs body");
     for (const [i, run] of runs.entries()) {
       grid.append(el("span", "", run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time"));
-      grid.append(el("span", "", IMPORT_HOW[run.transport] ?? run.transport));
+      grid.append(el("span", "", TRANSPORT_WORD[run.transport] ?? run.transport));
       grid.append(el("span", "value-small", `${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`));
       const failedRun = run.status === "failed";
       const withFailures = !failedRun && run.files_failed > 0;

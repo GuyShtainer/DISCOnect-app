@@ -38,9 +38,28 @@ fn core_of(state: &State<'_, Core>) -> Result<Sidecar, CoreError> {
     state.0.clone()
 }
 
-/// Generic relay. `key.unlock` is refused here; see [`core_unlock`].
+/// Every core method the page may call through [`core_call`] (the ones `src/*.ts` names; a guard in
+/// `tests/egress_guards.rs` keeps the two in step). `import.run` is deliberately absent: an import starts only from
+/// the OS drop handled in Rust (`import_drop.rs`), so a script in the webview cannot name a path. `key.unlock` is the
+/// keychain path only (the sidecar refuses it with a passphrase; see [`core_unlock`]).
+pub const ALLOWED_METHODS: &[&str] = &[
+    "app.info", "data.today", "data.live", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
+    "sync.status", "sync.run", "relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel",
+];
+
+/// `Ok` when the page may call `method`; otherwise a fixed refusal that never echoes the method.
+pub fn method_refusal(method: &str) -> Result<(), CoreError> {
+    if ALLOWED_METHODS.contains(&method) {
+        Ok(())
+    } else {
+        Err(CoreError::new("refused", "that method is not available to the page"))
+    }
+}
+
+/// Generic relay, for the methods in [`ALLOWED_METHODS`] only.
 #[tauri::command]
 async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String, params: Option<Value>) -> Result<Value, CoreError> {
+    method_refusal(&method)?;
     let core = core_of(&state)?;
     let answer = core.call(&method, params.unwrap_or(Value::Object(Default::default()))).await;
     if method == "key.unlock" && answer.as_ref().is_ok_and(|v| v.get("unlocked").and_then(Value::as_bool) == Some(true)) {
@@ -80,6 +99,10 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn launch_args() -> Vec<String> {
     #[allow(unused_mut)]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // a release build ignores the debug flags even when they are typed on the command line
+    if !cfg!(debug_assertions) {
+        args.retain(|a| !a.starts_with("--debug-"));
+    }
     // Evidence runs, debug builds only: `DISCONECT_DEBUG_DROP_OVER=1` reaches the page as `--debug-drop-over`
     // (the Import screen draws its drop cards in the hovered state).
     #[cfg(debug_assertions)]
@@ -230,6 +253,11 @@ fn debug_import_door(app: &tauri::AppHandle) {
     }
 }
 
+/// Tell the page whether something is hovering. The payload is only the flag, never a path.
+fn drag_over(app: &tauri::AppHandle, over: bool) {
+    let _ = app.emit("core://drag", serde_json::json!({ "over": over }));
+}
+
 /// The main window is declared in `tauri.conf.json` with `"create": false` and built here, after the core
 /// is in state, so it can carry the egress hooks (ADR 0010): top-level navigation is limited to the app's
 /// own origin ([`coach::egress_guard::navigation_allowed`]) and `window.open` / `target=_blank` is denied.
@@ -241,15 +269,24 @@ fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         .first()
         .cloned()
         .ok_or("tauri.conf.json declares no window")?;
-    // Pitch 7b-3: the OS drop is handled here, in Rust; the webview never sees or names a path.
+    // Pitch 7b-3: the OS drop is handled here, in Rust. The webview never listens to the `tauri://drag-*` events
+    // (they carry the dragged paths into the page); it hears only `core://drag` with a bare `over` flag.
     let handle = app.handle().clone();
     let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
         .on_navigation(coach::egress_guard::navigation_allowed)
         .on_new_window(|_url, _features| NewWindowResponse::Deny)
         .build()?;
     window.on_window_event(move |event| {
-        if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-            import_drop::handle_drop(&handle, paths.clone());
+        if let tauri::WindowEvent::DragDrop(drag) = event {
+            match drag {
+                tauri::DragDropEvent::Enter { .. } => drag_over(&handle, true),
+                tauri::DragDropEvent::Leave => drag_over(&handle, false),
+                tauri::DragDropEvent::Drop { paths, .. } => {
+                    drag_over(&handle, false);
+                    import_drop::handle_drop(&handle, paths.clone());
+                }
+                _ => {} // Over: nothing to tell the page
+            }
         }
     });
     Ok(())
