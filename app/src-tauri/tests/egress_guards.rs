@@ -473,3 +473,39 @@ fn the_frontend_has_no_network_or_navigation_primitive() {
         }
     }
 }
+
+// ---- the Import drop (pitch 7b-3) -------------------------------------------------------------------
+
+#[test]
+fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_builds() {
+    let src = manifest().join("src");
+    // the drop is handled in Rust: no command anywhere takes a path, and the import module registers none
+    let drop_rs = text(&src.join("import_drop.rs"));
+    assert!(!non_test_code(&drop_rs).contains("#[tauri::command]"), "import_drop.rs registers no command");
+    let lib = text(&src.join("lib.rs"));
+    assert!(lib.contains("tauri::DragDropEvent::Drop { paths, .. }"), "the OS drop reaches Rust");
+    for path in files_under(&src, "rs") {
+        let code = text(&path);
+        for line in code.lines().filter(|l| l.contains("fn ") && l.contains("path: String")) {
+            panic!("{} has a function taking a path as a string, a webview-shaped door: {line}", path.display());
+        }
+    }
+    // both debug env names appear only in lib.rs, each inside an item that starts at a `#[cfg(debug_assertions)]`
+    // line (the item is the text from that attribute to the next top-level closing brace)
+    for name in ["DISCONECT_DEBUG_IMPORT_PATH", "DISCONECT_DEBUG_DROP_OVER"] {
+        for path in files_under(&src, "rs") {
+            let code = text(&path);
+            let code = non_test_code(&code);
+            for (at, _) in code.match_indices(name) {
+                let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+                if code[line_start..at].trim_start().starts_with("//") {
+                    continue; // a doc comment naming the variable
+                }
+                assert!(path.ends_with("lib.rs"), "{name} appears outside lib.rs: {}", path.display());
+                let attr = code[..at].rfind("#[cfg(debug_assertions)]");
+                let head = attr.map_or("\n}\n", |i| &code[i..at]);
+                assert!(!head.contains("\n}\n"), "{name} sits outside a `#[cfg(debug_assertions)]` item");
+            }
+        }
+    }
+}

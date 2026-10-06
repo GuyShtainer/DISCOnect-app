@@ -49,6 +49,7 @@ const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
   { id: "watch", title: "Watch" },
   { id: "sync", title: "Sync" },
+  { id: "import", title: "Import" },
   { id: "trend", title: "Trends" },
   { id: "health", title: "Data health" },
   { id: "coach", title: "Coach" },
@@ -199,6 +200,7 @@ async function route(): Promise<void> {
     if (id === "today") await screenToday(out);
     else if (id === "watch") await screenWatch(out, later);
     else if (id === "sync") await screenSync(out, later, sub === "pair");
+    else if (id === "import") await screenImport(out);
     else if (id === "trend") await screenTrend(out, later);
     else if (id === "health") await screenHealth(out);
     else if (id === "coach") screenCoach(out, later);
@@ -210,7 +212,14 @@ async function route(): Promise<void> {
       location.hash = "#/key";
       return;
     }
-    out.append(core.isCoreError(e) ? bannerEl(e.code, e.message, true) : bannerEl("Error", String(e), true));
+    if (core.isCoreError(e) && e.code === "not_found" && e.message.includes("database yet")) {
+      // no store on disk yet: the first drop on Import creates it
+      const banner = bannerEl("Nothing imported yet", "There is no data on this Mac yet. Drop an export zip or a copied watch folder on Import.");
+      banner.append(importLink());
+      out.append(banner);
+    } else {
+      out.append(core.isCoreError(e) ? bannerEl(e.code, e.message, true) : bannerEl("Error", String(e), true));
+    }
   }
   if (mine !== generation) return;
   out.append(el("footer", "notice", NOTICE));
@@ -276,7 +285,9 @@ async function screenToday(out: ParentNode): Promise<void> {
   header(out, "Today", today.day);
   if (health?.never_imported) {
     // design pass 2026-10-06, states: a banner, not the empty value list (review N15)
-    out.append(bannerEl("Nothing imported yet", "Import with the command line for now: disconect import <export zip | watch folder>. Every screen fills from the first import."));
+    const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen. Every screen fills from the first import.");
+    nothing.append(importLink());
+    out.append(nothing);
     return;
   }
   await liveCard(out, today.day, health);
@@ -637,8 +648,10 @@ function onRelayEvent(payload: unknown): void {
   syncRedraw();
 }
 function onSyncProgress(payload: unknown): void {
-  const p = payload as { op?: string; phase?: string; state?: string; bundles?: number; records?: number; applied?: number; rejected?: number };
-  if (p.op === "sync") {
+  const p = payload as { op?: string; phase?: string; state?: string; bundles?: number; records?: number; applied?: number; rejected?: number; done?: number; total?: number | null; note?: string };
+  if (p.op === "import") {
+    onImportProgress(p);
+  } else if (p.op === "sync") {
     const key = p.phase === "pull" ? "pull" : "push";
     syncRun[key] = p.state === "done" ? "done" : "now";
     if (p.state === "done") {
@@ -655,6 +668,8 @@ function armSyncListeners(): void {
   void core.onCoreEvent("progress", onSyncProgress);
   void core.onCoreEvent("pair", onPairEvent);
   void core.onCoreEvent("relay", onRelayEvent);
+  void core.onCoreEvent("import", onImportEvent);
+  void core.onDragHover(onDragHover);
 }
 
 /** The offer is over (any ending): the QR, the text and the typed digits go with it. No redraw here. */
@@ -1090,6 +1105,204 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   later(() => drawTrend(chart, series, trendLabel(trendMetric)));
 }
 
+// ---- Import (Bet 7b-3) ------------------------------------------------------------------
+// The drop is handled in Rust (import_drop.rs): the window's OS drop event becomes the core's import call there and
+// `core://import` events (started / done / failed) come back here. This screen never starts an import and never
+// holds a path; it reads import.last and draws the events and the core's `progress` events (op "import").
+type ImportUi = {
+  running: boolean; kind: "export" | "usb" | null; done: number; total: number | null; note: string; seen: boolean;
+  error: { code: string; message: string } | null;
+};
+const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null };
+let dropOverDebug = false;
+let importBusyTimer: ReturnType<typeof setTimeout> | null = null;
+const IMPORT_HOW: Record<string, string> = { connect_export: "Account export", usb: "Watch folder or cable", ble: "Live link", drop: "Dropped files" };
+
+/** Redraw only while the Import screen is on (a progress tick repaints the bar in place, see importPaint). */
+function importRedraw(): void {
+  if (current().split("/")[0] === "import") void route();
+}
+
+function importLink(): HTMLElement {
+  const a = el("a", "caption", "Open Import");
+  a.setAttribute("href", "#/import");
+  return a;
+}
+
+/** The running card's bar and line, repainted in place from the module state. */
+function importPaint(): void {
+  const text = document.getElementById("import-progress-text");
+  const fill = document.getElementById("import-progress-fill");
+  if (text) text.textContent = importProgressLine();
+  if (fill) fill.style.width = importUi.total ? `${Math.min(100, Math.round((importUi.done / importUi.total) * 100))}%` : "0%";
+}
+
+function importProgressLine(): string {
+  if (!importUi.seen) return "Starting";
+  // only an export's JSON phase reports no total (a folder counts its files from the first event)
+  if (importUi.total === null) return importUi.note ? `Reading the export's records: ${importUi.note}` : "Reading the export's records";
+  return `${importUi.done} of ${importUi.total} files`;
+}
+
+function importIdleLater(): void {
+  // a `busy` answer means something else runs (another import, a sync); if no progress arrives for a while, ask again
+  if (importBusyTimer) clearTimeout(importBusyTimer);
+  importBusyTimer = setTimeout(() => {
+    importBusyTimer = null;
+    if (importUi.running && importUi.kind === null) {
+      importUi.running = false;
+      importRedraw();
+    }
+  }, 5000);
+}
+
+function onImportEvent(payload: unknown): void {
+  const p = payload as { state?: string; kind?: string; code?: string; message?: string };
+  if (p.state === "started") {
+    importUi.running = true;
+    importUi.kind = p.kind === "usb" ? "usb" : "export";
+    importUi.done = 0;
+    importUi.total = null;
+    importUi.note = "";
+    importUi.seen = false;
+    importUi.error = null;
+  } else if (p.state === "done") {
+    importUi.running = false;
+    importUi.kind = null;
+    importUi.error = null;
+  } else if (p.state === "failed") {
+    if (p.code === "busy") {
+      importUi.running = true;
+      importUi.kind = null;
+      importUi.error = null;
+      importIdleLater();
+    } else {
+      importUi.running = false;
+      importUi.kind = null;
+      importUi.error = { code: p.code ?? "error", message: p.message ?? "The import failed." };
+    }
+  } else return;
+  importRedraw();
+}
+
+function onImportProgress(p: { done?: number; total?: number | null; note?: string }): void {
+  if (!importUi.running) return;
+  importUi.seen = true;
+  importUi.done = p.done ?? 0;
+  importUi.total = typeof p.total === "number" ? p.total : null;
+  importUi.note = p.note ?? "";
+  if (importUi.kind === null) importIdleLater();
+  const wasBar = !!document.getElementById("import-progress-fill");
+  if (wasBar === (importUi.total !== null)) importPaint();
+  else importRedraw(); // the export phase (no total) became the counted phase: the bar appears
+}
+
+function onDragHover(over: boolean): void {
+  for (const card of document.querySelectorAll(".drop")) card.classList.toggle("over", over && !importUi.running);
+}
+
+function dropCard(kind: "export" | "usb", title: string, hint: string): HTMLElement {
+  const card = el("section", "drop");
+  card.setAttribute("aria-label", title);
+  card.append(el("h2", "heading", title));
+  const running = importUi.running && importUi.kind === kind;
+  const muted = importUi.running && !running;
+  if (muted) card.classList.add("muted");
+  if (dropOverDebug && !importUi.running) card.classList.add("over");
+  if (running) {
+    const bar = el("div", "progress");
+    bar.setAttribute("role", "progressbar");
+    const fill = el("span");
+    fill.id = "import-progress-fill";
+    bar.append(fill);
+    card.append(el("p", "body", "Importing"));
+    if (importUi.total !== null) card.append(bar);
+    const line = el("span", "caption", importProgressLine());
+    line.id = "import-progress-text";
+    card.append(line);
+    fill.style.width = importUi.total ? `${Math.min(100, Math.round((importUi.done / importUi.total) * 100))}%` : "0%";
+  } else {
+    card.append(el("p", "body", hint));
+  }
+  return card;
+}
+
+function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
+  if (importUi.error) return bannerEl(importUi.error.code === "bad_drop" ? "Not imported" : importUi.error.code, importUi.error.message, true);
+  if (importUi.running && importUi.kind !== null) {
+    return bannerEl("Importing", `${importUi.kind === "usb" ? "The copied watch folder" : "The account export"} is being read · the counts arrive when it ends`);
+  }
+  if (!run) return bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder below. Every screen fills from the first import.");
+  if (run.status === "running") {
+    // the newest run never ended and nothing runs now: the app or the core stopped under it
+    const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
+    return bannerEl("Interrupted", `${when} · this import stopped before it ended · drop it again, files already held are skipped`, true);
+  }
+  const failedRun = run.status === "failed";
+  const withFailures = !failedRun && run.files_failed > 0;
+  const lead = failedRun ? "Failed" : withFailures ? "Done with failures" : "Done";
+  const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
+  const text = failedRun
+    ? `${when} · the import failed${run.error ? ` · ${run.error}` : ""}`
+    : `${when} · ${run.files_imported} of ${run.files_seen} file${run.files_seen === 1 ? "" : "s"} imported · ${run.files_duplicate} already held · ${run.files_failed} failed`;
+  const b = bannerEl(lead, text, failedRun);
+  if (failedRun || withFailures) {
+    const link = el("a", "caption", "See what failed on Data health");
+    link.setAttribute("href", "#/health");
+    b.append(link);
+  }
+  return b;
+}
+
+async function screenImport(out: ParentNode): Promise<void> {
+  // a store that does not exist yet is exactly where the first drop goes: the core creates it on that run
+  const last = await core.call<{ runs: ImportRun[] }>("import.last").catch((e: unknown) => {
+    if (core.isCoreError(e) && e.code === "not_found") return { runs: [] as ImportRun[] };
+    throw e;
+  });
+  const runs = last.runs ?? [];
+  header(out, "Import", "Drop it on this window");
+  if (keyStatus && !keyStatus.encrypted) {
+    out.append(bannerEl("Not encrypted", "This store is not encrypted yet. Run disconect key init from the command line before pairing a phone."));
+  }
+  if (importUi.running && importUi.kind === null) out.append(bannerEl("Busy", "An import or a sync is already running. This screen waits for it."));
+  out.append(importOutcomeBanner(runs[0]));
+  const drops = el("div", "drops");
+  drops.append(dropCard("export", "Account export", "Drop your account export zip here"));
+  drops.append(dropCard("usb", "Copied watch folder", "Drop the folder you copied from the watch"));
+  const cable = el("section", "card muted");
+  cable.setAttribute("aria-label", "Cable sync");
+  cable.setAttribute("aria-disabled", "true");
+  cable.append(el("h2", "heading", "Cable sync"));
+  cable.append(el("p", "body", "Needs the watch over USB with the vendor's sync fully quit — command line only for now"));
+  out.append(drops, cable);
+  const recent = el("section", "card");
+  recent.setAttribute("aria-label", "Recent imports");
+  recent.append(el("h2", "heading", "Recent imports"));
+  if (!runs.length) {
+    recent.append(el("span", "caption muted", "No imports yet."));
+  } else {
+    const grid = el("div", "runs body");
+    for (const [i, run] of runs.entries()) {
+      grid.append(el("span", "", run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time"));
+      grid.append(el("span", "", IMPORT_HOW[run.transport] ?? run.transport));
+      grid.append(el("span", "value-small", `${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`));
+      const failedRun = run.status === "failed";
+      const withFailures = !failedRun && run.files_failed > 0;
+      if (failedRun || withFailures) {
+        const a = el("a", "caption", failedRun ? "failed" : "done with failures");
+        a.setAttribute("href", "#/health");
+        grid.append(a);
+      } else {
+        const word = run.status !== "running" ? "done" : i === 0 && importUi.running ? "running" : "interrupted";
+        grid.append(el("span", "caption", word));
+      }
+    }
+    recent.append(grid);
+  }
+  out.append(recent);
+}
+
 // ---- Data health ------------------------------------------------------------------------
 let healthDays = 90;
 
@@ -1165,7 +1378,9 @@ async function screenHealth(out: ParentNode): Promise<void> {
   }
   out.append(legend);
   if (health.never_imported) {
-    out.append(bannerEl("Nothing imported yet", "Import with the command line for now: disconect import <export zip | watch folder>."));
+    const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen.");
+    nothing.append(importLink());
+    out.append(nothing);
     return;
   }
   healthLiveCard(out, health.live);
@@ -1846,6 +2061,7 @@ void (async () => {
   const dl = args.indexOf("--debug-listen");
   const m = dl >= 0 ? /^(.+):(\d{1,5})$/.exec(args[dl + 1] ?? "") : null;
   if (m) debugListen = { ip: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) };
+  dropOverDebug = args.includes("--debug-drop-over"); // debug builds only: Rust adds it from DISCONECT_DEBUG_DROP_OVER
   debugPairDigits = args.includes("--debug-pair-digits"); // debug builds only: the Rust command is compiled out of release
   const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
   if (target && current() !== target) {

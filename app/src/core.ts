@@ -19,8 +19,19 @@ export function unlock(passphrase: string): Promise<{ unlocked: boolean }> {
   return invoke("core_unlock", { passphrase });
 }
 
-export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | "pair" | "relay", cb: (payload: unknown) => void): Promise<UnlistenFn> {
+export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | "pair" | "relay" | "import", cb: (payload: unknown) => void): Promise<UnlistenFn> {
   return listen(`core://${name}`, (e) => cb(e.payload));
+}
+
+/** Whether something is being dragged over the window. The OS event carries the dragged paths; this wrapper
+ *  drops them on the floor: the page only ever learns "hovering" or "not", and sends nothing (the drop itself is
+ *  handled in Rust, `import_drop.rs`). */
+export function onDragHover(cb: (over: boolean) => void): Promise<UnlistenFn[]> {
+  return Promise.all([
+    listen("tauri://drag-enter", () => cb(true)),
+    listen("tauri://drag-leave", () => cb(false)),
+    listen("tauri://drag-drop", () => cb(false)),
+  ]);
 }
 
 /** Debug builds only: types the six digits read from DISCONECT_DEBUG_DIGITS_FILE (evidence runs). */

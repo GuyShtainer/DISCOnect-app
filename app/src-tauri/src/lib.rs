@@ -7,6 +7,7 @@
 
 #[allow(dead_code)] // slices 5-8 fill it
 pub mod coach;
+pub mod import_drop;
 pub mod inproc;
 pub mod live;
 pub mod sidecar;
@@ -77,7 +78,15 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 /// The app's own argv (after the executable), so the UI can honour `--screen <id>`.
 #[tauri::command]
 fn launch_args() -> Vec<String> {
-    std::env::args().skip(1).collect()
+    #[allow(unused_mut)]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Evidence runs, debug builds only: `DISCONECT_DEBUG_DROP_OVER=1` reaches the page as `--debug-drop-over`
+    // (the Import screen draws its drop cards in the hovered state).
+    #[cfg(debug_assertions)]
+    if std::env::var_os("DISCONECT_DEBUG_DROP_OVER").is_some_and(|v| v == "1") {
+        args.push("--debug-drop-over".into());
+    }
+    args
 }
 
 /// Last stderr lines of the core for a diagnostics panel (never key material: the core keeps
@@ -205,6 +214,22 @@ fn start_core(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
     }
 }
 
+/// Evidence hook, debug builds only: the folder or zip named by `DISCONECT_DEBUG_IMPORT_PATH` goes through the
+/// same entry point as a real drop, a moment after the window exists (nothing is scriptable in an OS drag). It
+/// is read here, in Rust; no command takes a path from the webview. The body is compiled out of release builds.
+fn debug_import_door(app: &tauri::AppHandle) {
+    let _ = app;
+    #[cfg(debug_assertions)]
+    {
+        let Some(path) = std::env::var_os("DISCONECT_DEBUG_IMPORT_PATH") else { return };
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            import_drop::handle_drop(&app, vec![std::path::PathBuf::from(path)]);
+        });
+    }
+}
+
 /// The main window is declared in `tauri.conf.json` with `"create": false` and built here, after the core
 /// is in state, so it can carry the egress hooks (ADR 0010): top-level navigation is limited to the app's
 /// own origin ([`coach::egress_guard::navigation_allowed`]) and `window.open` / `target=_blank` is denied.
@@ -216,10 +241,17 @@ fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         .first()
         .cloned()
         .ok_or("tauri.conf.json declares no window")?;
-    tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+    // Pitch 7b-3: the OS drop is handled here, in Rust; the webview never sees or names a path.
+    let handle = app.handle().clone();
+    let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
         .on_navigation(coach::egress_guard::navigation_allowed)
         .on_new_window(|_url, _features| NewWindowResponse::Deny)
         .build()?;
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+            import_drop::handle_drop(&handle, paths.clone());
+        }
+    });
     Ok(())
 }
 
@@ -239,6 +271,7 @@ pub fn run() {
             app.manage(coach::commands::CoachState::default());
             app.manage(live::LiveState::default());
             build_main_window(app)?;
+            debug_import_door(app.handle());
             Ok(())
         });
     // Bet 17: `support_sites`/`support_open` exist only on macOS (`coach/commands.rs`'s own `#[cfg]`), so the

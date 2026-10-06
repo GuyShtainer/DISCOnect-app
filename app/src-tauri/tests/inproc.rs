@@ -422,3 +422,26 @@ async fn the_environment_passphrase_is_never_an_unlock_path_in_process() {
     assert_eq!(ok["unlocked"], true);
     core.shutdown();
 }
+
+#[tokio::test]
+async fn an_empty_folder_dropped_through_the_import_entry_point_answers_started_then_done_with_zero_files() {
+    env_init();
+    let dir = scratch();
+    let db = synthetic_copy(&dir, "synthetic.hbdb");
+    let folder = dir.0.join("copied-watch-folder");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let core = Sidecar::start_inproc(db, collect()).expect("core");
+    let (kind, path) = disconect_app_lib::import_drop::classify(std::slice::from_ref(&folder)).expect("a folder");
+    let seen = Mutex::new(Vec::new());
+    let emit = |name: &str, payload: Value| {
+        assert_eq!(name, "core://import");
+        seen.lock().expect("seen").push(payload);
+    };
+    disconect_app_lib::import_drop::run_import(&core, &emit, path, kind).await;
+    let seen = seen.into_inner().expect("seen");
+    assert_eq!(seen[0], json!({"state": "started", "kind": "usb"}));
+    assert_eq!(seen[1]["state"], "done", "{:?}", seen[1]);
+    assert_eq!(seen[1]["files"], 0);
+    assert_eq!(seen[1]["ok"], 0);
+    core.shutdown();
+}
