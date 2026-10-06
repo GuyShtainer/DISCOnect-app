@@ -1712,8 +1712,9 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
   }
   if (importUi.running) return bannerEl("Busy", IMPORT_BUSY); // nothing of ours runs, yet the slot is held
   if (!run) return bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder below. Every screen fills from the first import.");
-  if (run.status === "running") {
-    // the newest run never ended and nothing runs now: the app or the core stopped under it
+  if (run.status === "running" || run.status === "interrupted") {
+    // the newest run never ended and nothing of ours runs now: `interrupted` = a later write open noticed the dead
+    // writer; `running` = not noticed yet, or a command-line import running beside the app (7b-10)
     const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
     return bannerEl("Interrupted", `${when} · this import stopped before it ended · drop it again, files already held are skipped`, true);
   }
@@ -1777,7 +1778,9 @@ async function screenImport(out: ParentNode): Promise<void> {
         a.setAttribute("href", "#/health");
         grid.append(a);
       } else {
-        const word = run.status !== "running" ? "done" : i === 0 && importUi.running ? "running" : "interrupted";
+        const word = run.status === "interrupted" ? "interrupted"
+          : run.status === "running" ? (i === 0 && importUi.running ? "running" : "interrupted")
+          : "done";
         grid.append(el("span", "caption", word));
       }
     }

@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS import_runs (
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
     transport       TEXT NOT NULL,
-    status          TEXT NOT NULL,         -- running | ok | partial | failed
+    status          TEXT NOT NULL,         -- running | ok | partial | failed | interrupted (a write open sets it on a row a dead writer left running)
     files_seen      INTEGER NOT NULL DEFAULT 0,
     files_imported  INTEGER NOT NULL DEFAULT 0,
     files_duplicate INTEGER NOT NULL DEFAULT 0,

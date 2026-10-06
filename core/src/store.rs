@@ -222,6 +222,8 @@ pub fn open_for_write_with(
     conn.execute_batch("PRAGMA foreign_keys = ON")?;
     check_not_too_new(&conn)?;
     migrate(&mut conn)?;
+    // the OS write lock is ours, so no other writer is alive: a run still `running` belongs to a dead process
+    conn.execute("UPDATE import_runs SET status='interrupted' WHERE status='running'", [])?;
     Ok(Store { conn, _lock: Some(lock) })
 }
 

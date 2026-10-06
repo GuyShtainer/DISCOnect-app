@@ -191,3 +191,29 @@ fn cli_import_into_a_moved_legacy_folder_exits_3_and_creates_nothing() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("data folder ~/.hearthbeat has moved; restart DISCOnect"));
     assert!(!dir.path().join(".hearthbeat").exists());
 }
+
+#[test]
+fn a_write_open_marks_a_dead_writers_running_run_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("runs.db");
+    let first = store::open_for_write(&db, "test", 5.0, PassphraseSource::Env).unwrap();
+    first
+        .conn()
+        .execute("INSERT INTO import_runs(started_at, transport, status) VALUES('2026-01-01T00:00:00Z','export','running')", [])
+        .unwrap();
+    drop(first);
+    let statuses = |s: &store::Store| -> Vec<(String, Option<String>, Option<String>)> {
+        let mut stmt = s.conn().prepare("SELECT status, finished_at, error FROM import_runs ORDER BY id").unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+    };
+    let ro = store::open_read_only(&db, PassphraseSource::Env).unwrap();
+    assert_eq!(statuses(&ro), vec![("running".to_string(), None, None)], "a reader never changes a row");
+    drop(ro);
+    let second = store::open_for_write(&db, "test", 5.0, PassphraseSource::Env).unwrap();
+    assert_eq!(statuses(&second), vec![("interrupted".to_string(), None, None)]);
+    second
+        .conn()
+        .execute("INSERT INTO import_runs(started_at, transport, status) VALUES('2026-01-02T00:00:00Z','export','running')", [])
+        .unwrap();
+    assert_eq!(statuses(&second)[1].0, "running", "the UPDATE runs only at open time");
+}
