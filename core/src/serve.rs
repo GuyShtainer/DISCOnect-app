@@ -529,7 +529,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("pair.confirm", Handler::Reply(pair_confirm)),
     ("pair.cancel", Handler::Reply(pair_cancel)),
     ("tools.call", Handler::Ordered(tools_call)),
-    ("pair.forget", Handler::Reply(phone_forget)),
+    ("pair.forget", Handler::Reply(pair_forget)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -1538,10 +1538,10 @@ fn parse(line: &str) -> Result<Call, Rejected> {
 /// `pair.forget` (12-F, M5): the phone deletes its copy, key file, keychain item and `relay.json`, then forgets the
 /// master. A phone-only method: any other core answers `unsupported_transport` (the Python core, the desktop build).
 /// Params are ignored; the unsent count the sheet shows is `sync.status`'s `records_unsent`. The order and its crash
-/// safety are in [`crate::phone_forget`]. Answers `{"forgotten": true, "keychain": "removed"|"none"|"failed: <text>"}`,
+/// safety are in [`crate::pair_forget`]. Answers `{"forgotten": true, "keychain": "removed"|"none"|"failed: <text>"}`,
 /// or `busy` when an import or a sync runs, with nothing deleted.
 #[cfg(not(target_os = "ios"))]
-fn phone_forget(_session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+fn pair_forget(_session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     Err(Failure::serve(
         "unsupported_transport",
         "this core is not a phone; there is nothing to forget",
@@ -1549,8 +1549,8 @@ fn phone_forget(_session: &mut Session, _call: &Call) -> Result<Value, Failure> 
 }
 
 #[cfg(target_os = "ios")]
-fn phone_forget(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
-    use crate::phone_forget as forget;
+fn pair_forget(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    use crate::pair_forget as forget;
     let paths = forget::Paths::beside(&session.db_path, &session.key_path());
     // 1. the marker, before anything else
     forget::write_marker(&paths).map_err(Failure::Io)?;
@@ -1569,8 +1569,8 @@ fn phone_forget(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
 }
 
 #[cfg(target_os = "ios")]
-fn forget_holding_slot(session: &mut Session, paths: &crate::phone_forget::Paths) -> Result<Value, Failure> {
-    use crate::phone_forget as forget;
+fn forget_holding_slot(session: &mut Session, paths: &crate::pair_forget::Paths) -> Result<Value, Failure> {
+    use crate::pair_forget as forget;
     let lock = match crate::write_lock::acquire(&session.db_path, "forget", std::time::Duration::ZERO) {
         Ok(lock) => lock,
         Err(error) => {

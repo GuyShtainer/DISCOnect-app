@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `pair.forget` through the router's own entry (`handle_line`): refused on every core that is not a phone, and on
 //! iOS the whole delete, the `busy` answers that delete nothing, and a forget that is asked while locked. The order
-//! and the crash completion are `phone_forget`'s own unit tests (a fake keychain).
+//! and the crash completion are `pair_forget`'s own unit tests (a fake keychain).
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -73,7 +73,7 @@ mod phone {
     }
 
     #[test]
-    fn a_locked_phone_forgets_everything_and_reports_the_failed_keychain_in_fixed_words() {
+    fn a_locked_pair_forgets_everything_and_reports_the_failed_keychain_in_fixed_words() {
         let (dir, mut session, out) = seed();
         let reply = ask(&mut session, &out, "pair.forget", json!({}));
         assert_eq!(reply["result"], json!({"forgotten": true, "keychain": "failed: no keychain is available"}), "{reply}");
