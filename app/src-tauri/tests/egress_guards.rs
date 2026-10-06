@@ -219,6 +219,7 @@ fn the_lock_file_has_no_telemetry_updater_websocket_or_native_tls_crate() {
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "runs the host `cargo tree` (cargo and rustc are not on the simulator PATH) to pin the DESKTOP build graph, which an iOS run does not change")]
 fn reqwest_and_hyper_are_not_in_the_desktop_build_and_reach_the_lock_only_through_tauris_mobile_proxy() {
     // `tauri` lists `reqwest` (so `hyper`) under `cfg(any(target_os = "android", all(target_vendor = "apple",
     // not(target_os = "macos"))))`: its dev-server proxy on phones. The lock file spans every target, so the
@@ -234,6 +235,7 @@ fn reqwest_and_hyper_are_not_in_the_desktop_build_and_reach_the_lock_only_throug
 }
 
 #[test]
+#[cfg_attr(target_os = "ios", ignore = "runs the host `cargo tree` (cargo and rustc are not on the simulator PATH) to pin the DESKTOP build graph, which an iOS run does not change")]
 fn the_http_client_is_ureq_and_rustls_is_only_its_tls() {
     let graph = lock_graph(&text(&manifest().join("Cargo.lock")));
     let manifest_text = text(&manifest().join("Cargo.toml"));
@@ -486,7 +488,7 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
     assert!(lib.contains("tauri::DragDropEvent::Drop { paths, .. }"), "the OS drop reaches Rust");
     for path in files_under(&src, "rs") {
         let code = text(&path);
-        for line in code.lines().filter(|l| l.contains("fn ") && l.contains("path: String")) {
+        if let Some(line) = code.lines().find(|l| l.contains("fn ") && l.contains("path: String")) {
             panic!("{} has a function taking a path as a string, a webview-shaped door: {line}", path.display());
         }
     }
