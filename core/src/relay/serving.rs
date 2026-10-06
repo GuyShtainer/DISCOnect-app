@@ -639,6 +639,10 @@ fn end_of_offer(env: &Env, serial: u64, linger: bool) {
         }
         take_server(&mut st)
     };
+    if taken.is_some() {
+        // the app drops "Serving at ..." on this, not at its next render
+        emit_event(env, &json!({"event": "relay", "state": "stopped", "reason": "offer_ended"}));
+    }
     finish_stop(&env.shared, taken);
 }
 

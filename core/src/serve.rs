@@ -798,7 +798,6 @@ fn data_metric(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     }))
 }
 
-/// `_contract_pairs`: every (numeric metric, scope) the contract declares a stream for, in contract order.
 /// `data.live`: the live link on one local day (default today) — the Today live card's read.
 fn data_live(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     session.require_unlocked()?;
@@ -813,6 +812,7 @@ fn data_live(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     Ok(queries::live_day(conn, contract, &day)?)
 }
 
+/// `_contract_pairs`: every (numeric metric, scope) the contract declares a stream for, in contract order.
 fn contract_pairs(contract: &Contract) -> Vec<(String, String)> {
     let declared = |metric: &str, scope: &str| {
         contract

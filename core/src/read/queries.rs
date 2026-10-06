@@ -526,8 +526,6 @@ fn latest_sample_day(
     Ok(None)
 }
 
-/// `latest_value`: the newest `(local day, value)` stored for one numeric metric and scope, or None.
-/// A sample metric reports the mean of its newest local day.
 /// `LIVE_SCOPE`: the live link's source scope.
 pub const LIVE_SCOPE: &str = "live";
 
@@ -636,6 +634,8 @@ pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<V
     Ok(json!({"day": day, "sessions": out_sessions, "metrics": metrics}))
 }
 
+/// `latest_value`: the newest `(local day, value)` stored for one numeric metric and scope, or None.
+/// A sample metric reports the mean of its newest local day.
 pub fn latest_value(
     conn: &Connection,
     contract: &Contract,

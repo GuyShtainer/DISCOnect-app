@@ -793,6 +793,22 @@ fn a_cancel_after_delivery_stops_the_server_after_the_linger_with_no_pair_event(
     assert!(refused(&listen));
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(pair_states(&mut live), ["bound", "delivered"], "no aborted event after a delivery");
+    assert_eq!(live.event("relay", "stopped")["reason"], "offer_ended");
+}
+
+#[test]
+fn a_cancel_stops_the_server_after_the_linger_and_says_offer_ended_once() {
+    let (_dir, db) = serving_store(true);
+    let mut live = Live::unlocked(&db, fast(None, 200));
+    let listen = listen_on_free_port();
+    live.call("pair.offer", json!({"listen": listen}));
+    assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
+    let stopped = live.event("relay", "stopped");
+    assert_eq!(stopped["reason"], "offer_ended");
+    assert!(wait_until(15, || live.serving().is_null()), "the event comes with the stop");
+    assert!(refused(&listen));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(live.events("relay").len(), 1, "one stop, one event");
 }
 
 #[test]

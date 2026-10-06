@@ -290,6 +290,72 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
     }
 }
 
+// ---- data.live ----
+
+fn live_copy() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("live.db");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../disconect/tests/fixtures/serve/synthetic-live.hbdb");
+    std::fs::copy(source, &db).expect("copy the committed live store");
+    (dir, db)
+}
+
+fn live_minutes(result: &Value, metric: &str) -> (i64, Value) {
+    let item = result["metrics"]
+        .as_array()
+        .expect("metrics")
+        .iter()
+        .find(|m| m["metric"] == metric)
+        .expect("metric listed");
+    (item["minutes"].as_i64().expect("minutes"), item["median"].clone())
+}
+
+#[test]
+fn live_day_merges_overlapping_files_and_keeps_a_midnight_session_on_one_local_day() {
+    let (_dir, db) = live_copy();
+    let mut rig = Rig::new(&db);
+    // 2025-06-15: a partial file (10:00-10:09) stored before the full one (10:00-10:13) is one session
+    // (the store's watch clock runs +3 h, so the local times differ from the UTC ones)
+    let day = rig.send("data.live", json!({"day": "2025-06-15"}))["result"].clone();
+    assert_eq!(
+        day["sessions"],
+        json!([{"start_utc": "2025-06-15T10:00:00Z", "end_utc": "2025-06-15T10:13:00Z",
+                "start_local": "2025-06-15T13:00", "end_local": "2025-06-15T13:13", "minutes": 14}])
+    );
+    assert_eq!(live_minutes(&day, "heart_rate"), (14, json!(96.0)));
+    assert_eq!(live_minutes(&day, "spo2"), (1, json!(97.0)));
+    // 2025-06-20 23:55Z -> 06-21 00:05Z crosses UTC midnight but not the watch's (+3:30 there): one local day
+    assert_eq!(rig.send("data.live", json!({"day": "2025-06-20"}))["result"]["sessions"], json!([]));
+    let after = rig.send("data.live", json!({"day": "2025-06-21"}))["result"].clone();
+    assert_eq!(
+        after["sessions"],
+        json!([{"start_utc": "2025-06-20T23:55:00Z", "end_utc": "2025-06-21T00:05:00Z",
+                "start_local": "2025-06-21T03:25", "end_local": "2025-06-21T03:35", "minutes": 11}])
+    );
+    assert_eq!(live_minutes(&after, "heart_rate"), (11, json!(65.0)));
+    assert_eq!(live_minutes(&after, "spo2").0, 0);
+}
+
+#[test]
+fn live_day_of_a_watch_behind_utc_is_the_local_day_not_the_utc_day() {
+    // `day` is the date on the watch's own clock (the stated offset nearest the session's start/end), never
+    // the UTC date. The store's watch ran -05:00 from 1 March to 10 April: a session at 2025-03-06T01:00Z..01:05Z
+    // is the evening of 5 March there, so it is reported on the 5th and the UTC day (the 6th) lists nothing.
+    let (_dir, db) = live_copy();
+    let mut rig = Rig::new(&db);
+    let utc_day = rig.send("data.live", json!({"day": "2025-03-06"}))["result"].clone();
+    assert_eq!(utc_day["sessions"], json!([]));
+    assert_eq!(live_minutes(&utc_day, "heart_rate").0, 0);
+    let evening = rig.send("data.live", json!({"day": "2025-03-05"}))["result"].clone();
+    assert_eq!(
+        evening["sessions"],
+        json!([{"start_utc": "2025-03-06T01:00:00Z", "end_utc": "2025-03-06T01:05:00Z",
+                "start_local": "2025-03-05T20:00", "end_local": "2025-03-05T20:05", "minutes": 6}])
+    );
+    assert_eq!(live_minutes(&evening, "heart_rate"), (6, json!(72.0)));
+}
+
 // ---- data.facts ----
 
 fn synthetic_copy() -> (tempfile::TempDir, std::path::PathBuf) {
