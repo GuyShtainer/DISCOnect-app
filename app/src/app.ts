@@ -398,7 +398,7 @@ async function screenToday(out: ParentNode): Promise<void> {
   if (cloud.length) {
     const drawer = el("details", "drawer");
     const latest = cloud.reduce<string | null>((m, r) => (r.day && (!m || r.day > m) ? r.day : m), null);
-    drawer.append(el("summary", "", `${scopeWord("vendor_cloud")} · ${cloud.length} figure${cloud.length === 1 ? "" : "s"}${latest ? ` · the export ends ${latest}` : ""}`));
+    drawer.append(el("summary", "", `${scopeWord("vendor_cloud")} · ${cloud.length} figure${cloud.length === 1 ? "" : "s"}${latest ? ` · latest ${latest}` : ""}`));
     const grid = el("div", "cards");
     for (const row of cloud) grid.append(todayCard(row, today.day));
     drawer.append(grid);
@@ -1818,6 +1818,7 @@ function dayDiff(a: string, b: string): number {
  * are unknown) or the days do not add up to the window; the bar then runs in status order. */
 function timeOrderSegments(r: LedgerRow, window: { from: string; to: string; days: number }): [string, number][] | null {
   if (r.gaps_truncated) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(window.from) || !/^\d{4}-\d{2}-\d{2}$/.test(window.to)) return null;
   const segs: [string, number][] = [];
   let cursor = window.from;
   for (const g of r.gaps) {
@@ -1886,6 +1887,12 @@ async function screenHealth(out: ParentNode): Promise<void> {
       bar.append(seg);
     }
     block.append(bar);
+    if (segs === null && !r.gaps_truncated) block.append(el("div", "caption muted", "status order"));
+    const lastGap = r.gaps[r.gaps.length - 1];
+    if (r.source_scope === "vendor_cloud" && lastGap && lastGap.status === "not_covered" && lastGap.to === cov.window.to && lastGap.from) {
+      // the import ends where the trailing not-covered run begins
+      block.append(el("div", "caption muted", lastGap.from === cov.window.from ? "no export day in this window" : `the export ends ${new Date(Date.parse(`${lastGap.from}T00:00:00Z`) - 86400000).toISOString().slice(0, 10)}`));
+    }
     const span = (x: LedgerRow["gaps"][number]) => (x.from && x.to ? (x.from === x.to ? x.from : `${x.from} → ${x.to}`) : JSON.stringify(x));
     const failedGaps = r.gaps.filter((x) => x.status === "failed");
     const otherGaps = r.gaps.filter((x) => x.status !== "failed");
@@ -1896,7 +1903,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
     card.append(block);
   }
   const order = ordered.every((o) => o) ? "Bars run in time order."
-    : ordered.some((o) => o) ? "Bars run in time order except the rows marked 'newest gaps shown', which run in status order."
+    : ordered.some((o) => o) ? "Bars run in time order except the rows marked 'newest gaps shown' or 'status order', which run in status order."
       : "Bars run in status order, not time order.";
   card.append(el("span", "caption muted", `Counts are days out of ${cov.window.days}. ${order} "present" can still be a partial day. A sparse metric is recorded only on some days, so its empty days are normal.`));
   out.append(card);

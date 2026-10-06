@@ -42,7 +42,7 @@ export function runDays(days: { day: string }[], a: string, b: string): number {
 }
 
 const GRID = { left: 56, right: 24, top: 24, bottom: 48 };
-let active: { chart: echarts.ECharts; observer: ResizeObserver; readout: HTMLElement; days: string[] } | null = null;
+let active: { chart: echarts.ECharts; observer: ResizeObserver; readout: HTMLElement; days: string[]; latest: number; setReadout: (i: number) => void } | null = null;
 /** The day index the tip last stood on (the arrow keys step from it); -1 before any. */
 let tipIndex = -1;
 
@@ -66,6 +66,7 @@ export function showTipOn(day: string): void {
 function stepTip(i: number): void {
   if (!active) return;
   tipIndex = i;
+  active.setReadout(i); // the keyboard writes the readout itself, at every width
   // by pixel, not by series point: a day on which the first line has no value has no point to anchor a tip to
   const x = active.chart.convertToPixel({ xAxisIndex: 0 }, active.days[i]);
   if (typeof x === "number") active.chart.dispatchAction({ type: "showTip", x, y: GRID.top + 40 });
@@ -112,11 +113,16 @@ const LABEL_MIN_PX = 72;
 export function drawTrend(host: HTMLElement, series: Series[], title: string): void {
   disposeCharts();
   host.tabIndex = 0;
-  host.setAttribute("role", "img");
+  host.setAttribute("role", "group");
+  host.setAttribute("aria-roledescription", "chart");
   const days = series[0].days.map((d) => d.day);
   host.setAttribute("aria-label", `${title} trend, ${days.length} days`);
   const readout = document.createElement("div");
   readout.className = "readout";
+  readout.setAttribute("aria-live", "polite");
+  readout.setAttribute("aria-atomic", "true");
+  // one line per non-live series plus the day (a live line is omitted when absent, so it reserves none)
+  readout.style.minHeight = `${(series.filter((s) => s.scope !== "live").length + 1) * 1.3}em`;
   host.after(readout);
   const chart = echarts.init(host, undefined, { renderer: "canvas" });
   const setReadout = (i: number) => {
@@ -131,22 +137,23 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
     const i = typeof v === "number" ? v : typeof v === "string" ? days.indexOf(v) : -1;
     if (i >= 0 && i < days.length) {
       tipIndex = i;
-      setReadout(i);
+      if (chart.getWidth() <= 720) setReadout(i); // the mouse feeds the readout only where the tip is off
     }
   });
   host.onkeydown = (ev: KeyboardEvent) => {
     const last = days.length - 1;
-    const from = tipIndex < 0 ? last + 1 : tipIndex;
+    const from = tipIndex < 0 ? latest : tipIndex; // the first press moves one step from the latest day
     const to = ev.key === "ArrowLeft" ? from - 1 : ev.key === "ArrowRight" ? Math.min(from + 1, last) : ev.key === "Home" ? 0 : ev.key === "End" ? last : null;
     if (to === null) return;
     ev.preventDefault();
     stepTip(Math.max(0, Math.min(last, to)));
   };
+  host.onblur = () => chart.dispatchAction({ type: "hideTip" });
   const observer = new ResizeObserver(() => {
     chart.resize();
     chart.setOption(build(chart.getWidth())); // the band-label gate is in pixels, so a new width re-decides it
   });
-  active = { chart, observer, readout, days };
+  active = { chart, observer, readout, days, latest, setReadout };
   const hatch = token("--status-not-covered");
   const gap = hatchedDays(series);
   function build(width: number) {
@@ -158,22 +165,31 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
     tooltip: {
       trigger: "axis",
       confine: true,
+      showContent: width > 720, // under 720 px the readout row does that job; the cursor line still shows
       backgroundColor: token("--surface-raised"),
       borderColor: token("--hairline"),
       textStyle: { color: token("--ink") },
       axisPointer: { type: "line", lineStyle: { type: "dashed", color: token("--axis") } },
-      // beside the cursor, on the side with room: left of it in the right half, right of it otherwise, so the tip never covers the hovered day
+      // beside the cursor: right of it when it fits, else left, else the side with more room; never over the hovered day
       position: (point: number[], _params: unknown, _dom: unknown, _rect: unknown, size: { contentSize: number[]; viewSize: number[] }) => {
         const [w, h] = size.contentSize;
         const [vw, vh] = size.viewSize;
-        const x = point[0] > vw / 2 ? point[0] - w - 14 : point[0] + 14;
-        return [Math.max(0, Math.min(x, vw - w)), Math.max(0, Math.min(point[1] - h / 2, vh - h))];
+        const r = point[0] + 14;
+        const l = point[0] - 14 - w;
+        const x = r + w <= vw ? r : l >= 0 ? l : point[0] > vw / 2 ? 0 : vw - w;
+        return [x, Math.max(0, Math.min(point[1] - h / 2, vh - h))];
       },
       formatter: (params: unknown) => {
         const first = (Array.isArray(params) ? params[0] : params) as { dataIndex?: number } | undefined;
         const i = first?.dataIndex ?? -1;
-        if (i < 0 || i >= days.length) return "";
-        return [days[i], ...seriesWords(series, i)].join("<br/>");
+        if (i < 0 || i >= days.length) return document.createElement("div");
+        const box = document.createElement("div");
+        for (const line of [days[i], ...seriesWords(series, i)]) {
+          const row = document.createElement("div");
+          row.textContent = line;
+          box.append(row);
+        }
+        return box;
       },
     },
     grid: GRID,

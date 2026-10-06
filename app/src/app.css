@@ -16,7 +16,7 @@ a:hover { color: var(--accent-hover); }
 .sidebar .navgroup { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-3); }
 .sidebar .group { font-weight: 600; padding: var(--space-2) var(--space-3) 0; }
 .topbar, .scrim { display: none; }
-.readout { display: none; } /* shown inside the 720 px block below: no hover on a phone */
+.readout { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; } /* visually hidden above 720 px (screen readers still hear it); shown in the block below */
 .main { padding: var(--space-8) calc(var(--space-8) + env(safe-area-inset-right)) calc(var(--space-8) + env(safe-area-inset-bottom)) var(--space-8); display: flex; flex-direction: column; gap: var(--space-6); max-width: 1040px; }
 @media (max-width: 720px) {
   .shell { grid-template-columns: minmax(0, 1fr); } /* 1fr alone is minmax(auto, 1fr): one wide select made the whole page scroll sideways */
@@ -29,7 +29,7 @@ a:hover { color: var(--accent-hover); }
   .sidebar[data-open] { display: flex; position: fixed; top: 0; bottom: 0; left: 0; z-index: 2; width: 280px; overflow-y: auto; background: var(--surface); padding: calc(var(--space-8) + env(safe-area-inset-top)) var(--space-4) calc(var(--space-4) + env(safe-area-inset-bottom)) calc(var(--space-4) + env(safe-area-inset-left)); }
   .scrim { display: block; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 1; background: var(--ink); opacity: 0.4; }
   .scrim[hidden] { display: none; }
-  .readout { display: block; min-height: 2.6em; padding-top: var(--space-2); color: var(--ink); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+  .readout { position: static; width: auto; height: auto; overflow: visible; clip: auto; clip-path: none; white-space: normal; display: block; padding-top: var(--space-2); color: var(--ink); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
   .main { padding: var(--space-4) calc(var(--space-4) + env(safe-area-inset-right)) calc(var(--space-4) + env(safe-area-inset-bottom)) calc(var(--space-4) + env(safe-area-inset-left)); }
 }
 
