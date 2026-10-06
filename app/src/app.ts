@@ -2168,7 +2168,7 @@ function screenPairStart(out: ParentNode): void {
   header(out, "Pair with your Mac", "This phone keeps a copy of your data and pulls what is new from your Mac.");
   const how = pcard("How pairing works");
   how.append(psteps([
-    { text: "On your Mac, open Sync and choose Pair another device.", state: "now" },
+    { text: "On your Mac, open Sync and choose Pair a device.", state: "now" },
     { text: "Scan the code your Mac shows.", state: "idle" },
     { text: "Type the six digits this phone shows into your Mac.", state: "idle" },
   ]));
