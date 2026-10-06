@@ -81,6 +81,8 @@ pub struct Contract {
     pub metrics: Vec<MetricContract>,
     pub labels: Vec<MetricContract>,
     pub streams_for: Vec<StreamsFor>,
+    pub session_streams: Vec<String>,
+    pub session_streams_for: Vec<StreamsFor>,
     pub sparse_metrics: Vec<String>,
     pub comparison_targets: Vec<ComparisonTarget>,
     pub insight: InsightContract,
@@ -149,10 +151,12 @@ mod tests {
     }
 
     #[test]
-    fn every_field_loads_and_the_version_is_one() {
+    fn every_field_loads_and_the_version_is_two() {
         let c = contract();
-        assert_eq!(c.version(), Ok(1));
-        assert_eq!(c.source_scopes, ["device", "vendor_cloud", "local"]);
+        assert_eq!(c.version(), Ok(2));
+        assert_eq!(c.source_scopes, ["device", "vendor_cloud", "local", "live"]);
+        assert_eq!(c.session_streams, ["json:live"]);
+        assert_eq!(c.session_streams_for.len(), 5);
         assert!(c.metrics.len() > 50 && c.labels.len() == 5);
         assert!(c.streams_for.len() > 70 && c.sparse_metrics.len() > 10);
         assert_eq!(c.comparison_targets.len(), 4);

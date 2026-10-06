@@ -344,13 +344,14 @@ pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, Read
 /// before them, ending on `end_date` (empty or absent: the latest date the store holds, never the clock, so
 /// an old archive still answers). `metrics` are answered in request order, each once; a requested metric with
 /// no data in either range is a `no_data` fact, an unrequested one is omitted; a name the contract does not
-/// know (a label included) is listed in `ignored_metrics`. Errors, in Python's order: `source_scope`,
+/// know (a label included) is listed in `ignored_metrics`. Without a `source_scope` the session scope
+/// `live` is left out (`fact_scopes_for`). Errors, in Python's order: `source_scope`,
 /// `end_date` (`ValueError`), then the window arithmetic and the sample over-fetch (`OverflowError`).
 pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Json, ReadError> {
     let contract = Contract::get()?;
     let window_days = query.window_days.clamp(1, MAX_WINDOW_DAYS);
     let baseline_days = query.baseline_days.clamp(1, MAX_BASELINE_DAYS);
-    let scopes = &queries::scopes_for(contract, query.source_scope.as_ref())?;
+    let scopes = &queries::fact_scopes_for(contract, query.source_scope.as_ref())?;
     let end_date = query.end_date.as_ref().filter(|text| !text.is_empty());
     if let Some(text) = end_date {
         queries::parse_day(text, "end_date")?;

@@ -66,7 +66,11 @@ fn inflate(blob: &[u8]) -> Vec<u8> {
 fn canonical_counts(conn: &Connection) -> Vec<i64> {
     ["metric_samples", "daily_metrics", "daily_labels", "monitoring_intervals", "activities"]
         .iter()
-        .map(|t| conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).expect("count"))
+        .map(|t| {
+            // the 9b-2 fold writes `live`-scope samples; everything else stays empty
+            let filter = if *t == "metric_samples" { " WHERE source_scope != 'live'" } else { "" };
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}{filter}"), [], |r| r.get(0)).expect("count")
+        })
         .collect()
 }
 

@@ -324,7 +324,7 @@ pub fn data_health_ordered(
     {
         let mut statement = conn.prepare(
             "SELECT metric, COUNT(DISTINCT substr(ts_utc,1,10)), MIN(substr(ts_utc,1,10)), \
-             MAX(substr(ts_utc,1,10)) FROM metric_samples GROUP BY metric",
+             MAX(substr(ts_utc,1,10)) FROM metric_samples WHERE source_scope != 'live' GROUP BY metric",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -336,7 +336,7 @@ pub fn data_health_ordered(
     {
         let mut statement = conn.prepare(
             "SELECT metric, COUNT(DISTINCT substr(ts_utc,1,10)) FROM metric_samples \
-             WHERE substr(ts_utc,1,10) >= ? GROUP BY metric",
+             WHERE source_scope != 'live' AND substr(ts_utc,1,10) >= ? GROUP BY metric",
         )?;
         let mut rows = statement.query([&since])?;
         while let Some(row) = rows.next()? {
@@ -392,6 +392,22 @@ pub fn data_health_ordered(
             );
         }
     }
+    let live_records: i64 =
+        conn.query_row("SELECT COUNT(*) FROM raw_records WHERE stream='json:live'", [], |row| row.get(0))?;
+    let live = {
+        let mut statement = conn.prepare(
+            "SELECT COUNT(*), MIN(substr(ts_utc,1,10)), MAX(substr(ts_utc,1,10)) FROM metric_samples \
+             WHERE source_scope='live'",
+        )?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else { return Err(ReadError::Unexpected("TypeError")) };
+        Json::object([
+            ("records", Json::int(live_records)),
+            ("samples", late.json(row, 0)?),
+            ("first_day", late.json(row, 1)?),
+            ("last_day", late.json(row, 2)?),
+        ])
+    };
     let activities: i64 =
         conn.query_row("SELECT COUNT(*) FROM activities", [], |row| row.get(0))?;
     let offsets: i64 =
@@ -459,6 +475,7 @@ pub fn data_health_ordered(
         ("provenance", Json::Array(provenance)),
         ("metrics", Json::Array(metrics)),
         ("sleep", sleep),
+        ("live", live),
         ("activities", Json::int(activities)),
         ("clock_offsets_known", Json::int(offsets)),
         ("source_agreement", Json::Array(agreement)),
@@ -608,7 +625,7 @@ mod tests {
             report["window"],
             json!({"days": 3650, "from": "2015-07-05", "to": "2025-07-02"})
         );
-        assert_eq!(report["contract_version"], "1");
+        assert_eq!(report["contract_version"], "2");
         assert_eq!(report["never_imported"], true);
         let metrics = report["metrics"].as_array().expect("metrics");
         let steps = metrics

@@ -1,16 +1,17 @@
 {
-  "contract_version": "1",
+  "contract_version": "2",
   "conventions": {
     "time": "Sample timestamps (ts_utc) are RFC 3339 in UTC with a trailing 'Z'. Daily values are keyed by the watch's local calendar date (YYYY-MM-DD), resolved with the UTC offset the watch itself reported nearest to that moment; a night of sleep is keyed by the local date it ended. The time a file was imported (imported_at) is not the time a measurement happened and never stands in for it.",
     "missing_values": "Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
-    "sources": "source_scope names the layer a value came from. 'device' is decoded from the watch's own FIT bytes, whichever way they arrived (USB, a Connect account export, Gadgetbridge). 'vendor_cloud' is a figure Garmin Connect computed and delivered as JSON. 'local' is computed here from device data. The scopes are stored side by side and never merged; every value says which scope it belongs to.",
+    "sources": "source_scope names the layer a value came from. 'device' is decoded from the watch's own FIT bytes, whichever way they arrived (USB, a Connect account export, Gadgetbridge). 'vendor_cloud' is a figure Garmin Connect computed and delivered as JSON. 'local' is computed here from device data. 'live' is a reading the watch sent over the Bluetooth link during a session: the same sensor, read live, kept apart so a session never passes for a day of monitoring. The scopes are stored side by side and never merged; every value says which scope it belongs to.",
     "privacy": "Reads one local SQLite file. Opens no network connection and no port. Returns no device serial numbers, file paths, account identifiers, or GPS coordinates.",
-    "coverage": "Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. Coverage is derived from the retained raw files each time it is asked for; it is never guessed."
+    "coverage": "Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. A live-link session claims no day: in the 'live' scope a day without a session is 'not_covered'. Coverage is derived from the retained raw files each time it is asked for; it is never guessed."
   },
   "source_scopes": [
     "device",
     "vendor_cloud",
-    "local"
+    "local",
+    "live"
   ],
   "metrics": [
     {
@@ -970,6 +971,46 @@
       "source_scope": "vendor_cloud",
       "streams": [
         "json:biometrics"
+      ]
+    }
+  ],
+  "session_streams": [
+    "json:live"
+  ],
+  "session_streams_for": [
+    {
+      "metric": "heart_rate",
+      "source_scope": "live",
+      "streams": [
+        "json:live"
+      ]
+    },
+    {
+      "metric": "stress",
+      "source_scope": "live",
+      "streams": [
+        "json:live"
+      ]
+    },
+    {
+      "metric": "respiration_rate",
+      "source_scope": "live",
+      "streams": [
+        "json:live"
+      ]
+    },
+    {
+      "metric": "spo2",
+      "source_scope": "live",
+      "streams": [
+        "json:live"
+      ]
+    },
+    {
+      "metric": "energy_reserve",
+      "source_scope": "live",
+      "streams": [
+        "json:live"
       ]
     }
   ],

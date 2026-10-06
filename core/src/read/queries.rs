@@ -144,6 +144,24 @@ pub fn window(
 
 /// `source_scope not in contract.SOURCE_SCOPES` -> `ValueError`, else the scopes to read: the one named,
 /// or all of them (an empty text is not a scope: it fails the check).
+/// The scopes `period_facts` answers when none is asked for: every contract scope but the ones a session
+/// stream writes (`live`), so a link's minutes never shape the default facts (9b-2). A named scope, `live`
+/// included, goes through `scopes_for` unchanged.
+pub fn fact_scopes_for(
+    contract: &Contract,
+    source_scope: Option<&PyStr>,
+) -> Result<Vec<String>, ReadError> {
+    if source_scope.is_some() {
+        return scopes_for(contract, source_scope);
+    }
+    Ok(contract
+        .source_scopes
+        .iter()
+        .filter(|scope| !contract.session_streams_for.iter().any(|entry| &entry.source_scope == *scope))
+        .cloned()
+        .collect())
+}
+
 pub fn scopes_for(
     contract: &Contract,
     source_scope: Option<&PyStr>,
@@ -244,7 +262,7 @@ pub fn latest_stored_date(conn: &Connection) -> Result<Option<String>, ReadError
     let mut latest: Option<String> = None;
     for sql in [
         "SELECT MAX(date) FROM daily_metrics",
-        "SELECT MAX(substr(ts_utc, 1, 10)) FROM metric_samples",
+        "SELECT MAX(substr(ts_utc, 1, 10)) FROM metric_samples WHERE source_scope != 'live'",
     ] {
         let mut statement = conn.prepare(sql)?;
         let mut rows = statement.query([])?;
@@ -368,8 +386,9 @@ pub fn numeric_scope(
         .to_text()
         .is_some_and(|name| contract.source_scopes.contains(&name));
     if !known {
+        let names: Vec<String> = contract.source_scopes.iter().map(|name| pyrepr::repr_str(name)).collect();
         return Err(ReadError::Value(
-            "scope must be one of ('device', 'vendor_cloud', 'local')".into(),
+            format!("scope must be one of ({})", names.join(", ")),
         ));
     }
     Ok(cadence)
@@ -659,7 +678,7 @@ mod tests {
             if m == "unknown numeric metric \"it's\"; see the contract for the list"));
         let scope = numeric_scope(contract, &steps, &PyStr::from_text("cloud"));
         assert!(matches!(&scope, Err(ReadError::Value(m))
-            if m == "scope must be one of ('device', 'vendor_cloud', 'local')"));
+            if m == "scope must be one of ('device', 'vendor_cloud', 'local', 'live')"));
         // a label is not a numeric metric
         assert!(numeric_scope(contract, &PyStr::from_text("hrv_status"), &local).is_err());
     }

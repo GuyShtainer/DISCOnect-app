@@ -159,6 +159,7 @@ fn covered_by_stream(
     window: &Window,
     offsets: &ClockOffsets,
     refinements: bool,
+    session: &[String],
 ) -> Result<(BTreeMap<String, Flags>, i64), ReadError> {
     let mut covered: BTreeMap<String, Flags> = BTreeMap::new();
     let mut undatable = 0;
@@ -166,6 +167,9 @@ fn covered_by_stream(
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let stream = text(row.get_ref(0)?)?;
+        if session.iter().any(|s| s == stream) {
+            continue; // a session claims no day
+        }
         let span = span_days(
             offsets,
             optional_text(row.get_ref(1)?)?,
@@ -210,6 +214,7 @@ fn failed_by_stream(
     window: &Window,
     offsets: &ClockOffsets,
     refinements: bool,
+    session: &[String],
 ) -> Result<(BTreeMap<String, Flags>, i64), ReadError> {
     let mut failed: BTreeMap<String, Flags> = BTreeMap::new();
     let mut unattributed = 0;
@@ -222,6 +227,13 @@ fn failed_by_stream(
     )?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
+        let own_stream = match row.get_ref(0)? {
+            ValueRef::Null => None,
+            cell => Some(text(cell)?),
+        };
+        if own_stream.is_some_and(|name| session.iter().any(|s| s == name)) {
+            continue; // a refused session record is a failed raw record, not a failed day
+        }
         // `start_utc or raw_start`: the failure's own span wins unless it is falsy
         let start = optional_text(row.get_ref(1)?)?.or(optional_text(row.get_ref(3)?)?);
         let end = optional_text(row.get_ref(2)?)?.or(optional_text(row.get_ref(4)?)?);
@@ -401,6 +413,17 @@ fn declared_and_drift(
         .collect();
     let mut drift = Vec::new();
     for (metric, scope, stream) in observed_map(conn)? {
+        if let Some(entry) = contract
+            .session_streams_for
+            .iter()
+            .find(|e| e.metric == metric && e.source_scope == scope && e.streams.contains(&stream))
+        {
+            streams_for
+                .entry((metric.clone(), scope.clone()))
+                .or_default()
+                .extend(entry.streams.iter().cloned());
+            continue;
+        }
         let declared = streams_for
             .entry((metric.clone(), scope.clone()))
             .or_default();
@@ -427,8 +450,8 @@ fn analyse(
     let offsets = load_offsets(conn)?;
     let refinements = has_table(conn, "export_ranges")? && has_table(conn, "import_failures")?;
     let (streams_for, drift) = declared_and_drift(conn, contract)?;
-    let (covered, undatable) = covered_by_stream(conn, &window, &offsets, refinements)?;
-    let (failed, unattributed) = failed_by_stream(conn, &window, &offsets, refinements)?;
+    let (covered, undatable) = covered_by_stream(conn, &window, &offsets, refinements, &contract.session_streams)?;
+    let (failed, unattributed) = failed_by_stream(conn, &window, &offsets, refinements, &contract.session_streams)?;
     let present = present_days(conn, &window, &offsets)?;
     let statuses = streams_for
         .iter()

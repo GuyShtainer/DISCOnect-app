@@ -386,6 +386,8 @@ pub struct Writer<'c> {
     interval_devices: BTreeSet<Option<String>>,
     sample_span: Option<(Instant, Instant)>,
     sample_devices: BTreeSet<Option<String>>,
+    /// Raw ids of the `json:live` records this run stored (a duplicate is not stored).
+    live_run_ids: BTreeSet<i64>,
 }
 
 impl<'c> Writer<'c> {
@@ -399,6 +401,7 @@ impl<'c> Writer<'c> {
             interval_devices: BTreeSet::new(),
             sample_span: None,
             sample_devices: BTreeSet::new(),
+            live_run_ids: BTreeSet::new(),
         }
     }
 
@@ -1130,6 +1133,9 @@ impl<'c> Writer<'c> {
         };
         let written = self.write_canonical(decoded, raw_id)?;
         self.conn.execute_batch("COMMIT")?;
+        if decoded.stream == crate::live::STREAM {
+            self.live_run_ids.insert(raw_id);
+        }
         Ok(Some(written))
     }
 
@@ -1279,6 +1285,140 @@ impl<'c> Writer<'c> {
             }
         }
         Ok(days)
+    }
+}
+
+// ---- the live fold (bet 9b-2) ----
+
+/// The sample-cadence metrics the fold keeps; `steps` and anything else is ignored.
+const LIVE_METRICS: [&str; 5] = ["heart_rate", "stress", "respiration_rate", "spo2", "energy_reserve"];
+
+/// One decoded live record: its raw id and readings `(t, metric, value)` in payload order.
+pub type LiveRecord = (i64, Vec<(f64, String, i64)>);
+
+/// The reason a reading is a sentinel (dropped before thinning), None when it is kept.
+fn live_sentinel(metric: &str, value: i64) -> Option<&'static str> {
+    match metric {
+        "heart_rate" if value <= 0 => Some("live_heart_rate_zero"),
+        "stress" if value < 0 => Some("live_stress_sentinel"),
+        "respiration_rate" if value < 0 => Some("live_respiration_sentinel"),
+        "spo2" if value <= 0 => Some("live_spo2_off_wrist_or_zero"),
+        "energy_reserve" if !(0..=100).contains(&value) => Some("live_energy_reserve_out_of_range"),
+        _ => None,
+    }
+}
+
+/// One folded minute: `(metric, minute unix seconds, lower median, raw id)`.
+pub type LiveMinute = (String, i64, i64, i64);
+
+/// A minute bucket of the fold: `(metric, minute unix seconds)` -> (values, first raw id).
+type LiveBuckets = BTreeMap<(String, i64), (Vec<i64>, i64)>;
+
+/// The pure fold over decoded records in content order: the minute rows `(metric, minute, lower
+/// median, raw id of the first contributing record)` sorted by (metric, ts), and the sentinel
+/// drop counts. Readings are de-duplicated across all records by `(t as f64, metric, value)`.
+pub fn fold_live_readings(records: &[LiveRecord]) -> (Vec<LiveMinute>, BTreeMap<String, i64>) {
+    let mut seen: BTreeSet<(u64, String, i64)> = BTreeSet::new();
+    let mut buckets: LiveBuckets = BTreeMap::new();
+    let mut dropped: BTreeMap<String, i64> = BTreeMap::new();
+    for (raw_id, readings) in records {
+        for (t, metric, value) in readings {
+            if !LIVE_METRICS.contains(&metric.as_str()) {
+                continue;
+            }
+            // `+ 0.0` folds -0.0 into 0.0 so equal numbers share one key
+            if !seen.insert(((*t + 0.0).to_bits(), metric.clone(), *value)) {
+                continue;
+            }
+            if let Some(reason) = live_sentinel(metric, *value) {
+                *dropped.entry(reason.to_string()).or_insert(0) += 1;
+                continue;
+            }
+            let whole = t.floor() as i64;
+            let minute = whole - whole.rem_euclid(60);
+            buckets.entry((metric.clone(), minute)).or_insert_with(|| (Vec::new(), *raw_id)).0.push(*value);
+        }
+    }
+    let rows = buckets
+        .into_iter()
+        .map(|((metric, minute), (mut values, raw_id))| {
+            values.sort_unstable();
+            let median = values[(values.len() - 1) / 2];
+            (metric, minute, median, raw_id)
+        })
+        .collect();
+    (rows, dropped)
+}
+
+/// A stored `json:live` payload as readings, None when it fails decompression, JSON or the 9b validation.
+fn decode_stored_live(blob: &[u8]) -> Option<Vec<(f64, String, i64)>> {
+    let data = crate::sources::inflate(blob)?;
+    let canon::Value::Object(members) = canon::parse(&data).ok()? else { return None };
+    crate::live::decode_live_record(&members).ok()?;
+    let Some((_, canon::Value::Array(items))) = members.iter().find(|(k, _)| k == "readings") else { return None };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let canon::Value::Array(triple) = item else { return None };
+        let (canon::Value::Str(metric), canon::Value::Int(value)) = (triple.get(1)?, triple.get(2)?) else { return None };
+        let t = match triple.first()? {
+            canon::Value::Int(i) => *i as f64,
+            canon::Value::Float(x) => *x,
+            _ => return None,
+        };
+        out.push((t, metric.clone(), *value));
+    }
+    Some(out)
+}
+
+impl Writer<'_> {
+    /// The live fold: rebuild every `live`-scope sample (one per UTC minute and metric, the lower
+    /// median) as a pure function of the stored `json:live` records. Written directly, not through
+    /// the canonical path, so it never widens the sample span. Sentinel drops found in the records
+    /// this run stored are added to `stats.dropped`. Returns the rows written.
+    pub fn derive_live_samples(&mut self) -> rusqlite::Result<i64> {
+        let stored: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, payload FROM raw_records WHERE stream='json:live' \
+                 ORDER BY start_utc, payload_hash, stream, source_key",
+            )?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.collect::<Result<_, _>>()?
+        };
+        let records: Vec<LiveRecord> = stored
+            .iter()
+            .filter_map(|(id, blob)| decode_stored_live(blob).map(|readings| (*id, readings)))
+            .collect();
+        let (rows, _) = fold_live_readings(&records);
+        self.conn.execute_batch("BEGIN")?;
+        let written = (|| -> rusqlite::Result<i64> {
+            self.conn.execute("DELETE FROM metric_samples WHERE source_scope='live'", [])?;
+            let mut insert = self.conn.prepare_cached(
+                "INSERT INTO metric_samples(metric, ts_utc, value, source_scope, device_id, raw_record_id) \
+                 VALUES(?,?,?,'live',NULL,?)",
+            )?;
+            let mut count = 0_i64;
+            for (metric, minute, value, raw_id) in &rows {
+                let Some(moment) = chrono::DateTime::<chrono::Utc>::from_timestamp(*minute, 0) else { continue };
+                insert.execute(params![metric, iso_utc(&moment), *value as f64, raw_id])?;
+                count += 1;
+            }
+            Ok(count)
+        })();
+        match written {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT")?;
+                let own: Vec<LiveRecord> =
+                    records.into_iter().filter(|(id, _)| self.live_run_ids.contains(id)).collect();
+                for (reason, count) in fold_live_readings(&own).1 {
+                    *self.stats.dropped.entry(reason).or_insert(0) += count;
+                }
+                Ok(count)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 }
 

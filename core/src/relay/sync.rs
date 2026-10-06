@@ -899,6 +899,7 @@ fn apply_pending(
     sources::rederive_json(conn, writer, &touched)?;
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
+    writer.derive_live_samples()?;
     if !reparse_streams.is_empty() {
         let streams: Vec<String> = reparse_streams.into_iter().collect();
         sources::reparse_all(conn, Some(&streams), false)?;

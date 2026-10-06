@@ -264,6 +264,15 @@ fn contract_dict(_server: &Server, _args: &[Arg]) -> Outcome {
         item
     });
     out.set("streams_for", Json::Array(streams.collect()));
+    out.set("session_streams", strings(&contract.session_streams));
+    let sessions = contract.session_streams_for.iter().map(|entry| {
+        let mut item = Json::dict();
+        item.set("metric", Json::text(&entry.metric));
+        item.set("source_scope", Json::text(&entry.source_scope));
+        item.set("streams", strings(&entry.streams));
+        item
+    });
+    out.set("session_streams_for", Json::Array(sessions.collect()));
     out.set("sparse_metrics", strings(&sparse));
     out.set("metrics", metrics(&contract.metrics));
     out.set("labels", metrics(&contract.labels));

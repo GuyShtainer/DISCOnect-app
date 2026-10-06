@@ -87,7 +87,7 @@ fn app_info_names_the_product_the_notice_and_this_core() {
     );
     assert_eq!(info["encrypted"], false);
     assert_eq!(info["db"], db.to_string_lossy().as_ref());
-    assert_eq!(info["contract"], 1);
+    assert_eq!(info["contract"], 2);
     assert_eq!(info["schema"], store::SCHEMA_VERSION);
     assert!(
         info["core"]

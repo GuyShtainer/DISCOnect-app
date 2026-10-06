@@ -369,14 +369,18 @@ pub fn import_path(
             .and_then(|()| export::import_connect_export(path, &mut writer, reborrow(&mut progress)))
             .and_then(|()| {
                 let stored = stored_json_streams(conn)?;
-                rederive_json(conn, &mut writer, &stored)
+                rederive_json(conn, &mut writer, &stored)?;
+                writer.derive_live_samples()?;
+                Ok(())
             })
     } else {
         iter_live_files(path).and_then(|live_files| {
             let single_live_file = path.is_file() && !live_files.is_empty();
             import_live_batch(live_files, &mut writer, reborrow(&mut progress))?;
             let fit_files = if single_live_file { Vec::new() } else { iter_fit_files(path)? };
-            import_batch(&fit_files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
+            import_batch(&fit_files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)?;
+            writer.derive_live_samples()?;
+            Ok(())
         })
     };
     if let Err(error) = outcome {
@@ -874,6 +878,7 @@ fn reparse_body(
     }
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
+    writer.derive_live_samples()?;
     Ok(None)
 }
 
