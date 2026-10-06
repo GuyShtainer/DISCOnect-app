@@ -14,8 +14,9 @@
 //! the app's own environment: `HOME`, `DISCONECT_DB`/`DISCONECT_KEYS` (path resolution), and the
 //! test switches `DISCONECT_NOW` and `DISCONECT_KEYCHAIN`, which the sidecar's allowlist strips.
 //! Release builds default to the sidecar for that reason (and for the keychain binding, see the
-//! README), and a release desktop app run with `--core inproc` refuses to start while either
-//! switch is set (`sidecar::inproc_env_refusal`, called from `start_core`; Bet 12 review F2).
+//! README), and a release app run in-process (the desktop with `--core inproc`, or a phone) refuses to start while
+//! either switch is set; a phone release refuses `DISCONECT_KEYS` and `DISCONECT_DB` too
+//! (`sidecar::inproc_env_refusal`, called from `start_core`; Bet 12 review F2, 12-D).
 //!
 //! The database path is always passed in: the app resolves it (`home::resolve_default_db` on the
 //! desktop, `app_data_dir()` on a phone); the core is never left to look at `$HOME` itself.

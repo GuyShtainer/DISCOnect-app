@@ -571,22 +571,23 @@ pub fn plan(choice: Option<CoreChoice>, debug_build: bool, desktop: bool, env_co
     }
 }
 
-/// The test switches the core reads from its own environment (`DISCONECT_NOW` pins the clock,
-/// `DISCONECT_KEYCHAIN` redirects or disables the keychain). The sidecar's environment allowlist
-/// strips them; an in-process core would see the app's own.
-pub const INPROC_TEST_SWITCHES: [&str; 2] = ["DISCONECT_NOW", "DISCONECT_KEYCHAIN"];
+/// The switches the core reads from its own environment (`DISCONECT_NOW` pins the clock, `DISCONECT_KEYCHAIN`
+/// redirects or disables the keychain, `DISCONECT_KEYS` and `DISCONECT_DB` move the key file and the store). The
+/// sidecar's environment allowlist strips the first two; an in-process core would see the app's own.
+pub const INPROC_TEST_SWITCHES: [&str; 4] = ["DISCONECT_NOW", "DISCONECT_KEYCHAIN", "DISCONECT_KEYS", "DISCONECT_DB"];
 
-/// Whether the in-process core must refuse to start because a test switch is set: only in a
-/// **release** build on the **desktop**, where a user's shell can set them and `--core inproc` is
-/// an explicit choice. A debug build is the developer's own; a phone's environment cannot be set by
-/// a user shell, so in-process stays allowed there. The answer names the variable, never its value.
+/// Whether the in-process core must refuse to start because of the environment, in a **release** build (a debug
+/// build is the developer's own). `DISCONECT_NOW` and `DISCONECT_KEYCHAIN` are refused in every release, desktop or
+/// phone (12-D: a phone release honours no test switch). `DISCONECT_KEYS` and `DISCONECT_DB` are refused in a
+/// release only on a phone (`!desktop`), whose paths come from `app_data_dir()` alone; on the desktop they are
+/// legitimate path settings (the sidecar's allowlist passes them). The answer names the variable, never its value.
 /// Pure: the environment arrives through `getter` (`remove_var` is never used).
 pub fn inproc_env_refusal(
     debug_build: bool,
     desktop: bool,
     getter: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<&'static str> {
-    if debug_build || !desktop {
+    if debug_build {
         return None;
     }
     if getter(INPROC_TEST_SWITCHES[0]).is_some() {
@@ -594,6 +595,15 @@ pub fn inproc_env_refusal(
     }
     if getter(INPROC_TEST_SWITCHES[1]).is_some() {
         return Some("DISCONECT_KEYCHAIN is set; a release app will not run the in-process core with a test switch (unset it, or use the bundled core)");
+    }
+    if desktop {
+        return None;
+    }
+    if getter(INPROC_TEST_SWITCHES[2]).is_some() {
+        return Some("DISCONECT_KEYS is set; a phone release takes its key file path from the app's own data folder only (unset it)");
+    }
+    if getter(INPROC_TEST_SWITCHES[3]).is_some() {
+        return Some("DISCONECT_DB is set; a phone release takes its store path from the app's own data folder only (unset it)");
     }
     None
 }
@@ -785,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn the_in_process_core_refuses_test_switches_only_in_a_release_desktop_build() {
+    fn the_in_process_core_refuses_test_switches_in_every_release_and_path_overrides_only_on_a_phone() {
         use std::ffi::OsString;
         let env = |set: &'static [&'static str]| {
             move |name: &str| set.contains(&name).then(|| OsString::from("secret-value-xyz"))
@@ -794,12 +804,21 @@ mod tests {
             (true, true, &["DISCONECT_NOW"][..], false),
             (true, true, &["DISCONECT_KEYCHAIN"][..], false),
             (true, false, &["DISCONECT_NOW"][..], false),
-            (false, false, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN"][..], false),
+            (true, false, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN", "DISCONECT_KEYS", "DISCONECT_DB"][..], false),
             (false, true, &[][..], false),
             (false, true, &["DISCONECT_NOW"][..], true),
             (false, true, &["DISCONECT_KEYCHAIN"][..], true),
             (false, true, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN"][..], true),
             (false, true, &["DISCONECT_CORE", "DISCONECT_DB"][..], false),
+            (false, true, &["DISCONECT_KEYS"][..], false),
+            // a phone release: every one of the four is refused, nothing else is
+            (false, false, &[][..], false),
+            (false, false, &["DISCONECT_CORE"][..], false),
+            (false, false, &["DISCONECT_NOW"][..], true),
+            (false, false, &["DISCONECT_KEYCHAIN"][..], true),
+            (false, false, &["DISCONECT_KEYS"][..], true),
+            (false, false, &["DISCONECT_DB"][..], true),
+            (false, false, &["DISCONECT_NOW", "DISCONECT_KEYCHAIN", "DISCONECT_KEYS", "DISCONECT_DB"][..], true),
         ] {
             let answer = inproc_env_refusal(debug, desktop, env(set));
             assert_eq!(answer.is_some(), refused, "debug={debug} desktop={desktop} set={set:?}");
@@ -807,6 +826,12 @@ mod tests {
                 assert!(set.iter().any(|name| text.starts_with(name)), "names the variable: {text}");
                 assert!(!text.contains("secret-value-xyz"), "never the value: {text}");
             }
+        }
+        // each of the four, alone, is named in its own answer
+        for name in INPROC_TEST_SWITCHES {
+            let text = inproc_env_refusal(false, false, |n| (n == name).then(|| OsString::from("secret-value-xyz")))
+                .expect("refused on a phone release");
+            assert!(text.starts_with(name), "{text}");
         }
     }
 
