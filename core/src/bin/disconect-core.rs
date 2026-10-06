@@ -366,6 +366,7 @@ fn pull_json(result: &PullResult) -> Value {
         "conflicts": result.conflicts,
         "ranges_new": result.ranges_new,
         "records_repaired": result.records_repaired,
+        "records_kept": result.records_kept,
         "gaps": gaps_json(&result.gaps),
         "status": result.status,
     })
@@ -442,7 +443,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                 args.json,
                 pull_json(&result),
                 format!(
-                    "pulled {} bundle(s): {} new, {} duplicate, {} invalid, {} conflict(s), {} new range(s); rejected {}; gaps {}; repaired {}",
+                    "pulled {} bundle(s): {} new, {} duplicate, {} invalid, {} conflict(s), {} new range(s); rejected {}; gaps {}; repaired {}; kept for a later decoder {}",
                     result.applied.len(),
                     result.records_new,
                     result.records_duplicate,
@@ -451,7 +452,8 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                     result.ranges_new,
                     result.rejected.len(),
                     result.gaps.len(),
-                    result.records_repaired
+                    result.records_repaired,
+                    result.records_kept
                 ),
             );
             if result.status == "ok" { Ok(()) } else { Err((1, String::new())) }

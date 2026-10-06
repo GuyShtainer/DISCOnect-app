@@ -244,7 +244,7 @@ fn a_folder_relay_pushes_then_pulls_with_events_and_counts_only() {
         json!({
             "push": {"bundles": 1, "records": 2, "ranges": 0},
             "pull": {"applied": 0, "rejected": 0, "records_new": 0, "records_duplicate": 0,
-                     "records_invalid": 0, "conflicts": 0, "ranges_new": 0, "records_repaired": 0, "gaps": 0, "status": "ok"}
+                     "records_invalid": 0, "conflicts": 0, "ranges_new": 0, "records_repaired": 0, "records_kept": 0, "gaps": 0, "status": "ok"}
         })
     );
     let status = rig_a.send(11, "sync.status", json!({}));

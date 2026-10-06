@@ -645,7 +645,7 @@ fn the_binary_serves_and_syncs_over_lan_with_a_remembered_address() {
     );
     assert_eq!(
         text(&pulled).trim(),
-        "pulled 1 bundle(s): 2 new, 0 duplicate, 0 invalid, 0 conflict(s), 0 new range(s); rejected 0; gaps 0; repaired 0"
+        "pulled 1 bundle(s): 2 new, 0 duplicate, 0 invalid, 0 conflict(s), 0 new range(s); rejected 0; gaps 0; repaired 0; kept for a later decoder 0"
     );
     // the object sits in the served folder, which is a plain folder relay for anyone else
     let account = account_for(master());

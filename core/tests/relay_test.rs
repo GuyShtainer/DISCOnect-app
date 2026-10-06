@@ -1160,8 +1160,103 @@ fn bytes_that_fail_their_hashes_or_decode_to_nothing_are_counted_invalid() {
     );
     let r = pull(&b, &relay);
     assert_eq!(r.applied, vec![name]);
-    assert_eq!((r.records_new, r.records_invalid), (1, 7));
-    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_records"), 1);
+    // `json:unknown` has no decoder on this build: its bytes are kept, not counted invalid
+    assert_eq!((r.records_new, r.records_invalid, r.records_kept), (1, 6, 1));
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_records"), 2);
+    assert_eq!(
+        count(b.conn(), "SELECT count(*) FROM import_failures WHERE stream='json:unknown'"),
+        1
+    );
+}
+
+/// Simulate a newer build on this device: its records travel under a stream this build does not know.
+fn relabel(device: &Device, old: &str, new: &str) {
+    device
+        .conn()
+        .execute("UPDATE raw_records SET stream=? WHERE stream=?", rusqlite::params![new, old])
+        .expect("relabel");
+}
+
+#[test]
+fn a_record_of_a_stream_this_build_cannot_decode_is_kept_for_a_later_decoder() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    import(&a, &export_with_uds(tmp.path(), "x", &uds("2025-06-15", 4000, "2025-06-15T12:00:00.0")));
+    relabel(&a, "json:uds", "json:future");
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    let r = pull(&b, &relay);
+    assert_eq!((r.records_new, r.records_invalid, r.records_kept, r.status), (0, 0, 1, "ok"));
+    #[allow(clippy::type_complexity)]
+    let row: (i64, String, String, String, String, String, Option<String>, Option<String>, String) = b
+        .conn()
+        .query_row(
+            "SELECT id, stream, source_key, payload_hash, source_scope, transport, start_utc, end_utc, \
+             decode_summary FROM raw_records",
+            [],
+            |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
+            },
+        )
+        .expect("the kept row");
+    assert_eq!((row.1.as_str(), row.2.as_str()), ("json:future", "2025-06-15"));
+    assert_eq!((row.4.as_str(), row.5.as_str()), ("vendor_cloud", "connect_export"));
+    assert!(row.6.is_some() && row.7.is_some(), "the sender's span travels with the bytes");
+    assert_eq!(row.8, r#"{"kept": "no_decoder"}"#);
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM daily_metrics"), 0, "nothing derived from bytes nobody decoded");
+    let failure: (i64, String, String, String) = b
+        .conn()
+        .query_row("SELECT raw_record_id, stream, kind, payload_hash FROM import_failures", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .expect("failure row");
+    assert_eq!(failure, (row.0, "json:future".to_string(), "unrecognized_payload".to_string(), row.3.clone()));
+    let direction: String = b
+        .conn()
+        .query_row("SELECT direction FROM relay_seen WHERE raw_record_id=?", [row.0], |r| r.get(0))
+        .expect("relay_seen");
+    assert_eq!(direction, "pulled");
+    assert!(push(&b, &relay).bundles.is_empty(), "a pulled record is never pushed back, kept or not");
+    assert_eq!(pull(&b, &relay).records_kept, 0, "idempotent: the bundle is applied once");
+    // a replay on this build leaves the record waiting and the ledger entry in place; it is not a failed run
+    let stats = sources::reparse_all(b.conn(), None, false).expect("reparse");
+    assert_eq!(stats.files_failed, 0);
+    assert!(stats.failures.is_empty());
+    assert_eq!(
+        stats.warnings,
+        vec!["records of json:future wait for a decoder this build lacks".to_string()]
+    );
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM import_failures"), 1);
+    // an export import passes every stored JSON stream to the re-derive: the kept row must not abort it
+    import(&b, &export_with_uds(tmp.path(), "y", &uds("2025-06-16", 5, "2025-06-16T12:00:00.0")));
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_records WHERE stream='json:future'"), 1);
+}
+
+#[test]
+fn two_versions_of_an_undecodable_record_converge_by_hash_in_both_orders() {
+    let early = uds("2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let late = uds("2025-06-15", 8000, "2025-06-15T23:00:00.0");
+    let mut kept = Vec::new();
+    for (first, second) in [(&early, &late), (&late, &early)] {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (a, b, c) = (device(), device(), device());
+        import(&a, &export_with_uds(tmp.path(), "x", first));
+        import(&b, &export_with_uds(tmp.path(), "y", second));
+        relabel(&a, "json:uds", "json:future");
+        relabel(&b, "json:uds", "json:future");
+        let relay = relay_in(tmp.path());
+        push(&a, &relay);
+        push(&b, &relay);
+        let rc = pull(&c, &relay);
+        assert!(rc.conflicts == 1 && rc.records_kept >= 1, "a winner that replaced the stored loser counts as kept too");
+        assert_eq!(count(c.conn(), "SELECT count(*) FROM raw_records"), 1);
+        assert_eq!(count(c.conn(), "SELECT count(*) FROM raw_superseded"), 1, "the loser's bytes are kept too");
+        assert_eq!(count(c.conn(), "SELECT count(*) FROM sync_conflicts WHERE rule='payload_hash'"), 1);
+        assert_eq!(count(c.conn(), "SELECT count(*) FROM sync_conflicts"), 1);
+        assert_eq!(count(c.conn(), "SELECT count(*) FROM import_failures"), 1, "one trail for the record that stayed");
+        kept.push(keys_of(&c));
+    }
+    assert_eq!(kept[0], kept[1], "without a decoder neither side has a time, so the hash decides on every device");
 }
 
 #[test]

@@ -33,6 +33,10 @@ pub enum WriterError {
     Db(#[from] rusqlite::Error),
     #[error("{0}")]
     Compress(String),
+    /// A span stamp that is not the store's shape: `parse_iso_utc` raises `ValueError` in the
+    /// oracle's `keep_undecodable_record`, outside any handler, so the pull aborts.
+    #[error("{0}")]
+    BadStamp(String),
 }
 
 /// Writes that must share the transaction of one record's write (the relay retires a conflict's
@@ -46,6 +50,8 @@ pub enum WriteOutcome {
     Failed,
     /// `rewrite_canonical` replaced a raw record's canonical rows.
     Reparsed,
+    /// Bytes retained for a decoder this build lacks; no canonical rows.
+    Kept,
 }
 
 // ---- Python-faithful numerics ----
@@ -349,6 +355,14 @@ type IntervalRow = (String, String, Option<i64>, Option<f64>, i64);
 type TypeMax = (String, Option<i64>, Option<f64>);
 
 /// What `store_raw` needs besides the decoded facts.
+/// The sender's own fields of a relayed record (`row` of `keep_undecodable_record`).
+pub struct KeptRow<'a> {
+    pub source_scope: &'a str,
+    pub device_id: Option<&'a str>,
+    pub start_utc: Option<&'a str>,
+    pub end_utc: Option<&'a str>,
+}
+
 struct RawInput<'a> {
     stream: &'a str,
     source_key: &'a str,
@@ -932,6 +946,101 @@ impl<'c> Writer<'c> {
                 self.account(decoded, written);
                 Ok(WriteOutcome::Imported)
             }
+            Ok(None) => {
+                self.stats.files_duplicate += 1;
+                Ok(WriteOutcome::Duplicate)
+            }
+            Err(error) => {
+                self.storage_failure(stream, label, &error)?;
+                Ok(WriteOutcome::Failed)
+            }
+        }
+    }
+
+    /// `keep_undecodable_record`: retain the bytes of a relayed JSON record whose stream this
+    /// build has no decoder for. A peer on a newer build may publish a stream this one does not
+    /// know yet; dropping the record would lose it for good (a pulled record is never pushed
+    /// back), so the bytes are stored as a `raw_records` row with the sender's own scope, device
+    /// and span (`row`), no canonical rows, and an `import_failures` row carrying the kind and
+    /// message `decode_raw` gives such a record -- the trail `reparse` leaves until a decoder
+    /// arrives and replays the bytes. Same transaction shape as [`Writer::write_json_record_with`]
+    /// (`before_write` is the relay's conflict hook). Returns `Kept`, `Duplicate` or `Failed`
+    /// (a storage error). A span stamp that is not the store's shape is `BadStamp` (the oracle's
+    /// uncaught `ValueError`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn keep_undecodable_record(
+        &mut self,
+        stream: &str,
+        source_key: &str,
+        row: &KeptRow<'_>,
+        data: &[u8],
+        label: &str,
+        origin: Option<(&str, &str)>,
+        before_write: Option<BeforeWrite<'_>>,
+    ) -> Result<WriteOutcome, WriterError> {
+        self.stats.files_seen += 1;
+        let duplicate = before_write.is_none()
+            && self
+                .conn
+                .prepare_cached("SELECT 1 FROM raw_records WHERE stream=? AND source_key=?")?
+                .exists(params![stream, source_key])?;
+        if duplicate {
+            self.stats.files_duplicate += 1;
+            return Ok(WriteOutcome::Duplicate);
+        }
+        let stamp = |text: Option<&str>| -> Result<Option<Instant>, WriterError> {
+            match text.filter(|t| !t.is_empty()) {
+                None => Ok(None),
+                Some(t) => parse_iso_utc(t).map(Some).ok_or_else(|| {
+                    WriterError::BadStamp(format!("time data {t:?} does not match format '%Y-%m-%dT%H:%M:%SZ'"))
+                }),
+            }
+        };
+        let mut shell = Decoded::new(stream, if row.source_scope.is_empty() { "vendor_cloud" } else { row.source_scope });
+        shell.device_id = row.device_id.map(str::to_string);
+        shell.start_utc = stamp(row.start_utc)?;
+        shell.end_utc = stamp(row.end_utc)?;
+        let payload_hash = sha256_hex(data);
+        let packed = compress_verified(data)?;
+        let summary = canon::dumps_spaced(&canon::Value::Object(vec![(
+            "kept".to_string(),
+            canon::Value::Str("no_decoder".to_string()),
+        )]));
+        let raw = RawInput {
+            stream,
+            source_key,
+            kind: "json",
+            packed: &packed,
+            payload_hash: &payload_hash,
+            data_len: data.len(),
+            summary: &summary,
+            origin,
+        };
+        let stored = (|| -> rusqlite::Result<Option<i64>> {
+            self.conn.execute_batch("BEGIN")?;
+            if let Some(hook) = before_write {
+                hook(self)?;
+            }
+            let Some(raw_id) = self.store_raw(&shell, &raw)? else {
+                self.conn.execute_batch("ROLLBACK")?;
+                return Ok(None);
+            };
+            self.record_parse_failure(
+                stream,
+                label,
+                "unrecognized_payload",
+                &format!("no reparse decoder registered for stream '{stream}'"),
+                None,
+                None,
+                Some(raw_id),
+                Some(&payload_hash),
+                true,
+            )?;
+            self.conn.execute_batch("COMMIT")?;
+            Ok(Some(raw_id))
+        })();
+        match stored {
+            Ok(Some(_)) => Ok(WriteOutcome::Kept),
             Ok(None) => {
                 self.stats.files_duplicate += 1;
                 Ok(WriteOutcome::Duplicate)

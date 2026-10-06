@@ -31,7 +31,7 @@ use crate::fit;
 use crate::model::{Decoded, Instant};
 use crate::sources::{self, SourceError};
 use crate::time::{parse_iso_utc, utc_now_iso};
-use crate::writer::{WriteOutcome, Writer, WriterError};
+use crate::writer::{KeptRow, WriteOutcome, Writer, WriterError};
 
 pub const TRANSPORT_RELAY: &str = "relay";
 /// A bundle is cut once its compressed payloads would pass this many bytes.
@@ -88,6 +88,8 @@ pub struct PullResult {
     pub ranges_new: i64,
     /// Stored copies whose bytes no longer matched their hash, refetched from the relay.
     pub records_repaired: i64,
+    /// Bytes of a stream this build has no decoder for, retained for a later reparse.
+    pub records_kept: i64,
     pub gaps: Vec<Gap>,
     pub status: &'static str,
 }
@@ -103,6 +105,7 @@ impl Default for PullResult {
             conflicts: 0,
             ranges_new: 0,
             records_repaired: 0,
+            records_kept: 0,
             gaps: Vec::new(),
             status: "ok",
         }
@@ -300,6 +303,12 @@ fn observed(decoded: &Decoded) -> Option<Instant> {
         .max()
 }
 
+/// `_has_decoder`: this build can decode records of `stream` (a batch stream or a registered
+/// per-record decoder).
+fn has_decoder(stream: &str) -> bool {
+    export::is_batch_stream(stream) || export::has_record_decoder(stream)
+}
+
 /// `_decode_json`: the record and its decoded facts, `None` where the oracle's `ValueError` /
 /// `TypeError` / no-decoder / no-facts paths lead to an invalid record. An exception the oracle
 /// lets escape (a record that is not an object) is `Err(Abort)`.
@@ -419,11 +428,13 @@ pub struct Conflict {
 }
 
 /// Same key, different bytes: who wins. `None` when no stored row differs from the incoming bytes
-/// (no row at all, or the very same bytes): nothing to decide.
+/// (no row at all, or the very same bytes): nothing to decide. `incoming = None` is a record of a
+/// stream this build cannot decode: neither side has a time, so the rule is the hash alone (as for
+/// a batch stream) -- the one rule a device without the decoder can apply.
 pub fn decide_conflict(
     conn: &Connection,
     record: &RawRow,
-    incoming: &Decoded,
+    incoming: Option<&Decoded>,
 ) -> Result<Option<Conflict>, SyncError> {
     let existing: Option<Existing> = conn
         .query_row(
@@ -448,15 +459,16 @@ pub fn decide_conflict(
     if existing.payload_hash == record.payload_hash {
         return Ok(None);
     }
-    let (existing_observed, incoming_observed) = if export::is_batch_stream(&record.stream) {
-        // a batch stream's record carries no time of its own: the protocol's rule is the hash alone
+    let (existing_observed, incoming_observed) = if incoming.is_none() || export::is_batch_stream(&record.stream) {
+        // a batch stream's record carries no time of its own: the protocol's rule is the hash alone;
+        // a stream with no decoder here has no time either
         (None, None)
     } else {
         // an undecodable existing record loses by definition
         let decoded = sources::inflate(&existing.payload)
             .and_then(|data| decode_json(&record.stream, &data, None).ok().flatten())
             .map(|(_record, decoded)| decoded);
-        (decoded.as_ref().and_then(observed), observed(incoming))
+        (decoded.as_ref().and_then(observed), incoming.and_then(observed))
     };
     let (incoming_wins, rule) = if incoming_observed != existing_observed {
         (incoming_observed > existing_observed, "observed_utc")
@@ -763,12 +775,20 @@ fn apply_pending(
             }
         }
         for (record, data) in &jsons {
-            let Some((record_value, facts)) = decode_json(&record.stream, data, Some(record))?
-            else {
-                result.records_invalid += 1;
-                continue;
+            let known = has_decoder(&record.stream);
+            // a stream a newer build published: the bytes are kept (no canonical rows) for the day
+            // a decoder arrives -- dropping them would lose them for good
+            let decoded = if known {
+                let Some(pair) = decode_json(&record.stream, data, Some(record))? else {
+                    result.records_invalid += 1;
+                    continue;
+                };
+                Some(pair)
+            } else {
+                None
             };
-            let conflict = decide_conflict(conn, record, &facts)?;
+            let facts = decoded.as_ref().map(|(_value, facts)| facts);
+            let conflict = decide_conflict(conn, record, facts)?;
             if let Some(conflict) = conflict.as_ref().filter(|c| !c.incoming_wins) {
                 // a reapplied bundle decided this record already
                 if !conflict_recorded(conn, name, record)? {
@@ -795,31 +815,43 @@ fn apply_pending(
                 }
             }
             let before = writer.last_raw_id()?;
-            let outcome = match conflict.as_ref() {
+            let hook;
+            let before_write: Option<crate::writer::BeforeWrite<'_>> = match conflict.as_ref() {
                 Some(conflict) => {
-                    let hook = |w: &Writer<'_>| retire_loser(conn, w, record, conflict, name);
-                    writer.write_json_record_with(
-                        &record.stream,
-                        &record.source_key,
-                        &record_value,
-                        &facts,
-                        &label,
-                        Some((&record.transport, &record.imported_at)),
-                        Some(&hook),
-                    )?
+                    hook = |w: &Writer<'_>| retire_loser(conn, w, record, conflict, name);
+                    Some(&hook)
                 }
-                None => writer.write_json_record(
+                None => None,
+            };
+            let origin = Some((record.transport.as_str(), record.imported_at.as_str()));
+            let outcome = match &decoded {
+                Some((record_value, facts)) => writer.write_json_record_with(
                     &record.stream,
                     &record.source_key,
-                    &record_value,
-                    &facts,
+                    record_value,
+                    facts,
                     &label,
-                    Some((&record.transport, &record.imported_at)),
+                    origin,
+                    before_write,
+                )?,
+                None => writer.keep_undecodable_record(
+                    &record.stream,
+                    &record.source_key,
+                    &KeptRow {
+                        source_scope: &record.source_scope,
+                        device_id: record.device_id.as_deref(),
+                        start_utc: record.start_utc.as_deref(),
+                        end_utc: record.end_utc.as_deref(),
+                    },
+                    data,
+                    &label,
+                    origin,
+                    before_write,
                 )?,
             };
             let storage_failure =
                 outcome == WriteOutcome::Failed && writer.last_failure_is_storage();
-            if storage_failure || (conflict.is_some() && outcome != WriteOutcome::Imported) {
+            if storage_failure || (conflict.is_some() && !matches!(outcome, WriteOutcome::Imported | WriteOutcome::Kept)) {
                 return Err(SyncError::WriteFailed(format!(
                     "{} record not stored ({outcome:?}); nothing it wrote is kept",
                     record.stream
@@ -902,8 +934,12 @@ fn mark(
     result: &mut PullResult,
 ) -> Result<(), SyncError> {
     match outcome {
-        WriteOutcome::Imported => {
-            result.records_new += 1;
+        WriteOutcome::Imported | WriteOutcome::Kept => {
+            if outcome == WriteOutcome::Imported {
+                result.records_new += 1;
+            } else {
+                result.records_kept += 1;
+            }
             let ids: Vec<i64> = {
                 let mut stmt = conn.prepare("SELECT id FROM raw_records WHERE id > ?")?;
                 let mapped = stmt.query_map(params![before], |r| r.get(0))?;

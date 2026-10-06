@@ -147,6 +147,7 @@ fn source_parts(error: &SourceError) -> (&'static str, String) {
         SourceError::Writer(crate::writer::WriterError::Compress(_)) => {
             ("internal", "unexpected error".into())
         }
+        SourceError::Writer(crate::writer::WriterError::BadStamp(message)) => ("bad_params", message.clone()),
         SourceError::Abort(text) => {
             let (class, message) = text.split_once(": ").unwrap_or((text.as_str(), ""));
             match class {
@@ -172,6 +173,7 @@ fn sync_parts(error: &SyncError) -> (&'static str, String) {
         SyncError::Writer(crate::writer::WriterError::Compress(_)) => {
             ("internal", "unexpected error".into())
         }
+        SyncError::Writer(crate::writer::WriterError::BadStamp(message)) => ("bad_params", message.clone()),
         SyncError::Source(inner) => source_parts(inner),
         SyncError::Bundle(_) => ("internal", "unexpected ValueError".into()),
         SyncError::Relay(inner) => relay_parts(inner),
@@ -1025,6 +1027,7 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         "conflicts": pulled.conflicts,
         "ranges_new": pulled.ranges_new,
         "records_repaired": pulled.records_repaired,
+        "records_kept": pulled.records_kept,
         "gaps": pulled.gaps.len(),
         "status": pulled.status,
     });

@@ -5,7 +5,7 @@
 //! Two passes over the FIT bytes: first collect every UTC offset the files state, so local dates
 //! resolve consistently regardless of file order; then decode and write.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -320,6 +320,7 @@ fn outcome_text(outcome: WriteOutcome) -> &'static str {
         WriteOutcome::Duplicate => "duplicate",
         WriteOutcome::Failed => "failed",
         WriteOutcome::Reparsed => "reparsed",
+        WriteOutcome::Kept => "kept",
     }
 }
 
@@ -818,6 +819,12 @@ pub fn reparse_all(conn: &Connection, streams: Option<&[String]>, force: bool) -
     }
 }
 
+/// `_decodable_stream`: a stream `reparse` can replay on this build: FIT, a batch stream, or one
+/// with a record decoder.
+fn decodable_stream(stream: &str) -> bool {
+    stream.starts_with("fit:") || export::is_batch_stream(stream) || export::has_record_decoder(stream)
+}
+
 /// The body of `reparse_all`; `Ok(Some(message))` is the dry run refusing to touch anything.
 fn reparse_body(
     conn: &Connection,
@@ -825,7 +832,16 @@ fn reparse_body(
     streams: Option<&[String]>,
     force: bool,
 ) -> Result<Option<String>, SourceError> {
-    let rows = raw_ids_by_stream(conn, streams)?;
+    let mut rows = raw_ids_by_stream(conn, streams)?;
+    let waiting: BTreeSet<&str> =
+        rows.iter().map(|(_, s)| s.as_str()).filter(|s| !decodable_stream(s)).collect();
+    if !waiting.is_empty() {
+        // relayed bytes of a stream this build has no decoder for (relay `records_kept`): not a
+        // broken decoder, so they neither block the replay nor lose their `import_failures` trail
+        let names = waiting.into_iter().collect::<Vec<_>>().join(", ");
+        rows.retain(|(_, s)| decodable_stream(s));
+        writer.stats.warnings.push(format!("records of {names} wait for a decoder this build lacks"));
+    }
     writer.stats.files_seen = rows.len() as i64;
     let failures = dry_run(conn, &rows)?;
     if !failures.is_empty() && !force {
