@@ -204,7 +204,7 @@ mod backend {
 mod backend {
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use security_framework::base::Error;
-    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
+    use security_framework::item::{CloudSync, ItemClass, ItemSearchOptions, Limit, SearchResult};
     use security_framework::passwords::{
         PasswordOptions, delete_generic_password, generic_password, set_generic_password_options,
     };
@@ -283,6 +283,32 @@ mod backend {
         }
     }
 
+    /// The class (`pdmn`) of the item and whether it is synchronizable, from attribute-only searches
+    /// (no data is loaded, so nothing secret is read). `None` = there is no such item.
+    pub fn class_of(service: &str, account: &str) -> Result<Option<(String, bool)>, Error> {
+        let search = |sync: CloudSync| {
+            let mut options = ItemSearchOptions::new();
+            options
+                .class(ItemClass::generic_password())
+                .service(service)
+                .account(account)
+                .cloud_sync(sync)
+                .load_attributes(true)
+                .limit(Limit::Max(1));
+            match options.search() {
+                Ok(results) => Ok(results),
+                Err(e) if e.code() == NOT_FOUND => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        };
+        let any = search(CloudSync::MatchSyncAny)?;
+        let Some(mut attrs) = any.iter().find_map(SearchResult::simplify_dict) else {
+            return Ok(None);
+        };
+        let synchronizable = !search(CloudSync::MatchSyncYes)?.is_empty();
+        Ok(Some((attrs.remove("pdmn").unwrap_or_default(), synchronizable)))
+    }
+
     pub fn error_text(error: &Error) -> String {
         if error.code() == MISSING_ENTITLEMENT {
             return "OSStatus -34018: the keychain needs an app's entitlements (this process is not an app)"
@@ -307,6 +333,17 @@ pub(crate) fn delete_account(service: &str, account: &str) -> Result<bool, Keych
         return Err(KeychainError::NoBackend);
     }
     backend::remove(service, account).map_err(|e| KeychainError::Backend(backend::error_text(&e)))
+}
+
+/// iOS only, for the evidence door: the class (`pdmn`, e.g. `aku` = when unlocked, this device only) and the
+/// synchronizable flag of the master key's item for `key_id`; `None` when there is no such item. Attributes
+/// only: neither the account nor the secret is returned.
+#[cfg(target_os = "ios")]
+pub fn item_class(key_id: &[u8; 16]) -> Result<Option<(String, bool)>, KeychainError> {
+    if disabled() {
+        return Err(KeychainError::NoBackend);
+    }
+    backend::class_of(SERVICE, &account(key_id)).map_err(|e| KeychainError::Backend(backend::error_text(&e)))
 }
 
 fn quiet_read(service: &str, key_id: &[u8; 16]) -> Quiet {
