@@ -471,7 +471,10 @@ async fn data_contract_lists_the_trend_metrics_and_marks_heart_rate_a_sample() {
     let core = Sidecar::start_inproc(db, collect()).expect("in-process core");
     let c = core.call("data.contract", json!({})).await.expect("data.contract");
     let metrics = c["metrics"].as_array().expect("metrics");
-    assert!(metrics.len() >= 10, "{} metrics", metrics.len());
+    // the contract's numeric metrics with a declared scope (Python data_contract: 62, heart_rate first, sweat_loss_ml last)
+    assert_eq!(metrics.len(), 62, "{} metrics", metrics.len());
+    assert_eq!(metrics[0]["metric"], "heart_rate");
+    assert_eq!(metrics[61]["metric"], "sweat_loss_ml");
     let hr = metrics.iter().find(|m| m["metric"] == "heart_rate").expect("heart_rate");
     assert_eq!(hr["cadence"], "sample");
     core.shutdown();

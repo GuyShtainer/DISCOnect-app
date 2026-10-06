@@ -4,7 +4,7 @@
 import * as core from "./core";
 import qrcode from "qrcode-generator";
 import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord } from "./identity";
-import { disposeCharts, drawTrend, type Series } from "./charts";
+import { disposeCharts, drawTrend, hatchedDays, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
 type AppInfo = { product: string; core: string; db: string; encrypted: boolean };
@@ -1103,22 +1103,26 @@ let trendMetric = "";
 let trendDays = 90;
 
 async function screenTrend(out: ParentNode, later: Later): Promise<void> {
+  let failure: { code?: string } | null = null;
   if (trendList === null) {
-    const c = await core.call<{ metrics: ContractMetric[] }>("data.contract").catch(() => null);
+    const c = await core.call<{ metrics: ContractMetric[] }>("data.contract").catch((e: { code?: string }) => { failure = e; return null; });
     trendList = c ? c.metrics.filter((m) => m.scopes.length > 0) : null;
   }
   const list = trendList ?? [];
+  if (!list.length) {
+    const asked = trendList !== null; // an empty answer is an answer; a failed read is asked again on the next visit
+    trendList = null;
+    header(out, "Trends", "");
+    out.append(el("p", "caption muted", asked ? "The core answered with no metrics."
+      : (failure as { code?: string } | null)?.code === "core_unavailable" ? "The core is not running."
+        : "The core did not answer with its metric list."));
+    return; // --trend stays unconsumed until a read succeeds
+  }
   if (trendArg !== null) {
     if (list.some((m) => m.metric === trendArg)) trendMetric = trendArg;
     trendArg = null;
   }
   if (!list.some((m) => m.metric === trendMetric)) trendMetric = list[0]?.metric ?? "";
-  if (!list.length) {
-    trendList = null; // a failed read is asked again on the next visit
-    header(out, "Trends", "");
-    out.append(el("p", "caption muted", "The core did not answer with its metric list."));
-    return;
-  }
   const controls = el("div", "row");
   const select = el("select") as HTMLSelectElement;
   for (const { metric: m } of list) {
@@ -1165,21 +1169,23 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
     card.append(el("span", "muted body", "No source has values for this metric in the window."));
     return;
   }
-  // a day is hatched only when every drawn non-live series lacks it: a live session claims no day, so its gaps mean nothing
+  // the band is drawn from the same set the caption counts: hatchedDays is the one definition
   const drawn = series.filter((x) => x.scope !== "live");
-  const gapDays = drawn.length ? drawn[0].days.filter((_d, i) => drawn.every((x) => x.days[i]?.status === "not_covered")).length : 0;
+  const hatched = hatchedDays(series);
   const plural = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
-  const extra = drawn
-    .map((x) => ({ x, n: x.days.filter((d) => d.status === "not_covered").length - gapDays }))
+  const lacks = drawn
+    .map((x) => ({ x, n: x.days.filter((d) => d.value === null && !hatched.has(d.day)).length }))
     .filter((e) => e.n > 0)
-    .map((e, i) => `${i === 0 ? "The" : "the"} ${scopeWord(e.x.scope)} line lacks ${plural(e.n)} more`);
+    .map((e) => `The ${scopeWord(e.x.scope)} line lacks ${hatched.size ? `${e.n} more day${e.n === 1 ? "" : "s"}` : plural(e.n)}.`)
+    .join(" ");
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
   const liveNote = series.some((s) => s.scope === "live") ? ` Diamonds: days with a live-link session, the mean of the minutes the link recorded; a session claims no day, so it draws no band.` : "";
+  const bandWords = hatched.size
+    ? `Hatched bands: ${plural(hatched.size)} no import covered any source. Nothing is drawn there; a line never bridges a gap.`
+    : "Every day in the window was covered by an import of at least one source.";
   card.append(el("span", "caption muted", (!drawn.length
     ? "Only live-link sessions have values for this metric in the window."
-    : gapDays
-      ? `Hatched bands: ${plural(gapDays)} no source was covered by an import.${extra.length ? ` ${extra.join(", ")}.` : ""} Nothing is drawn there; a line never bridges a gap.`
-      : "Every day in the window was covered by an import of at least one source.") + liveNote + ends));
+    : bandWords + (lacks ? ` ${lacks}` : "")) + liveNote + ends));
   later(() => drawTrend(chart, series, trendLabel(trendMetric)));
 }
 
