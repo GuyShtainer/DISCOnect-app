@@ -487,6 +487,7 @@ pub fn data_health_ordered(
                 ("missing_values", Json::text(&conventions.missing_values)),
                 ("sources", Json::text(&conventions.sources)),
                 ("coverage", Json::text(&conventions.coverage)),
+                ("completeness", Json::text(&conventions.completeness)),
             ]),
         ),
     ]))

@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use super::ReadError;
 use super::queries::{iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
+use crate::model::Instant;
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
 use crate::wirejson::Json;
@@ -25,6 +26,13 @@ pub const PRESENT: &str = "present";
 pub const FAILED: &str = "failed";
 pub const SOURCE_EMPTY: &str = "source_empty";
 pub const NOT_COVERED: &str = "not_covered";
+
+/// Two consecutive readings of a per-minute metric at most this many seconds apart span worn time
+/// between them (`WORN_GAP_S`: five minutes bridges a short unmeasurable spell; a charger hour shows as a gap).
+pub const WORN_GAP_S: i64 = 300;
+/// The seconds a reading accounts for on its own (`READING_S`, the per-minute cadence): the last of a
+/// run, or one whose next reading is farther than `WORN_GAP_S`.
+pub const READING_S: i64 = 60;
 
 /// The status window; gap lists, not the window, are what is capped.
 pub const MAX_WINDOW_DAYS: i64 = 3650;
@@ -593,6 +601,163 @@ pub fn ledger_ordered(
         ("refinements", Json::text(refinements)),
         ("refinements_available", Json::flag(analysis.refinements)),
     ]))
+}
+
+// ---- completeness (7b-12): how much of a day a per-minute metric's mean rests on -------------
+
+/// `_day_bounds`: epoch seconds each window day starts at, plus the end of the last one
+/// (`window.days + 1` entries). Local midnight is read under the offset nearest to it; UTC is
+/// assumed where no offset is known.
+fn day_bounds(window: &Window, offsets: &ClockOffsets) -> Result<Vec<i64>, ReadError> {
+    let mut bounds = Vec::with_capacity(window.days + 1);
+    for position in 0..=window.days {
+        let date = shift(window.first, i64::try_from(position).map_err(|_| ReadError::Overflow)?)?;
+        let midnight: Instant = date.and_hms_opt(0, 0, 0).ok_or(ReadError::Overflow)?.and_utc();
+        bounds.push(midnight.timestamp() - offsets.offset_at(midnight).unwrap_or(0));
+    }
+    Ok(bounds)
+}
+
+/// `_add_clipped`: add the seconds of `[start, end)` that fall inside each window day to `seconds`.
+fn add_clipped(start: i64, end: i64, bounds: &[i64], seconds: &mut [i64]) {
+    let mut position = bounds.partition_point(|bound| *bound <= start).saturating_sub(1); // bisect_right - 1, floored at 0
+    let mut start = start.max(bounds[0]);
+    while position < seconds.len() && start < end {
+        let piece_end = end.min(bounds[position + 1]);
+        seconds[position] += piece_end - start;
+        start = piece_end;
+        position += 1;
+    }
+}
+
+/// `_merged`: overlapping or touching spans folded into one each, in time order.
+fn merged(mut spans: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    spans.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// `_covered_seconds`: per window day, the seconds some retained file of `streams` spans (a claimed
+/// window covers whole days).
+fn covered_seconds(
+    conn: &Connection,
+    window: &Window,
+    streams: &BTreeSet<String>,
+    session: &[String],
+    bounds: &[i64],
+    refinements: bool,
+) -> Result<Vec<i64>, ReadError> {
+    let mut spans = Vec::new();
+    let mut statement = conn.prepare("SELECT start_utc, end_utc FROM raw_records WHERE stream=?")?;
+    for stream in streams {
+        if session.iter().any(|s| s == stream) {
+            continue; // a session claims no day
+        }
+        let mut rows = statement.query([stream])?;
+        while let Some(row) = rows.next()? {
+            if let (Some(start), Some(end)) = (optional_text(row.get_ref(0)?)?, optional_text(row.get_ref(1)?)?)
+                && !start.is_empty()
+                && !end.is_empty()
+            {
+                spans.push((parse_moment(start)?.timestamp(), parse_moment(end)?.timestamp()));
+            }
+        }
+    }
+    let mut seconds = vec![0; window.days];
+    for (start, end) in merged(spans) {
+        add_clipped(start, end, bounds, &mut seconds);
+    }
+    if refinements {
+        let mut claimed = vec![false; window.days];
+        let mut statement = conn.prepare("SELECT from_day, to_day FROM export_ranges WHERE stream=?")?;
+        for stream in streams {
+            let mut rows = statement.query([stream])?;
+            while let Some(row) = rows.next()? {
+                window.mark(&mut claimed, text(row.get_ref(0)?)?, text(row.get_ref(1)?)?)?;
+            }
+        }
+        for (position, flag) in claimed.into_iter().enumerate() {
+            if flag {
+                seconds[position] = bounds[position + 1] - bounds[position];
+            }
+        }
+    }
+    Ok(seconds)
+}
+
+/// `_worn_seconds`: per window day, the seconds a reading accounts for: its own minute, and the gap to
+/// the next reading when that is at most `WORN_GAP_S`.
+fn worn_seconds(
+    conn: &Connection,
+    metric: &str,
+    scope: &str,
+    window: &Window,
+    bounds: &[i64],
+) -> Result<Vec<i64>, ReadError> {
+    let low = iso(shift(window.first, -1)?);
+    let high = iso(shift(window.last, 2)?);
+    let mut seconds = vec![0; window.days];
+    let mut previous: Option<i64> = None;
+    let mut statement = conn.prepare(
+        "SELECT ts_utc FROM metric_samples WHERE metric=? AND source_scope=? AND ts_utc >= ? AND ts_utc < ? \
+         ORDER BY ts_utc",
+    )?;
+    let mut rows = statement.query(rusqlite::params![metric, scope, low, high])?;
+    while let Some(row) = rows.next()? {
+        let moment = parse_moment(text(row.get_ref(0)?)?)?.timestamp();
+        if let Some(earlier) = previous {
+            let end = if moment - earlier <= WORN_GAP_S { moment } else { earlier + READING_S };
+            add_clipped(earlier, end, bounds, &mut seconds);
+        }
+        previous = Some(moment);
+    }
+    if let Some(earlier) = previous {
+        add_clipped(earlier, earlier + READING_S, bounds, &mut seconds);
+    }
+    Ok(seconds)
+}
+
+/// `day_completeness`: per local day, oldest first, the share (0-100) of the covered seconds a reading
+/// accounts for (its minute, and the gap to the next reading when at most `WORN_GAP_S`); None for a pair
+/// that is not per-minute, for a session scope, and for a day no file of the pair's streams spans.
+pub fn day_completeness(
+    conn: &Connection,
+    contract: &Contract,
+    metric: &str,
+    scope: &str,
+    first_day: &str,
+    last_day: &str,
+) -> Result<Vec<(String, Option<i64>)>, ReadError> {
+    let window = Window::new(first_day, last_day)?;
+    let days = (0..window.days).map(|position| window.day(position)).collect::<Result<Vec<_>, _>>()?;
+    let session_scope = contract.session_streams_for.iter().any(|entry| entry.source_scope == scope);
+    if !contract.per_minute_metrics.iter().any(|m| m == metric) || session_scope {
+        return Ok(days.into_iter().map(|day| (day, None)).collect());
+    }
+    let offsets = load_offsets(conn)?;
+    let (streams_for, _drift) = declared_and_drift(conn, contract)?;
+    let streams = streams_for
+        .get(&(metric.to_string(), scope.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    let bounds = day_bounds(&window, &offsets)?;
+    let refinements = has_table(conn, "export_ranges")?;
+    let covered = covered_seconds(conn, &window, &streams, &contract.session_streams, &bounds, refinements)?;
+    let worn = worn_seconds(conn, metric, scope, &window, &bounds)?;
+    Ok(days
+        .into_iter()
+        .enumerate()
+        .map(|(position, day)| {
+            let share = (covered[position] > 0).then(|| (100 * worn[position] / covered[position]).min(100));
+            (day, share)
+        })
+        .collect())
 }
 
 #[cfg(test)]

@@ -252,10 +252,12 @@ fn contract_dict(_server: &Server, _args: &[Arg]) -> Outcome {
         ("sources", &c.sources),
         ("privacy", &c.privacy),
         ("coverage", &c.coverage),
+        ("completeness", &c.completeness),
     ] {
         out.set(key, Json::text(value));
     }
     out.set("source_scopes", strings(&contract.source_scopes));
+    out.set("per_minute_metrics", strings(&contract.per_minute_metrics));
     let streams = contract.streams_for.iter().map(|entry| {
         let mut item = Json::dict();
         item.set("metric", Json::text(&entry.metric));

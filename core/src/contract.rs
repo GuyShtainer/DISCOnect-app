@@ -31,6 +31,7 @@ pub struct Conventions {
     pub sources: String,
     pub privacy: String,
     pub coverage: String,
+    pub completeness: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -78,6 +79,8 @@ pub struct Contract {
     pub contract_version: String,
     pub conventions: Conventions,
     pub source_scopes: Vec<String>,
+    /// The sample metrics a day's completeness is measured for (7b-12).
+    pub per_minute_metrics: Vec<String>,
     pub metrics: Vec<MetricContract>,
     pub labels: Vec<MetricContract>,
     pub streams_for: Vec<StreamsFor>,
@@ -155,6 +158,7 @@ mod tests {
         let c = contract();
         assert_eq!(c.version(), Ok(2));
         assert_eq!(c.source_scopes, ["device", "vendor_cloud", "local", "live"]);
+        assert_eq!(c.per_minute_metrics, ["heart_rate", "stress", "respiration_rate", "energy_reserve"]);
         assert_eq!(c.session_streams, ["json:live"]);
         assert_eq!(c.session_streams_for.len(), 5);
         assert!(c.metrics.len() > 50 && c.labels.len() == 5);
@@ -178,6 +182,7 @@ mod tests {
             &c.conventions.sources,
             &c.conventions.privacy,
             &c.conventions.coverage,
+            &c.conventions.completeness,
         ] {
             assert!(!text.is_empty());
         }

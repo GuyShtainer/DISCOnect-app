@@ -4,7 +4,11 @@
 import * as echarts from "echarts";
 import { scopeWord } from "./identity";
 
-export type Series = { scope: string; unit: string | null; days: { day: string; value: number | null; status: string }[] };
+export type Series = { scope: string; unit: string | null; days: { day: string; value: number | null; status: string; completeness?: number | null }[] };
+
+/** A day whose mean rests on less than this share of the day (7b-12 `completeness`, 0-100) draws a hollow,
+ * faded dot; the value is never withheld. */
+export const LOW_COMPLETENESS = 50;
 
 const SCOPE_TOKEN: Record<string, string> = { device: "--device", vendor_cloud: "--vendor-cloud", local: "--local", live: "--live" };
 
@@ -77,16 +81,31 @@ function numWord(v: number): string {
   return Math.abs(v) >= 100 ? Math.round(v).toLocaleString("en").replace(/,/g, "\u202f") : String(Math.round(v * 10) / 10);
 }
 
-/** One series' words for one day: "<scope word> <value> <unit>" or "<scope word> no data"; a live series with no
- * session that day says nothing (a session claims no day). */
+/** One series' words for one day: "<scope word> <value> <unit>" or "<scope word> no data", then ", <n> % of the day"
+ * when the core measured how much of the day the value rests on; a live series with no session that day says
+ * nothing (a session claims no day). */
 function seriesWords(series: Series[], i: number): string[] {
   const out: string[] = [];
   for (const s of series) {
-    const v = s.days[i]?.value ?? null;
+    const d = s.days[i];
+    const v = d?.value ?? null;
     if (v === null && s.scope === "live") continue;
-    out.push(`${scopeWord(s.scope)} ${v === null ? "no data" : `${numWord(v)}${s.unit ? ` ${s.unit}` : ""}`}`);
+    const share = typeof d?.completeness === "number" && v !== null ? `, ${d.completeness} % of the day` : "";
+    out.push(`${scopeWord(s.scope)} ${v === null ? "no data" : `${numWord(v)}${s.unit ? ` ${s.unit}` : ""}`}${share}`);
   }
   return out;
+}
+
+/** The dot a non-live day draws: hollow and faded when its mean rests on less than LOW_COMPLETENESS of the day,
+ * a full dot when it is isolated (both neighbours missing, so a line would not show it), else none. */
+function dayPoint(days: Series["days"], i: number): number | null | { value: number; symbol: string; symbolSize: number; itemStyle?: { opacity: number } } {
+  const d = days[i];
+  if (d.value === null) return null;
+  if (typeof d.completeness === "number" && d.completeness < LOW_COMPLETENESS) {
+    return { value: d.value, symbol: "emptyCircle", symbolSize: 6, itemStyle: { opacity: 0.45 } };
+  }
+  if (days[i - 1]?.value == null && days[i + 1]?.value == null) return { value: d.value, symbol: "circle", symbolSize: 5 };
+  return d.value;
 }
 
 /** A diagonal-hatch canvas in the given colour: ECharts applies decals to series only, so a
@@ -217,17 +236,18 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       type: s.scope === "live" ? "scatter" : "line",
       symbol: s.scope === "live" ? "diamond" : "none",
       symbolSize: s.scope === "live" ? 9 : 4,
-      // non-live lines draw no dots, except an isolated value (both neighbours missing), which would vanish
+      // non-live lines draw no dots, except an isolated value (both neighbours missing), which would vanish,
+      // and a low-completeness day, which draws hollow and faded (dayPoint)
       showSymbol: s.scope !== "live",
+      // ECharts's default ("auto") samples a few days' symbol sizes against the day width and, when one is too
+      // big for it, hides every symbol that is not on an axis-label tick: a lone marked day then vanishes
+      // (seen on the 90-day window). The marked days are the point, so every one draws.
+      showAllSymbol: true,
       connectNulls: false,
       // vendor cloud is dashed: when it agrees with device the two lines overlap exactly and both must stay visible
       lineStyle: { width: 1.5, type: s.scope === "vendor_cloud" ? "dashed" : "solid" },
       itemStyle: { color: token(SCOPE_TOKEN[s.scope] ?? "--ink") },
-      data: s.scope === "live"
-        ? s.days.map((d) => d.value)
-        : s.days.map((d, i) => (d.value !== null && s.days[i - 1]?.value == null && s.days[i + 1]?.value == null
-          ? { value: d.value, symbol: "circle", symbolSize: 5 }
-          : d.value)),
+      data: s.scope === "live" ? s.days.map((d) => d.value) : s.days.map((_d, i) => dayPoint(s.days, i)),
       markArea: i === series.findIndex((t) => t.scope !== "live")
         ? {
             silent: true,

@@ -461,7 +461,8 @@ fn calendar_values(
 }
 
 /// `metric_calendar`: every local day from `first_day` to `last_day` (inclusive, oldest first) as
-/// `{day, value, status}`; `value` is null where the store has none and `status` says why.
+/// `{day, value, status, completeness}`; `value` is null where the store has none and `status` says
+/// why; `completeness` (0-100) says how much of the day a per-minute metric's mean rests on, null otherwise.
 pub fn metric_calendar(
     conn: &Connection,
     contract: &Contract,
@@ -499,10 +500,11 @@ pub fn metric_calendar(
         last_day,
     )?;
     let statuses = coverage::day_statuses(conn, contract, &metric_text, &scope_text, first_day, last_day)?;
+    let completeness = coverage::day_completeness(conn, contract, &metric_text, &scope_text, first_day, last_day)?;
     let mut days = Vec::new();
-    for (day, status) in statuses {
+    for ((day, status), (_, share)) in statuses.into_iter().zip(completeness) {
         let value = values.remove(&day).unwrap_or(Ok(Value::Null))?;
-        days.push(json!({"day": day, "value": value, "status": status}));
+        days.push(json!({"day": day, "value": value, "status": status, "completeness": share}));
     }
     Ok(days)
 }

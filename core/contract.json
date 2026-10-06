@@ -5,13 +5,20 @@
     "missing_values": "Missing means missing: a minute or a day without a sample has no row, and a series shorter than its span means the watch recorded nothing then. A value is never filled with 0, the previous value, or an estimate. Readings the watch itself marks invalid (off wrist, too much motion) are dropped, not stored as numbers.",
     "sources": "source_scope names the layer a value came from. 'device' is decoded from the watch's own FIT bytes, whichever way they arrived (USB, a Connect account export, Gadgetbridge). 'vendor_cloud' is a figure Garmin Connect computed and delivered as JSON. 'local' is computed here from device data. 'live' is a reading the watch sent over the Bluetooth link during a session: the same sensor, read live, kept apart so a session never passes for a day of monitoring. The scopes are stored side by side and never merged; every value says which scope it belongs to.",
     "privacy": "Reads one local SQLite file. Opens no network connection and no port. Returns no device serial numbers, file paths, account identifiers, or GPS coordinates.",
-    "coverage": "Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. A live-link session claims no day: in the 'live' scope a day without a session is 'not_covered'. Coverage is derived from the retained raw files each time it is asked for; it is never guessed."
+    "coverage": "Coverage explains a missing day. For each metric and source scope, every local day in the window has exactly one status, decided in this order: 'present' (rows exist; the day may still be incomplete), 'failed' (a file or record that would have supplied it failed to decode), 'source_empty' (an imported file spanned the day, or an export file claimed the window, yet nothing was decoded for it: the source genuinely had nothing), 'not_covered' (no import has ever covered the day). Metrics marked sparse are recorded only on some days by nature (a VO2max update, a weigh-in), so their 'source_empty' days are normal. The watch writes sleep, HRV and skin-temperature files only for nights it recorded, so a day the all-day monitoring files cover counts as covered for them too. A live-link session claims no day: in the 'live' scope a day without a session is 'not_covered'. Coverage is derived from the retained raw files each time it is asked for; it is never guessed.",
+    "completeness": "Completeness marks how much of a day a per-minute metric's mean rests on: the share, 0-100, of the day's covered seconds that a reading accounts for (its own minute, and the gap to the next reading when that is at most 5 minutes). Covered seconds are the ones a retained file of the metric's streams spans inside the local day (a claimed export window covers its days whole). It is measured here from the readings' times and the files' spans, never from a wearing-time figure of the watch's, and it says nothing about a reading's accuracy. It is null for metrics that are not per-minute (five-minute HRV, periodic pulse oximetry), for daily metrics, for the live link, and for a day no file spans."
   },
   "source_scopes": [
     "device",
     "vendor_cloud",
     "local",
     "live"
+  ],
+  "per_minute_metrics": [
+    "heart_rate",
+    "stress",
+    "respiration_rate",
+    "energy_reserve"
   ],
   "metrics": [
     {
