@@ -83,21 +83,36 @@ fn the_pure_fold_follows_the_rules() {
         r(b, "unknown", 1),
         r(b, "energy_reserve", 0),
         r(b, "stress", 0),
+        // the upper bounds: a FIT uint8 never carries 0xFF, a percentage never 101 (review S3)
+        r(b, "heart_rate", 255),
+        r(b, "stress", 101),
+        r(b, "respiration_rate", 255),
+        r(b, "spo2", 101),
+        r(b, "heart_rate", 254),
+        r(b, "respiration_rate", 254),
+        r(b, "spo2", 100),
+        r(b, "stress", 100),
     ];
     let (rows, dropped) = fold_live_readings(&[(1, sentinels)]);
     assert_eq!(
         rows,
-        [("energy_reserve".to_string(), BASE, 0, 1), ("stress".to_string(), BASE, 0, 1)]
+        [
+            ("energy_reserve".to_string(), BASE, 0, 1),
+            ("heart_rate".to_string(), BASE, 254, 1),
+            ("respiration_rate".to_string(), BASE, 254, 1),
+            ("spo2".to_string(), BASE, 100, 1),
+            ("stress".to_string(), BASE, 0, 1)
+        ]
     );
     let counts: Vec<(&str, i64)> = dropped.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_eq!(
         counts,
         [
             ("live_energy_reserve_out_of_range", 2),
-            ("live_heart_rate_zero", 1),
-            ("live_respiration_sentinel", 1),
-            ("live_spo2_off_wrist_or_zero", 1),
-            ("live_stress_sentinel", 1),
+            ("live_heart_rate_zero", 2),
+            ("live_respiration_sentinel", 2),
+            ("live_spo2_off_wrist_or_zero", 2),
+            ("live_stress_sentinel", 2),
         ]
     );
 }
@@ -199,6 +214,14 @@ fn health_keeps_live_apart() {
     let heart = report["metrics"].as_array().unwrap().iter().find(|m| m["metric"] == "heart_rate").unwrap();
     assert_eq!(heart["total"], Value::Null);
     assert_eq!(heart["days_in_window"], json!(0));
+    // asked for the session scope alone and no end_date, the facts anchor on its newest day (review S1)
+    let facts = period_facts(store.conn(), &FactsQuery::default()).expect("facts");
+    assert_eq!(facts["reason"], json!("nothing stored yet"));
+    let live_only = FactsQuery { source_scope: Some(PyStr::from_text("live")), ..FactsQuery::default() };
+    let facts = period_facts(store.conn(), &live_only).expect("facts");
+    assert_eq!(facts["as_of"], json!("2025-06-15"));
+    assert_eq!(facts["facts"].as_array().unwrap().len(), 1);
+    assert_eq!(facts["facts"][0]["metric"], json!("heart_rate"));
     // the default facts never see a session; naming the scope is the one way to its facts
     let query = FactsQuery { end_date: Some(PyStr::from_text("2025-06-16")), ..FactsQuery::default() };
     let facts = period_facts(store.conn(), &query).expect("facts");

@@ -1296,13 +1296,14 @@ const LIVE_METRICS: [&str; 5] = ["heart_rate", "stress", "respiration_rate", "sp
 /// One decoded live record: its raw id and readings `(t, metric, value)` in payload order.
 pub type LiveRecord = (i64, Vec<(f64, String, i64)>);
 
-/// The reason a reading is a sentinel (dropped before thinning), None when it is kept.
+/// The reason a reading is a sentinel (dropped before thinning), None when it is kept: the FIT
+/// decoder's rule plus the field's upper bound (a uint8 never carries 0xFF, a percentage never 101).
 fn live_sentinel(metric: &str, value: i64) -> Option<&'static str> {
     match metric {
-        "heart_rate" if value <= 0 => Some("live_heart_rate_zero"),
-        "stress" if value < 0 => Some("live_stress_sentinel"),
-        "respiration_rate" if value < 0 => Some("live_respiration_sentinel"),
-        "spo2" if value <= 0 => Some("live_spo2_off_wrist_or_zero"),
+        "heart_rate" if !(1..255).contains(&value) => Some("live_heart_rate_zero"),
+        "stress" if !(0..=100).contains(&value) => Some("live_stress_sentinel"),
+        "respiration_rate" if !(0..255).contains(&value) => Some("live_respiration_sentinel"),
+        "spo2" if !(1..=100).contains(&value) => Some("live_spo2_off_wrist_or_zero"),
         "energy_reserve" if !(0..=100).contains(&value) => Some("live_energy_reserve_out_of_range"),
         _ => None,
     }
@@ -1404,9 +1405,10 @@ impl Writer<'_> {
             }
             Ok(count)
         })();
+        // a failed COMMIT rolls back too, so no later statement runs inside a stale transaction
+        let written = written.and_then(|count| self.conn.execute_batch("COMMIT").map(|_| count));
         match written {
             Ok(count) => {
-                self.conn.execute_batch("COMMIT")?;
                 let own: Vec<LiveRecord> =
                     records.into_iter().filter(|(id, _)| self.live_run_ids.contains(id)).collect();
                 for (reason, count) in fold_live_readings(&own).1 {

@@ -370,7 +370,7 @@ pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Jso
     let as_of = match end_date {
         // `parse_day` accepted it: plain ASCII
         Some(text) => Some(text.to_text().unwrap_or_default()),
-        None => queries::latest_stored_date(conn)?,
+        None => queries::latest_stored_date_for(conn, contract, scopes)?,
     };
     let Some(as_of) = as_of else {
         let mut out = Json::dict();

@@ -257,6 +257,28 @@ pub fn local_today_at(conn: &Connection, now: Instant) -> Result<String, ReadErr
     Ok(if local > utc { local } else { utc })
 }
 
+/// `_latest_stored_date(conn, scopes)`: asked for session scopes only, the newest sample day of
+/// those scopes (a session newer than the last cable sync stays reachable); else the plain rule.
+pub fn latest_stored_date_for(
+    conn: &Connection,
+    contract: &Contract,
+    scopes: &[String],
+) -> Result<Option<String>, ReadError> {
+    let is_session = |scope: &String| contract.session_streams_for.iter().any(|entry| &entry.source_scope == scope);
+    if scopes.is_empty() || !scopes.iter().all(is_session) {
+        return latest_stored_date(conn);
+    }
+    let marks = scopes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT MAX(substr(ts_utc, 1, 10)) FROM metric_samples WHERE source_scope IN ({marks})");
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(scopes.iter()))?;
+    let Some(row) = rows.next()? else { return Ok(None) };
+    Ok(match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(text) => Some(String::from_utf8_lossy(text).into_owned()),
+        _ => None,
+    })
+}
+
 /// `_latest_stored_date`: the later of the newest daily date and the newest sample's UTC date.
 pub fn latest_stored_date(conn: &Connection) -> Result<Option<String>, ReadError> {
     let mut latest: Option<String> = None;

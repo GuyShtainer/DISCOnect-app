@@ -230,4 +230,28 @@ fn relay_carries_the_live_record_and_the_peer_stores_the_bytes() {
     assert_eq!(inflate(&rows[0].7), PINNED);
     assert_eq!(rows[0].2, "ble");
     assert!(canonical_counts(b.conn()).iter().all(|n| *n == 0));
+    // the pull itself folds the live minutes: a pull-only device gets the same rows (9b-2 review S2)
+    let folded = |conn: &Connection| -> Vec<(String, String, f64)> {
+        let mut stmt = conn
+            .prepare("SELECT metric, ts_utc, value FROM metric_samples WHERE source_scope='live' ORDER BY metric, ts_utc")
+            .expect("prepare");
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows")
+    };
+    assert!(!folded(a.conn()).is_empty());
+    assert_eq!(folded(a.conn()), folded(b.conn()));
+}
+
+#[test]
+fn a_value_past_i64_makes_the_file_not_live() {
+    // the oracle's `_is_reading` bounds the value the same way (9b-2 review M1)
+    let huge = format!("1{}", "0".repeat(400));
+    for text in ["9223372036854775808", "-9223372036854775809", huge.as_str()] {
+        let line = format!("{{\"t\": 1749981601, \"metric\": \"heart_rate\", \"value\": {text}}}\n");
+        assert_eq!(disconect_core::live::parse_live_file(line.as_bytes()), None, "{text}");
+    }
+    let edge = b"{\"t\": 1749981601, \"metric\": \"heart_rate\", \"value\": 9223372036854775807}\n";
+    assert_eq!(disconect_core::live::parse_live_file(edge).map(|r| r.len()), Some(1));
 }
