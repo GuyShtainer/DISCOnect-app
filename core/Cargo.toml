@@ -43,7 +43,7 @@ if-addrs = "0.15.0"
 
 # The OS keychain behind `key.cache` (MIT/Apache-2.0; talks to the Security framework in-process,
 # so the master key never appears in a child process's argv). Other platforms: no keychain.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = "3"
 
 # `serve` isolates the protocol on a private descriptor (dup/dup2); unix-only (row 13 for Windows).
