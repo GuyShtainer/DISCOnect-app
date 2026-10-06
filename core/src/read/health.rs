@@ -28,7 +28,8 @@ use crate::writer::{py_round, py_sum};
 
 /// `serve.DEFAULT_HEALTH_DAYS`.
 pub const DEFAULT_HEALTH_DAYS: i64 = 90;
-/// `serve.LAST_IMPORTS`: how many runs `import.last` (and `data.health`) report.
+/// `health.LAST_IMPORTS`: how many runs of the transports other than `ble` `import.last` (and
+/// `data.health`) report; the newest `ble` run (a live link's end sweep) is listed beside them.
 pub const LAST_IMPORTS: i64 = 5;
 /// `data_health` clamps its window to this many days.
 pub const MAX_HEALTH_DAYS: i64 = 3650;
@@ -486,11 +487,17 @@ fn set_nested(groups: &mut Json, metric: &str, scope: &str, value: Json) {
     }
 }
 
-/// The newest [`LAST_IMPORTS`] runs with their 11 columns, `error` redacted (`data_health`'s
-/// `recent_imports` and, with a `failures` count added, `import.last`).
+/// `health.RECENT_RUNS_SQL`: the newest [`LAST_IMPORTS`] runs of every transport but `ble` plus the
+/// newest `ble` run, newest first, with their 11 columns, `error` redacted (`data_health`'s
+/// `recent_imports` and, with a `failures` count added, `import.last`). A live link ends with a sweep
+/// of the readings folder (transport `ble`, usually "0 imported, N duplicate"); listed like any run,
+/// the sweeps pushed the USB and export runs out of the list within a day (9b review N8).
 fn recent_runs(conn: &Connection, late: &mut Late) -> Result<Vec<Row_>, ReadError> {
     let sql = format!(
-        "SELECT {} FROM import_runs ORDER BY id DESC LIMIT ?",
+        "SELECT {} FROM import_runs WHERE id IN (\
+         SELECT id FROM (SELECT id FROM import_runs WHERE transport IS NOT 'ble' ORDER BY id DESC LIMIT ?) \
+         UNION SELECT id FROM (SELECT id FROM import_runs WHERE transport = 'ble' ORDER BY id DESC LIMIT 1)\
+         ) ORDER BY id DESC",
         RUN_COLUMNS.join(", ")
     );
     rows_of(conn, &sql, [LAST_IMPORTS], late, &["error"])

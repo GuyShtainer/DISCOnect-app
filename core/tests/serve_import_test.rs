@@ -246,6 +246,70 @@ fn import_run_streams_the_fit_phase_then_restarts_done_for_the_json_phase_and_an
     assert_eq!(run["error"], Value::Null);
 }
 
+/// A live link ends with a `ble` sweep of the readings folder; listed like any run, the sweeps would
+/// push the USB and export runs out of the five-row list within a day (9b review N8): the list is the
+/// newest five runs of the other transports plus the newest sweep, newest first.
+#[test]
+fn import_last_lists_the_newest_sweep_beside_five_runs_of_the_other_transports() {
+    let (_dir, db) = new_store();
+    let transports = [
+        "usb", "connect_export", "ble", "usb", "ble", "drop", "usb", "ble", "usb", "ble", "ble",
+    ];
+    {
+        let store = store::open_for_write(&db, "test", 1.0, PassphraseSource::Explicit("unused"))
+            .expect("open store");
+        for (index, transport) in transports.iter().enumerate() {
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO import_runs(id, started_at, transport, status) \
+                     VALUES(?, '2025-07-01T00:00:00Z', ?, 'ok')",
+                    rusqlite::params![index as i64 + 1, transport],
+                )
+                .expect("insert run");
+        }
+    }
+    let last = Rig::new(&db).send(1, "import.last", json!({}));
+    let runs = last[0]["result"]["runs"].as_array().expect("runs");
+    let ids: Vec<i64> = runs.iter().map(|run| run["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![11, 9, 7, 6, 4, 2]);
+    let kinds: Vec<&str> = runs
+        .iter()
+        .map(|run| run["transport"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["ble", "usb", "usb", "drop", "usb", "connect_export"]);
+    let health = Rig::new(&db).send(2, "data.health", json!({}));
+    let recent: Vec<i64> = health[0]["result"]["recent_imports"]
+        .as_array()
+        .expect("recent_imports")
+        .iter()
+        .map(|run| run["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(recent, ids);
+}
+
+#[test]
+fn import_last_with_only_sweeps_is_the_newest_one() {
+    let (_dir, db) = new_store();
+    {
+        let store = store::open_for_write(&db, "test", 1.0, PassphraseSource::Explicit("unused"))
+            .expect("open store");
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO import_runs(id, started_at, transport, status) VALUES \
+                 (1, '2025-07-01T00:00:00Z', 'ble', 'ok'), (2, '2025-07-01T00:00:00Z', 'ble', 'ok'), \
+                 (3, '2025-07-01T00:00:00Z', 'ble', 'partial')",
+            )
+            .expect("insert runs");
+    }
+    let last = Rig::new(&db).send(1, "import.last", json!({}));
+    let runs = last[0]["result"]["runs"].as_array().expect("runs");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["id"], 3);
+    assert_eq!(runs[0]["status"], "partial");
+}
+
 #[test]
 fn import_last_on_a_store_that_never_imported_is_an_empty_list() {
     let (_dir, db) = new_store();
