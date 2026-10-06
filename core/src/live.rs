@@ -49,13 +49,21 @@ fn non_empty_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-fn is_number(value: &Value) -> bool {
-    matches!(value, Value::Int(_) | Value::Float(_))
+/// Exclusive upper bound of a reading's `t` (unix seconds, 10000-01-01Z): a millisecond stamp falls outside.
+const T_LIMIT: i64 = 253_402_300_800;
+
+/// A number (never a bool) in `0 <= t < T_LIMIT`.
+fn is_time(value: &Value) -> bool {
+    match value {
+        Value::Int(i) => (0..T_LIMIT).contains(i),
+        Value::Float(x) => *x >= 0.0 && *x < T_LIMIT as f64,
+        _ => false,
+    }
 }
 
-/// A reading's three fields have the shapes the rule asks for: number, string, int (never bool).
+/// A reading's three fields have the shapes the rule asks for: time in range, string, int (never bool).
 fn is_reading(t: &Value, metric: &Value, value: &Value) -> bool {
-    is_number(t) && matches!(metric, Value::Str(_)) && matches!(value, Value::Int(_))
+    is_time(t) && matches!(metric, Value::Str(_)) && matches!(value, Value::Int(_))
 }
 
 /// The readings `[t, metric, value]` of a live file, or `None` when `data` is not one (the oracle's

@@ -240,6 +240,7 @@ const liveLatest = new Map<string, { value: number; t: number }>();
 let liveStatus = "idle";
 let liveStop: string | null = null;
 let liveRunning = false;
+let liveSeq = 0; // the current link's number: a stored event of another link is ignored
 let liveStored: string | null = null; // what the sweep of the readings folder said after the last link ended
 const liveNodes: { values: Map<string, HTMLElement>; since: Map<string, HTMLElement>; status: HTMLElement | null; button: HTMLButtonElement | null } = {
   values: new Map(), since: new Map(), status: null, button: null,
@@ -298,7 +299,7 @@ async function toggleLive(): Promise<void> {
       liveStored = null;
       liveStatus = "starting";
       drawLive();
-      await core.liveStart();
+      liveSeq = (await core.liveStart()).seq ?? liveSeq;
       liveRunning = true;
     }
   } catch (e) {
@@ -313,8 +314,9 @@ async function toggleLive(): Promise<void> {
 }
 
 async function screenWatch(out: ParentNode, later: Later): Promise<void> {
-  const state = await core.liveState().catch(() => ({ running: false, available: false }));
+  const state = await core.liveState().catch((): core.LiveStatus => ({ running: false, available: false }));
   liveRunning = state.running;
+  liveSeq = state.seq ?? liveSeq;
   header(out, "Watch", "live readings over Bluetooth, read-only");
   const card = el("div", "card");
   const row = el("div", "actions");
@@ -354,7 +356,8 @@ async function screenWatch(out: ParentNode, later: Later): Promise<void> {
 }
 
 void core.onLiveLine(onLive);
-void core.onLiveStored((text) => {
+void core.onLiveStored((text, seq) => {
+  if (seq !== liveSeq) return;
   liveStored = text;
   drawLive();
 });

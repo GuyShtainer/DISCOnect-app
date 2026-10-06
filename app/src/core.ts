@@ -159,7 +159,7 @@ export function supportOpen(id: SupportSiteId): Promise<void> {
 
 /** One line from the live link: a status change or a reading (unix seconds, the product's metric id, an int). */
 export type LiveLine = { status?: string; stop?: string; t?: number; metric?: string; value?: number };
-export type LiveStatus = { running: boolean; available: boolean };
+export type LiveStatus = { running: boolean; available: boolean; seq?: number };
 
 export function liveStart(): Promise<LiveStatus> {
   return invoke<LiveStatus>("live_start");
@@ -181,7 +181,10 @@ export function onLiveEnded(cb: (exit: number | null) => void): Promise<Unlisten
   return listen("live://ended", (e) => cb((e.payload as { exit: number | null }).exit));
 }
 
-/** What the sweep of the readings folder answered after a link ended: "stored", "already stored" or "not stored (…)". */
-export function onLiveStored(cb: (text: string) => void): Promise<UnlistenFn> {
-  return listen("live://stored", (e) => cb((e.payload as { text: string }).text));
+/** What the sweep of the readings folder answered after a link ended ("stored", "nothing new stored" or "not stored (…)"), and the number of the link it belongs to. */
+export function onLiveStored(cb: (text: string, seq: number) => void): Promise<UnlistenFn> {
+  return listen("live://stored", (e) => {
+    const { text, seq } = e.payload as { text: string; seq: number };
+    cb(text, seq);
+  });
 }
