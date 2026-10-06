@@ -50,4 +50,34 @@ fn ios_bundles_no_core_and_is_a_dev_app_called_disconect() {
     // an array patch replaces the macOS map outright (a merge patch merges objects only)
     assert_eq!(config.bundle.resources, Some(BundleResources::List(vec![])));
     assert_eq!(config.app.windows[0].title, "DISCOnect");
+    assert_eq!(
+        config.bundle.ios.minimum_system_version, "18.1",
+        "the iOS floor"
+    );
+}
+
+/// The Tauri CLI writes the signing team into the tracked project at device builds; none may be committed.
+#[test]
+fn no_file_under_gen_apple_holds_a_development_team() {
+    fn walk(dir: &Path, hits: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                if name != "build" && name != "Externals" {
+                    walk(&path, hits);
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains("DEVELOPMENT_TEAM = \"") {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("gen/apple"), &mut hits);
+    assert!(hits.is_empty(), "a signing team is written in: {hits:?}");
 }
