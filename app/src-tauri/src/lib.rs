@@ -97,7 +97,7 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 /// Release filter: drop every `--debug-*` flag and, unless it is one of the flags that take no operand,
 /// the operand after it (so `--debug-window 390x844` leaves nothing behind).
 fn release_args(args: Vec<String>) -> Vec<String> {
-    const NO_OPERAND: [&str; 3] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open"];
+    const NO_OPERAND: [&str; 5] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock"];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
     while let Some(a) = it.next() {
@@ -121,6 +121,7 @@ mod release_args_tests {
         assert_eq!(release_args(v(&[window, "390x844", "--screen", "today"])), v(&["--screen", "today"]));
         assert_eq!(release_args(v(&["--screen", "today", "--debug-drawer-open", "--theme", "dark"])), v(&["--screen", "today", "--theme", "dark"]));
         assert_eq!(release_args(v(&["--debug-listen", "127.0.0.1:9", "--debug-drop-over"])), v(&[]));
+        assert_eq!(release_args(v(&["--screen", "sync", "--debug-sync-run", "--theme", "dark"])), v(&["--screen", "sync", "--theme", "dark"]));
     }
 }
 

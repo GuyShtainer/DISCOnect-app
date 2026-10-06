@@ -15,7 +15,7 @@
 //! * `POST /v1/pair/<id>` and `GET /v1/pair/<id>/payload` -- only when an offer is attached (`pair offer`),
 //!   unauthenticated by design; see `pair_routes.rs` and `docs/relay-protocol.md`, "Pairing routes".
 //!
-//! Every answer of the object routes (all statuses) carries `X-Disconect-Resp` (`lan.rs`, the response
+//! Every answer from `handle()` except `/v1/health` and `/v1/pair*` (all statuses) carries `X-Disconect-Resp` (`lan.rs`, the response
 //! tag, computed in [`handle`] over the method, the target, the request's auth value, the server's seconds,
 //! the status and the body); health, the pairing routes and the head errors (400/408 before a head exists)
 //! carry none.
@@ -1144,5 +1144,32 @@ mod tests {
         assert_eq!(signed(&ctx, "GET", &path, b"", 100, 100).status, 404);
         let reply = handle(&ctx, "PUT", &path, Some(&header), Some(4), &mut &b"ab"[..], 100);
         assert_eq!(reply.status, 408, "a body shorter than declared");
+    }
+
+    #[test]
+    fn the_handlers_own_408_and_500_and_a_signed_delete_are_tagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx(dir.path());
+        let path = object(&ctx, "a");
+        let now = 100;
+        // 408: a body that stops arriving after a valid pre-tag
+        let header = auth_value(&*ctx.key, "PUT", &path, now, b"abcd").expect("h");
+        let stalled = handle(&ctx, "PUT", &path, Some(&header), Some(4), &mut Untouchable, now);
+        assert_eq!(stalled.status, 408);
+        assert!(tag_verifies(&ctx, &stalled, "PUT", &path, &header, now), "408");
+        // 500: a directory where the object should be
+        let name = path.trim_start_matches("/v1/objects/").to_string();
+        std::fs::create_dir_all(dir.path().join("relay").join(&name)).expect("directory in its place");
+        let header = auth_value(&*ctx.key, "GET", &path, now, b"").expect("h");
+        let broken = handle(&ctx, "GET", &path, Some(&header), None, &mut std::io::empty(), now);
+        assert_eq!(broken.status, 500);
+        assert!(tag_verifies(&ctx, &broken, "GET", &path, &header, now), "500");
+        // a signed DELETE (204 today, 405 once Bet 12-D lands): tagged either way
+        let other = object(&ctx, "d");
+        assert_eq!(signed(&ctx, "PUT", &other, b"x", now, now).status, 204);
+        let header = auth_value(&*ctx.key, "DELETE", &other, now, b"").expect("h");
+        let deleted = handle(&ctx, "DELETE", &other, Some(&header), None, &mut std::io::empty(), now);
+        assert!(matches!(deleted.status, 204 | 405), "{}", deleted.status);
+        assert!(tag_verifies(&ctx, &deleted, "DELETE", &other, &header, now), "DELETE");
     }
 }

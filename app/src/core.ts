@@ -35,6 +35,11 @@ export function debugPairDigitsFromFile(): Promise<unknown> {
   return invoke("debug_pair_digits_from_file");
 }
 
+/** Debug builds only: key.unlock with the passphrase in DISCONECT_DEBUG_PASSPHRASE_FILE (evidence runs). */
+export function debugUnlockFromFile(): Promise<unknown> {
+  return invoke("debug_unlock_from_file");
+}
+
 export function coreStderr(): Promise<string[]> {
   return invoke<string[]>("core_stderr");
 }

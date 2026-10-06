@@ -664,9 +664,10 @@ function syncRedraw(): void {
 }
 // The relay's two answers a person can act on, in plain words (the core's own text names the causes at length).
 const SYNC_WORDS: Record<string, string> = {
-  relay_auth_failed: "The relay refused this device: check the date and time on both devices.",
-  relay_unverified: "The relay's answer could not be verified. It is not the relay this device paired with, it was set up again with a new key, or the network altered the answer.",
+  relay_auth_failed: "The relay refused this device: its clock and this device's clock disagree. Check the date and time on both.",
+  relay_unverified: "This device could not verify the relay's answer: it may not be the relay this device paired with, the relay may have been set up again with a new key (pair again from it), the network may have altered the answer, or the connection broke.",
 };
+const SYNC_LEADS: Record<string, string> = { relay_auth_failed: "Refused", relay_unverified: "Not verified" };
 
 function syncFail(e: unknown): void {
   syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
@@ -933,7 +934,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   };
   const errorBanners = (): void => {
     if (syncError) {
-      out.append(bannerEl(syncError.code, SYNC_WORDS[syncError.code] ?? syncError.message, true));
+      out.append(bannerEl(SYNC_LEADS[syncError.code] ?? syncError.code, SYNC_WORDS[syncError.code] ?? syncError.message, true));
       syncError = null;
     }
     if (relayStoppedNote) {
@@ -2501,6 +2502,11 @@ void (async () => {
   if (locked() && (await core.unlockFromKeychain())) await refreshKey();
   await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);
+  // evidence runs, debug builds only (Rust drops --debug-* argv in release): unlock from the passphrase file
+  if (args.includes("--debug-unlock") && locked()) {
+    await core.debugUnlockFromFile().then(() => undefined, () => undefined);
+    await refreshKey();
+  }
   const i = args.indexOf("--screen");
   const arg = args[i + 1] ?? "";
   const night = /^sleep\/\d{4}-\d{2}-\d{2}$/.test(arg); // evidence runs: open one night
@@ -2526,4 +2532,12 @@ void (async () => {
   }
   // evidence runs, debug builds only (Rust drops --debug-* argv in release): the drawer drawn open
   if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
+  // evidence runs, debug builds only: a real click on the Sync screen's own "Sync now" button (the network call
+  // still comes from a click, never from the page's own code path)
+  if (args.includes("--debug-sync-run")) {
+    setTimeout(() => {
+      const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now");
+      button?.click();
+    }, 800);
+  }
 })();

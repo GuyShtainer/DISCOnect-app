@@ -10,7 +10,7 @@
 //! so a peer without the key cannot make it wait for a body (Bet 12 review F1). `token_key = HKDF-SHA256(master, salt = account, info = "disconect/lan/v1/token")`. The
 //! server (`lan_server.rs`) never decrypts anything; it derives the same key from the same master.
 //!
-//! **Response tag (Bet 12-RA).** Every answer of the object routes carries
+//! **Response tag (Bet 12-RA).** Every answer from `handle()` except `/v1/health` and `/v1/pair*` carries
 //! `X-Disconect-Resp: v1.<server unix seconds>.<rtag>` with `rtag = hex HMAC-SHA256(token_key, "resp" LF
 //! METHOD LF target LF <request auth value as the server received it, or empty> LF <seconds> LF status LF
 //! hex(sha256(body)))`. The client verifies it, in constant time, before it interprets the status: a
@@ -252,6 +252,7 @@ pub fn parse_resp(header: &str) -> Result<(u64, [u8; 32]), AuthError> {
     };
     if version != format!("v{API_VERSION}")
         || stamp.is_empty()
+        || (stamp.len() > 1 && stamp.starts_with('0'))
         || stamp.len() > 20
         || !stamp.bytes().all(|b| b.is_ascii_digit())
     {
@@ -350,7 +351,8 @@ impl LanRelay {
     /// after the answer's response tag verified against this request. A missing, repeated,
     /// malformed or wrong tag is `Unverified`: nothing about the answer is interpreted.
     fn call(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), RelayError> {
-        let header = auth_value(&*self.key, method, path, wall_clock(), body)
+        let ts = wall_clock();
+        let header = auth_value(&*self.key, method, path, ts, body)
             .ok_or(RelayError::Unreachable)?;
         let url = format!("{}{path}", self.base);
         let outcome = match method {
@@ -370,6 +372,16 @@ impl LanRelay {
         let (secs, tag) = tag;
         verify_resp(&*self.key, (method, path, &header), secs, status, &bytes, &tag)
             .map_err(|_| RelayError::Unverified)?;
+        if status == 401 {
+            // A verified 401 is the real server refusing. Outside the skew window the clocks are
+            // the cause; inside it nothing honest produces a 401 (a middlebox altered the request
+            // and the server's refusal was replayed as a re-pair lure), so it stays `Unverified`.
+            return Err(if ts.abs_diff(secs) > MAX_SKEW_SECS {
+                RelayError::Unauthorized { skew_s: ts as i64 - secs as i64 }
+            } else {
+                RelayError::Unverified
+            });
+        }
         Ok((status, bytes))
     }
 }
@@ -388,7 +400,8 @@ fn single_resp_header<B>(response: &ureq::http::Response<B>) -> Result<(u64, [u8
 fn status_error(status: u16) -> RelayError {
     match status {
         400 => RelayError::BadName,
-        401 => RelayError::Unauthorized,
+        // `call` turns every verified 401 into `Unauthorized` or `Unverified` before this runs
+        401 => RelayError::Unverified,
         404 => RelayError::Io(IoError::from(ErrorKind::NotFound)),
         413 => RelayError::TooLarge,
         other => RelayError::Status(other),
@@ -651,6 +664,7 @@ mod tests {
     fn the_response_header_shape_is_exact() {
         let mac = "ab".repeat(32);
         assert!(parse_resp(&format!("v1.5.{mac}")).is_ok());
+        assert!(parse_resp(&format!("v1.0.{mac}")).is_ok());
         for bad in [
             String::new(),
             "v1".into(),
@@ -663,6 +677,8 @@ mod tests {
             format!("v1.5.{}", "zz".repeat(32)),
             format!("v1.{}.{mac}", "9".repeat(21)),
             format!("v1.5. {mac}"),
+            format!("v1.05.{mac}"),
+            format!("v1.00.{mac}"),
         ] {
             assert_eq!(parse_resp(&bad).unwrap_err(), AuthError::Malformed, "{bad}");
         }

@@ -952,6 +952,21 @@ fn hostile_heads_and_paths_get_bare_refusals_and_a_slow_head_is_cut() {
     server.stop();
 }
 
+#[test]
+fn a_head_the_server_cannot_read_gets_a_bare_400_with_no_response_tag() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let server = LanServer::start("127.0.0.1:0", tmp.path().join("relay"), master(), silent()).expect("serve");
+    let mut stream = TcpStream::connect(server.local_addr()).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    stream.write_all(b"get /v1/objects HTTP/1.1\r\n\r\n").expect("write");
+    let mut out = Vec::new();
+    let _ = stream.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 400"), "{text}");
+    assert!(!text.contains(&RESP_HEADER.to_ascii_lowercase()), "{text}");
+    server.stop();
+}
+
 // ------------------------------------------------------------------ 12-RA: response authentication
 
 /// What a fake server or a proxy sees of a request.
@@ -1101,9 +1116,27 @@ fn an_answer_without_a_valid_tag_is_unverified_and_a_tagged_401_is_the_clock() {
         }
     }
     // a 401 with a valid tag: the relay holds this key and refused the request (clocks)
-    let tagged = Fake::start({ let k = k.clone(); move |r| raw_answer(401, b"", &[tag_for(&k, r, 401, b"")]) });
-    let outcome = list_of(&tagged.url());
-    assert!(matches!(outcome, Err(RelayError::Unauthorized)), "{outcome:?}");
+    // 10 minutes off (either way) is the clock; within the skew window a verified 401 is the lure
+    for (offset, skew) in [(600i64, -600i64), (-600, 600)] {
+        let tagged = Fake::start({
+            let k = k.clone();
+            move |r| {
+                let secs = (wall_clock() as i64 + offset) as u64;
+                let t = resp_header_value(&k, &r.method, &r.target, &r.auth, secs, 401, b"").expect("tag");
+                raw_answer(401, b"", &[t])
+            }
+        });
+        let outcome = list_of(&tagged.url());
+        match outcome {
+            Err(RelayError::Unauthorized { skew_s }) => {
+                assert!((skew_s - skew).abs() <= 3, "{skew_s} vs {skew}");
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+    let within = Fake::start({ let k = k.clone(); move |r| raw_answer(401, b"", &[tag_for(&k, r, 401, b"")]) });
+    let outcome = list_of(&within.url());
+    assert!(matches!(outcome, Err(RelayError::Unverified)), "within the skew: {outcome:?}");
     // the same 401 without a tag, or with a wrong one: only Unverified, never "re-pair" or "clock"
     let bare = Fake::start(|_| raw_answer(401, b"", &[]));
     assert!(matches!(list_of(&bare.url()), Err(RelayError::Unverified)));
@@ -1118,9 +1151,15 @@ fn unsent(device: &Device) -> i64 {
     )
 }
 
-fn nothing_booked(device: &Device) {
+fn next_seq(device: &Device) -> i64 {
+    count(device.conn(), "SELECT coalesce((SELECT next_seq FROM relay_device WHERE id=1), 1)")
+}
+
+fn nothing_booked(device: &Device, seq_before: i64) {
     assert_eq!(count(device.conn(), "SELECT count(*) FROM relay_bundles"), 0);
     assert_eq!(count(device.conn(), "SELECT count(*) FROM relay_seen"), 0);
+    assert_eq!(count(device.conn(), "SELECT count(*) FROM relay_seen_ranges"), 0);
+    assert_eq!(next_seq(device), seq_before, "no sequence number consumed");
 }
 
 #[test]
@@ -1130,11 +1169,12 @@ fn a_fake_server_answering_204_to_everything_books_nothing() {
     let a = device();
     import_path(a.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
     let before = unsent(&a);
+    let seq = next_seq(&a);
     assert!(before > 0);
     let client = LanRelay::new(&fake.url(), master()).expect("client");
     let error = sync::push(a.conn(), master(), &client).expect_err("unverified");
     assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
-    nothing_booked(&a);
+    nothing_booked(&a, seq);
     assert_eq!(unsent(&a), before, "every record is still unsent");
     let b = device();
     let pull = sync::pull(b.conn(), master(), &client).expect_err("unverified");
@@ -1145,10 +1185,29 @@ fn a_fake_server_answering_204_to_everything_books_nothing() {
 /// A proxy between a client and a real server (one request per connection): `rewrite` gets the
 /// server's whole answer (head and body) and returns what the client is shown.
 fn proxy(upstream: std::net::SocketAddr, rewrite: impl Fn(&Req, Vec<u8>) -> Vec<u8> + Send + 'static) -> Fake {
+    proxy_hops(upstream, |request| Hop::Forward(request.raw.clone()), rewrite)
+}
+
+/// What a proxy does with a request: send these bytes upstream, or answer without asking.
+enum Hop {
+    Forward(Vec<u8>),
+    Answer(Vec<u8>),
+}
+
+/// A proxy that may also rewrite the request (`edit`) or answer it itself.
+fn proxy_hops(
+    upstream: std::net::SocketAddr,
+    edit: impl Fn(&Req) -> Hop + Send + 'static,
+    rewrite: impl Fn(&Req, Vec<u8>) -> Vec<u8> + Send + 'static,
+) -> Fake {
     Fake::start(move |request| {
+        let forwarded = match edit(request) {
+            Hop::Answer(bytes) => return bytes,
+            Hop::Forward(bytes) => bytes,
+        };
         let mut up = TcpStream::connect(upstream).expect("upstream");
         up.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
-        up.write_all(&request.raw).expect("forward");
+        up.write_all(&forwarded).expect("forward");
         let mut answer = Vec::new();
         let _ = up.read_to_end(&mut answer);
         rewrite(request, answer)
@@ -1221,10 +1280,11 @@ fn a_proxy_that_strips_the_tag_books_nothing_and_the_retry_converges_without_a_g
         out
     });
     let before = unsent(&a);
+    let seq = next_seq(&a);
     let blind = LanRelay::new(&strip.url(), master()).expect("client");
     let error = sync::push(a.conn(), master(), &blind).expect_err("unverified");
     assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
-    nothing_booked(&a);
+    nothing_booked(&a, seq);
     assert_eq!(unsent(&a), before);
     // the PUT did land on the real server (an unverified PUT may have): the retry pushes the same
     // records again as a second bundle
@@ -1240,4 +1300,81 @@ fn a_proxy_that_strips_the_tag_books_nothing_and_the_retry_converges_without_a_g
     assert_eq!(fingerprint(&a), fingerprint(&b), "fingerprints converge");
     assert!(sync::gaps(b.conn()).expect("gaps").is_empty(), "no gap");
     lan.server.stop();
+}
+
+/// The three transplants of the attack record (row 7): each ends in `Unverified`, no row, and the
+/// straight pull afterwards applies the bundle.
+fn pull_through_forger(forger: impl Fn(std::net::SocketAddr) -> Fake) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lan = Lan::start(tmp.path(), master());
+    let a = device();
+    import_path(a.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
+    sync::push(a.conn(), master(), &lan.client(master())).expect("push");
+    let evil = forger(lan.server.local_addr());
+    let b = device();
+    let client = LanRelay::new(&evil.url(), master()).expect("client");
+    let error = sync::pull(b.conn(), master(), &client).expect_err("unverified");
+    assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles"), 0, "no row, not even rejected");
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_records"), 0);
+    assert_eq!(sync::pull(b.conn(), master(), &lan.client(master())).expect("pull").status, "ok");
+    assert_eq!(fingerprint(&a), fingerprint(&b));
+    lan.server.stop();
+}
+
+#[test]
+fn a_proxy_that_rewrites_the_object_target_cannot_make_a_pull_reject_the_bundle() {
+    pull_through_forger(|upstream| {
+        proxy_hops(
+            upstream,
+            |request| {
+                if !request.target.starts_with("/v1/objects/") {
+                    return Hop::Forward(request.raw.clone());
+                }
+                let text = String::from_utf8_lossy(&request.raw).to_string();
+                let line_end = text.find("\r\n").expect("line");
+                let line = text[..line_end].replacen(&request.target, &format!("{}?x", request.target), 1);
+                Hop::Forward(format!("{line}{}", &text[line_end..]).into_bytes())
+            },
+            |_, answer| answer,
+        )
+    });
+}
+
+#[test]
+fn a_proxy_that_answers_object_reads_with_a_bare_404_cannot_make_a_pull_reject_the_bundle() {
+    pull_through_forger(|upstream| {
+        proxy_hops(
+            upstream,
+            |request| {
+                if request.target.starts_with("/v1/objects/") {
+                    Hop::Answer(raw_answer(404, b"", &[]))
+                } else {
+                    Hop::Forward(request.raw.clone())
+                }
+            },
+            |_, answer| answer,
+        )
+    });
+}
+
+#[test]
+fn a_proxy_that_adds_a_body_to_the_list_request_gets_a_real_401_that_stays_unverified() {
+    // the real server refuses (tagged 401, within the skew window): a re-pair lure, never "the clock"
+    pull_through_forger(|upstream| {
+        proxy_hops(
+            upstream,
+            |request| {
+                if request.target != "/v1/objects" {
+                    return Hop::Forward(request.raw.clone());
+                }
+                let text = String::from_utf8_lossy(&request.raw).to_string();
+                let line_end = text.find("\r\n").expect("line");
+                let mut out = format!("{}\r\nContent-Length: 5{}", &text[..line_end], &text[line_end..]).into_bytes();
+                out.extend_from_slice(b"hello");
+                Hop::Forward(out)
+            },
+            |_, answer| answer,
+        )
+    });
 }

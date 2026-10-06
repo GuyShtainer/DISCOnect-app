@@ -360,3 +360,50 @@ fn sync_run_shares_the_slot_with_import_run() {
 fn drop_sender(sender: mpsc::Sender<()>) {
     drop(sender);
 }
+
+#[test]
+fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
+    use disconect_core::relay::lan::{AUTH_HEADER, RESP_HEADER, resp_header_value, token_key, wall_clock};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let key = token_key(&master());
+    let thread = std::thread::spawn(move || {
+        // answers every request with a 401 tagged under the right key and a server clock 10 minutes ahead
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&raw).to_string();
+            let mut lines = head.split("\r\n");
+            let mut first = lines.next().unwrap_or("").split(' ');
+            let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+            let auth = lines
+                .filter_map(|l| l.split_once(':'))
+                .find(|(n, _)| n.eq_ignore_ascii_case(AUTH_HEADER))
+                .map(|(_, v)| v.trim().to_string())
+                .unwrap_or_default();
+            let tag = resp_header_value(&*key, method, target, &auth, wall_clock() + 600, 401, b"").expect("tag");
+            let _ = stream.write_all(
+                format!("HTTP/1.1 401 X\r\nConnection: close\r\n{RESP_HEADER}: {tag}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+            );
+        }
+    });
+    let (_da, a) = encrypted_store(true);
+    relay_json(&a, json!({"lan": format!("http://{addr}")}));
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let lines = rig.send(1, "sync.run", json!({}));
+    let error = &only_response(&lines)["error"];
+    assert_eq!(error["code"], "relay_auth_failed");
+    assert!(
+        error["message"].as_str().expect("message").contains("10 minutes off the relay's"),
+        "{error}"
+    );
+    drop(thread);
+}

@@ -203,7 +203,7 @@ fn relay_parts(error: &RelayError) -> (&'static str, String) {
         RelayError::Io(inner) => io_parts(inner),
         RelayError::TooLarge | RelayError::BadName => ("bad_params", error.to_string()),
         RelayError::Unreachable => ("not_found", error.to_string()),
-        RelayError::Unauthorized => ("relay_auth_failed", error.to_string()),
+        RelayError::Unauthorized { .. } => ("relay_auth_failed", error.to_string()),
         RelayError::Unverified => ("relay_unverified", error.to_string()),
         RelayError::Status(_) => ("internal", error.to_string()),
     }

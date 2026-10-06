@@ -27,9 +27,10 @@ pub enum RelayError {
     #[error("the relay is unreachable (retry later)")]
     Unreachable,
     /// A network relay that proved it holds this device's key (the answer's response tag verified)
-    /// refused the request with HTTP 401: the clocks disagree.
-    #[error("relay_auth_failed: the relay holds this device's key but refused the request; check the date and time on both devices")]
-    Unauthorized,
+    /// refused the request with HTTP 401 while this device's clock was more than the allowed skew
+    /// off the relay's (`skew_s` = this device's seconds minus the relay's).
+    #[error("relay_auth_failed: the relay holds this device's key but refused the request: this device's clock is {} minutes off the relay's; check the date and time on both devices", .skew_s.unsigned_abs() / 60)]
+    Unauthorized { skew_s: i64 },
     /// A network relay's answer carried no valid response tag.
     #[error("relay_unverified: the relay's answer could not be verified: not the relay this device paired with, the relay was set up again with a new key (pair again from it), the network altered the answer, or the connection broke")]
     Unverified,
@@ -48,7 +49,7 @@ impl RelayError {
             RelayError::BadName => reasons::PY_VALUE_ERROR,
             // network relays only; these never reach a `rejected` row (see `is_transient`)
             RelayError::Unreachable | RelayError::Status(_) => reasons::PY_OS_ERROR,
-            RelayError::Unauthorized => reasons::AUTHENTICATION_FAILED,
+            RelayError::Unauthorized { .. } => "relay_auth_failed",
             RelayError::Unverified => "relay_unverified",
             RelayError::Io(error) => match error.kind() {
                 K::NotFound => reasons::PY_FILE_NOT_FOUND,
@@ -74,7 +75,7 @@ impl RelayError {
         matches!(
             self,
             RelayError::Unreachable
-                | RelayError::Unauthorized
+                | RelayError::Unauthorized { .. }
                 | RelayError::Unverified
                 | RelayError::Status(_)
         )
@@ -267,16 +268,18 @@ mod tests {
     #[test]
     fn network_errors_are_transient_and_folder_errors_are_not() {
         assert!(RelayError::Unreachable.is_transient());
-        assert!(RelayError::Unauthorized.is_transient());
+        assert!(RelayError::Unauthorized { skew_s: 600 }.is_transient());
         assert!(RelayError::Unverified.is_transient());
         assert!(RelayError::Status(500).is_transient());
         assert!(!RelayError::BadName.is_transient());
         assert!(!RelayError::TooLarge.is_transient());
         assert!(!RelayError::Io(std::io::ErrorKind::NotFound.into()).is_transient());
-        assert_eq!(RelayError::Unauthorized.reason(), "authentication_failed");
+        assert_eq!(RelayError::Unauthorized { skew_s: 600 }.reason(), "relay_auth_failed");
         assert_eq!(RelayError::Unverified.reason(), "relay_unverified");
         assert!(RelayError::Unverified.to_string().starts_with("relay_unverified: "));
-        assert!(RelayError::Unauthorized.to_string().starts_with("relay_auth_failed: "));
+        let text = RelayError::Unauthorized { skew_s: -600 }.to_string();
+        assert!(text.starts_with("relay_auth_failed: "));
+        assert!(text.contains("this device's clock is 10 minutes off the relay's"), "{text}");
     }
 
     #[test]
