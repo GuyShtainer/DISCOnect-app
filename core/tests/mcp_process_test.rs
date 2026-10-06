@@ -18,11 +18,9 @@ const INIT: &str = r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params
 
 fn command(db: &Path, home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_disconect-core"));
+    command.arg("mcp").arg("--db").arg(db).env_clear();
+    common::simulator_env(&mut command);
     command
-        .arg("mcp")
-        .arg("--db")
-        .arg(db)
-        .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home)
         .env("DISCONECT_KEYCHAIN", "fail")

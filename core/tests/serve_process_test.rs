@@ -19,8 +19,9 @@ const WRONG: &str = "not the passphrase at all!";
 
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_disconect-core"));
+    command.env_clear();
+    common::simulator_env(&mut command);
     command
-        .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("DISCONECT_KEYCHAIN", "fail")
         .stdin(Stdio::piped())
@@ -105,7 +106,10 @@ fn stray_prints_and_raw_fd_writes_never_reach_the_protocol_stream() {
             "the fd_probe example builds"
         );
     }
-    let out = Command::new(probe).env_clear().output().expect("run probe");
+    let mut probe_cmd = Command::new(probe);
+    probe_cmd.env_clear();
+    common::simulator_env(&mut probe_cmd);
+    let out = probe_cmd.output().expect("run probe");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

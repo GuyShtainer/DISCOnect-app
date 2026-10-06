@@ -180,8 +180,10 @@ fn a_writer_never_recreates_a_moved_legacy_folder() {
 fn cli_import_into_a_moved_legacy_folder_exits_3_and_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join(".hearthbeat").join("hearthbeat.db");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"))
-        .env_clear()
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"));
+    cmd.env_clear();
+    common::simulator_env(&mut cmd);
+    let out = cmd
         .env("DISCONECT_KEYCHAIN", "fail")
         .arg("--db").arg(&db).args(["import", "/nonexistent"])
         .output().unwrap();
