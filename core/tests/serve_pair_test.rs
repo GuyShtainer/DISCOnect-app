@@ -887,7 +887,8 @@ fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifeti
     live.call("relay.serve", json!({"on": true, "listen": listen}));
     present.store(false, Ordering::SeqCst);
     live.event("relay", "stopped");
-    assert_eq!(live.serving(), Value::Null);
+    // the stop lands a tick after the event under full-suite load: wait, never assert the instant
+    assert!(wait_until(5, || live.serving().is_null()), "the server left with its address");
     present.store(true, Ordering::SeqCst);
     let reply = live.call("pair.offer", json!({"listen": listen}));
     assert!(reply["result"]["offer"].is_string());
