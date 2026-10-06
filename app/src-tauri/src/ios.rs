@@ -2,6 +2,8 @@
 //! The iOS start-up hook (12-D, pitch items 2 and 3). It runs first in `setup`, before the core starts, so before
 //! the store opens and before the page asks `key.unlock`. In this order:
 //!
+//! 0. a Forget that did not end (the `forget.pending` marker, `disconect_core::phone_forget`) is completed first, so
+//!    nothing below sees a half-forgotten phone;
 //! 1. the app data folder exists;
 //! 2. leftover keychain items (a reinstall keeps them, kit gate E) are cleaned by the core's rule
 //!    (`keychain_leftovers`), and the first-run marker is written;
@@ -28,7 +30,7 @@ use objc2_foundation::{
 use tauri::Manager;
 
 /// The marker that says the leftover-items rule has run for this install.
-const MARKER_FILE: &str = "first-run.done";
+const MARKER_FILE: &str = disconect_core::phone_forget::FIRST_RUN_MARKER;
 
 /// Run the hook for this app's data folder; returns the notes. A release that `start_core` will refuse over a test
 /// switch (`sidecar::inproc_env_refusal`) touches nothing here either: `DISCONECT_KEYS` would point the leftover rule
@@ -50,6 +52,7 @@ fn prepare_in(keychain: &mut dyn Keychain, dir: &Path) -> Vec<String> {
         notes.push(format!("could not create the data folder: {e}"));
         return notes;
     }
+    finish_forget(keychain, dir, &mut notes);
     leftovers(keychain, dir, &mut notes);
     exclude_all(dir, &mut notes);
     let key_path = keys::key_path_for(&dir.join(crate::PHONE_DB_FILE));
@@ -59,6 +62,33 @@ fn prepare_in(keychain: &mut dyn Keychain, dir: &Path) -> Vec<String> {
         }
     }
     notes
+}
+
+/// The core's forget items over the leftovers rule's keychain (so one fake serves both in the tests): present or not
+/// is read from the account list, so "removed" and "none" stay apart.
+struct ForgetItems<'a>(&'a mut dyn Keychain);
+
+impl disconect_core::phone_forget::Items for ForgetItems<'_> {
+    fn remove(&mut self, key_id: &[u8; 16]) -> Result<bool, disconect_core::keychain::KeychainError> {
+        let service = disconect_core::keychain::SERVICE;
+        let account: String = key_id.iter().map(|b| format!("{b:02x}")).collect();
+        if !self.0.accounts(service)?.contains(&account) {
+            return Ok(false);
+        }
+        self.0.delete(service, &account)?;
+        Ok(true)
+    }
+}
+
+/// Step 0: complete a pending Forget. Notes say only what happened, never an account.
+fn finish_forget(keychain: &mut dyn Keychain, dir: &Path, notes: &mut Vec<String>) {
+    let db = dir.join(crate::PHONE_DB_FILE);
+    let paths = disconect_core::phone_forget::Paths::beside(&db, &keys::key_path_for(&db));
+    match disconect_core::phone_forget::complete_pending(&paths, &mut ForgetItems(keychain)) {
+        None => {}
+        Some(Ok(result)) => notes.push(format!("completed an interrupted Forget; keychain {}", result.text())),
+        Some(Err(e)) => notes.push(format!("an interrupted Forget could not be completed yet: {e}")),
+    }
 }
 
 fn leftovers(keychain: &mut dyn Keychain, dir: &Path, notes: &mut Vec<String>) {
@@ -244,6 +274,47 @@ mod tests {
         assert!(again.iter().any(|n| n.contains("StoreExists")), "{again:?}");
         assert_eq!(is_excluded_from_backup(&dir.join("disconect.db")), Ok(true));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// A keychain with a list of `(service, account)` items.
+    struct Items(Vec<(String, String)>);
+
+    impl Keychain for Items {
+        fn accounts(&mut self, service: &str) -> Result<Vec<String>, KeychainError> {
+            Ok(self.0.iter().filter(|(s, _)| s == service).map(|(_, a)| a.clone()).collect())
+        }
+        fn delete(&mut self, service: &str, account: &str) -> Result<(), KeychainError> {
+            self.0.retain(|(s, a)| !(s == service && a == account));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_hook_completes_a_pending_forget_before_anything_else_and_a_marker_free_start_deletes_nothing() {
+        let dir = scratch("forget");
+        let db = dir.join(crate::PHONE_DB_FILE);
+        let key = keys::key_path_for(&db);
+        let id = "00112233445566778899aabbccddeeff";
+        let seed = |with_marker: bool| {
+            std::fs::write(&db, b"x").unwrap();
+            std::fs::write(dir.join("disconect.db-wal"), b"x").unwrap();
+            std::fs::write(&key, format!(r#"{{"format":"hearthbeat-keys","format_version":1,"key_id":"{id}","created_at":"","wraps":[{{"purpose":"passphrase"}}]}}"#)).unwrap();
+            std::fs::write(dir.join("relay.json"), b"{}").unwrap();
+            if with_marker {
+                std::fs::write(dir.join(disconect_core::phone_forget::MARKER_NAME), b"").unwrap();
+            }
+        };
+        let mut items = Items(vec![("disconect".into(), id.into())]);
+        seed(false);
+        let notes = prepare_in(&mut items, &dir);
+        assert!(db.exists() && key.exists() && items.0.len() == 1, "no marker: nothing is forgotten: {notes:?}");
+        seed(true);
+        let notes = prepare_in(&mut items, &dir);
+        assert!(!db.exists() && !key.exists() && !dir.join("relay.json").exists() && !dir.join("disconect.db-wal").exists(), "{notes:?}");
+        assert!(items.0.is_empty(), "the keychain item went: {notes:?}");
+        assert!(!dir.join(disconect_core::phone_forget::MARKER_NAME).exists());
+        assert!(notes.iter().any(|n| n == "completed an interrupted Forget; keychain removed"), "{notes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

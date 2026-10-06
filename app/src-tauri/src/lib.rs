@@ -60,12 +60,13 @@ pub const ALLOWED_METHODS: &[&str] = &[
 
 /// The phone's list (12-F, S5): the four server-side methods are gone, because a phone serves nothing and the core
 /// refuses them anyway (`unsupported_transport`). `pair.cancel` stays until the joiner's own cancel replaces it.
-/// `pair.join`, `pair.land` and the forget method join this list when those methods exist (12-F rows 3 and 5b).
+/// `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy. `pair.join` and `pair.land` join it
+/// when those methods exist (12-F row 3).
 /// `tests/egress_guards.rs` reads the first list above for the page's calls and this one for the four.
 #[cfg(target_os = "ios")]
 pub const ALLOWED_METHODS: &[&str] = &[
     "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
-    "sync.status", "sync.run", "pair.cancel",
+    "sync.status", "sync.run", "pair.cancel", "pair.forget",
 ];
 
 /// `Ok` when the page may call `method`; otherwise a fixed refusal that never echoes the method.
@@ -457,8 +458,6 @@ pub fn run() {
             // store opens and before the page asks `key.unlock`. Its notes reach the core's diagnostics below.
             #[cfg(target_os = "ios")]
             let ios_notes = ios::prepare(app.handle());
-            #[cfg(all(debug_assertions, target_os = "ios"))]
-            let proof_notes = ios_notes.clone();
             let core = start_core(app.handle());
             // N1: with no core there is no tail to hold the hook's notes; they wait in `StartupNotes` for `core_stderr`.
             #[cfg(target_os = "ios")]

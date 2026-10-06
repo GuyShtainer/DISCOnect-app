@@ -2180,18 +2180,58 @@ function screenPairStart(out: ParentNode): void {
   out.append(ptext("p", "caption muted", "Pairing gives this phone your key. DISCOnect then asks for two permissions: the camera, to scan the code, and the local network, to reach your Mac. It reaches nothing else."));
 }
 
-// Forget this phone: the confirmation sheet. Its delete action is a stub (12-F part 2 adds the core's forget method
-// and wires it); nothing on this phone is deleted from here.
+// Forget this phone: the confirmation sheet and its result. The core's `pair.forget` deletes the copy, the key file, the
+// keychain entry and the relay setting, in an order that a crash cannot leave half done. The count of records not yet
+// sent comes from `sync.status` (`records_unsent`) and is read before the confirmation.
 let forgetSheet: HTMLElement | null = null;
 let forgetOpener: HTMLElement | null = null;
 function closeForgetSheet(): void {
   if (!forgetSheet) return;
   forgetSheet.remove();
   forgetSheet = null;
+  document.querySelectorAll(".sheet-shade").forEach((n) => n.remove());
   main.inert = false;
   topbar.inert = false;
   forgetOpener?.focus();
 }
+const FORGET_REVOKE = "Forgetting does not shut this phone out of your account. Only a key rotation on your Mac does that.";
+
+/** The sentence that says how many records this phone holds that your Mac may not have, and why that number is what it is. */
+async function forgetUnsentLine(): Promise<string> {
+  if (locked()) return "This phone is locked, so it cannot count what has not been sent. Unlock it first if you want the count; forgetting works either way.";
+  try {
+    const status = await core.call<{ records_unsent: number }>("sync.status");
+    const n = status.records_unsent;
+    if (n > 0) return `${n} ${n === 1 ? "record" : "records"} on this phone ${n === 1 ? "has" : "have"} not been sent to your Mac. ${n === 1 ? "It is" : "They are"} lost if you forget this phone.`;
+    return "0 records on this phone are waiting to be sent. This phone only copies what it pulled from your Mac, so your Mac already has all of it.";
+  } catch (e) {
+    if (core.isCoreError(e) && e.code === "not_found") return "0 records on this phone are waiting to be sent: nothing has been pulled onto it yet.";
+    return "This phone could not count what has not been sent. Your Mac keeps everything it already has.";
+  }
+}
+
+function forgetResultSheet(sheet: HTMLElement, answer: { keychain: string }): void {
+  sheet.replaceChildren();
+  const title = ptext("h2", "heading", "This phone is forgotten");
+  title.id = "forget-title";
+  sheet.append(title);
+  sheet.append(ptext("p", "body", "This phone's copy of your data, its key file and its relay setting are deleted. Your Mac keeps everything. Pair again to use this phone again."));
+  if (answer.keychain === "removed") sheet.append(ptext("p", "body", "Its keychain entry was removed too."));
+  else if (answer.keychain === "none") sheet.append(ptext("p", "body", "It had no keychain entry."));
+  else sheet.append(el("p", "caption error", neutralText("The keychain entry could not be removed. This phone tries again the next time the app starts.")));
+  sheet.append(ptext("p", "caption muted", FORGET_REVOKE));
+  const actions = el("div", "actions");
+  const done = el("button", "", "Done") as HTMLButtonElement;
+  done.onclick = () => { forgetOpener = null; closeForgetSheet(); location.hash = "#/today"; void route(); };
+  actions.append(done);
+  sheet.append(actions);
+  // the shade and Escape end the result the same way Done does: back to the app, which is now Pair Start
+  const shade = document.querySelector<HTMLElement>(".sheet-shade");
+  if (shade) shade.onclick = done.onclick;
+  sheet.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); done.click(); } };
+  done.focus();
+}
+
 function openForgetSheet(opener: HTMLElement): void {
   closeForgetSheet();
   forgetOpener = opener;
@@ -2203,25 +2243,46 @@ function openForgetSheet(opener: HTMLElement): void {
   const title = ptext("h2", "heading", "Forget this phone?");
   title.id = "forget-title";
   sheet.append(title);
-  sheet.append(ptext("p", "body", "This deletes this phone's copy of your data, its key file and its keychain entry. Your Mac keeps everything. Pair again to use this phone again."));
-  // part 2: the core reports the records not yet sent here before it deletes; this phone sends nothing today
-  sheet.append(ptext("p", "body", "This phone sends nothing to your Mac, so nothing on it is missing from your Mac."));
-  sheet.append(ptext("p", "caption muted", "Forgetting does not shut this phone out of your account. Only a key rotation on your Mac does that."));
+  sheet.append(ptext("p", "body", "This deletes this phone's copy of your data, its key file, its keychain entry and its relay setting. Your Mac keeps everything. Pair again to use this phone again."));
+  const unsent = ptext("p", "body", "Counting what has not been sent…");
+  unsent.setAttribute("aria-live", "polite");
+  sheet.append(unsent);
+  sheet.append(ptext("p", "caption muted", FORGET_REVOKE));
+  const problem = el("p", "caption error");
+  problem.setAttribute("role", "alert");
+  sheet.append(problem);
   const actions = el("div", "actions");
   const cancel = el("button", "secondary", "Cancel") as HTMLButtonElement;
   const forget = el("button", "danger", "Forget this phone") as HTMLButtonElement;
-  forget.disabled = true; // part 2 wires this to the core's forget method
+  forget.disabled = true; // until the count is in: the confirmation always shows it first
   cancel.onclick = closeForgetSheet;
-  shade.onclick = closeForgetSheet;
-  sheet.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); closeForgetSheet(); } };
+  shade.onclick = () => { if (!cancel.disabled) closeForgetSheet(); };
+  sheet.onkeydown = (e) => { if (e.key === "Escape" && !cancel.disabled) { e.preventDefault(); closeForgetSheet(); } };
+  forget.onclick = async () => {
+    forget.disabled = true; cancel.disabled = true; problem.textContent = "";
+    try {
+      const answer = await core.call<{ forgotten: boolean; keychain: string }>("pair.forget");
+      forgetResultSheet(sheet, answer);
+    } catch (e) {
+      const busy = core.isCoreError(e) && e.code === "busy";
+      problem.textContent = neutralText(busy
+        ? "A pull is running. Wait for it to finish, then try again."
+        : "This phone could not finish forgetting. Close and reopen the app: it finishes the job when it starts.");
+      forget.disabled = false; cancel.disabled = false;
+    }
+  };
   actions.append(cancel, forget);
   sheet.append(actions);
-  sheet.append(ptext("p", "caption muted", "Deleting is not available in this version yet."));
   document.body.append(shade, sheet);
   forgetSheet = sheet;
   main.inert = true;
   topbar.inert = true;
   cancel.focus();
+  void forgetUnsentLine().then((line) => {
+    if (forgetSheet !== sheet) return;
+    unsent.textContent = neutralText(line);
+    forget.disabled = false;
+  });
 }
 /** The sheet is two siblings of the page in the body; leaving a screen takes both away. */
 window.addEventListener("hashchange", closeForgetSheet);
@@ -3030,8 +3091,14 @@ void (async () => {
     // evidence runs: the drawer drawn open
     if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
     // evidence runs (the phone): the Forget sheet drawn open, by a real click on the screen's own button
-    if (args.includes("--debug-forget-open")) {
+    if (args.includes("--debug-forget-open") || args.includes("--debug-forget-confirm")) {
       setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Forget this phone…")?.click(), 1500);
+    }
+    // evidence runs (the phone): then a real click on the sheet's own confirm button, once the count is in
+    if (args.includes("--debug-forget-confirm")) {
+      setTimeout(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button.danger")).find((b) => b.textContent === "Forget this phone")?.click(), 4500);
+      // and a real click on the result's own Done button, which returns the app to Pair Start
+      setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Done")?.click(), 9000);
     }
     // evidence runs: a real click on the Sync screen's own "Sync now" button (the network call
     // still comes from a click, never from the page's own code path)

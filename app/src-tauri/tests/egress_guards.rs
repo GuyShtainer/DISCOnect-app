@@ -606,6 +606,8 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
         used.extend(called_methods(&text(&path)));
     }
     assert!(used.contains("data.today") && used.contains("key.unlock"), "the scanner sees the calls: {used:?}");
+    // the phone's own method is on the phone's list only (the next test); the desktop list is the first one
+    used.remove("pair.forget");
     assert!(used.is_subset(&allowed), "a method the page calls is missing from ALLOWED_METHODS: {:?}", used.difference(&allowed).collect::<Vec<_>>());
     assert!(!allowed.contains("import.run"), "an import starts only from the OS drop, never from the page");
     let lib = text(&manifest().join("src").join("lib.rs"));
@@ -618,7 +620,7 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
 }
 
 #[test]
-fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_none() {
+fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_only_forget() {
     let lib = text(&manifest().join("src").join("lib.rs"));
     let mut lists = lib.split("pub const ALLOWED_METHODS: &[&str] = &[").skip(1).map(|t| t.split("];").next().expect("closed list"));
     let names = |body: &str| -> BTreeSet<String> { body.split('"').skip(1).step_by(2).map(str::to_string).collect() };
@@ -626,7 +628,10 @@ fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_none() {
     assert!(lists.next().is_none(), "two lists, one per platform");
     let dropped: BTreeSet<String> = desktop.difference(&phone).cloned().collect();
     assert_eq!(dropped, ["pair.confirm", "pair.offer", "relay.addresses", "relay.serve"].map(String::from).into_iter().collect(), "only the four server-side methods go");
-    assert!(phone.is_subset(&desktop), "the phone's list adds nothing: {:?}", phone.difference(&desktop).collect::<Vec<_>>());
+    let added: BTreeSet<String> = phone.difference(&desktop).cloned().collect();
+    assert_eq!(added, ["pair.forget"].map(String::from).into_iter().collect(), "the phone's list adds only its own forget method");
+    let page = app_dir().join("src").join("app.ts");
+    assert!(text(&page).contains("\"pair.forget\""), "the page calls the method the phone's list adds");
 }
 
 #[test]
