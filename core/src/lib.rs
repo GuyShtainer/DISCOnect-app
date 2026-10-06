@@ -22,6 +22,7 @@ pub mod mcp_args;
 pub mod mcp_start;
 pub mod mcp_tools;
 pub mod model;
+pub mod pair;
 pub mod read;
 pub mod redact;
 pub mod relay;

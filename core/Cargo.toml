@@ -38,6 +38,7 @@ ryu = "1.0.23"
 getrandom = "0.4"
 hmac = "0.13.0"
 ureq = { version = "3", default-features = false }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 
 # The OS keychain behind `key.cache` (MIT/Apache-2.0; talks to the Security framework in-process,
 # so the master key never appears in a child process's argv). Other platforms: no keychain.
