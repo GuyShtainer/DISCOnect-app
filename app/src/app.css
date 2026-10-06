@@ -34,10 +34,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
 .scope-device { color: var(--device); }
 .scope-vendor_cloud { color: var(--vendor-cloud); }
 .scope-local { color: var(--local); }
+.scope-live { color: var(--live); }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: var(--radius-sm); vertical-align: middle; margin-right: var(--space-1); }
 .swatch.device { background: var(--device); }
 .swatch.vendor_cloud { background: var(--vendor-cloud); }
 .swatch.local { background: var(--local); }
+.swatch.live { background: var(--live); }
 
 button, .button { min-height: 44px; padding: 0 var(--space-4); border: 0; border-radius: var(--radius-md); background: var(--accent); color: var(--on-accent); font: inherit; font-weight: 600; cursor: pointer; }
 button.secondary { background: var(--surface); color: var(--ink); border: 1px solid var(--hairline); }

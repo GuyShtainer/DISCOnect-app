@@ -6,7 +6,7 @@ import { scopeWord } from "./identity";
 
 export type Series = { scope: string; unit: string | null; days: { day: string; value: number | null; status: string }[] };
 
-const SCOPE_TOKEN: Record<string, string> = { device: "--device", vendor_cloud: "--vendor-cloud", local: "--local" };
+const SCOPE_TOKEN: Record<string, string> = { device: "--device", vendor_cloud: "--vendor-cloud", local: "--local", live: "--live" };
 
 export function token(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();

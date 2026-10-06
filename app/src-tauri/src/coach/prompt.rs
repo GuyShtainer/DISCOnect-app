@@ -56,7 +56,7 @@ pub fn contract_digest() -> String {
         join(contract.labels.iter().map(|m| m.metric.clone())),
         "Sparse metrics (recorded only on some days; empty days are normal):".to_string(),
         join(contract.sparse_metrics.iter().cloned()),
-        "Source scopes: device (decoded from the watch's own files), vendor_cloud (a figure the maker's cloud computed), local (computed by this app from device data). Stored side by side, never merged.".to_string(),
+        "Source scopes: device (decoded from the watch's own files), vendor_cloud (a figure the maker's cloud computed), local (computed by this app from device data), live (readings the watch sent over the Bluetooth link during a session, one per minute; a session is not a day of monitoring). Stored side by side, never merged.".to_string(),
         "Coverage status of a day for a metric and scope: present, failed, source_empty, not_covered.".to_string(),
     ];
     lines.retain(|line| !line.is_empty());

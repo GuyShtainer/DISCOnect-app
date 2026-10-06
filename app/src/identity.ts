@@ -60,6 +60,7 @@ export const SCOPE_WORD: Record<string, string> = {
   device: "device",
   vendor_cloud: "vendor cloud",
   local: "local",
+  live: "live link",
 };
 
 /** Human labels for the metrics the screens show; everything else falls back to the id. */
