@@ -41,7 +41,7 @@ pub const OFFERER_TAG_LEN: usize = 32;
 pub const TRANSCRIPT_LEN: usize = LABEL.len() + 1 + 32 + 32 + 16 + 8;
 
 /// Why a pairing step was refused. Never carries the offer text or any secret.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum PairError {
     #[error("bad offer text: {0}")]
     BadOffer(&'static str),
@@ -53,6 +53,28 @@ pub enum PairError {
     BadPayload,
     #[error("no random bytes available")]
     Random,
+    #[error("the offer has not been joined yet")]
+    NotBound,
+    #[error("the offer expired")]
+    Expired,
+    #[error("the offer ended (another device answered, or it was aborted)")]
+    OfferEnded,
+    #[error("the codes differ")]
+    CodesDiffer,
+    #[error("cannot reach the offerer")]
+    Network,
+    #[error("the offerer refused the request (HTTP {0})")]
+    Refused(u16),
+    #[error("cancelled")]
+    Cancelled,
+    #[error("the paired key file does not match the key: {0}")]
+    KeyFile(&'static str),
+    /// A landing precondition failed before any request or write (nothing was changed).
+    #[error("cannot pair here: {0}")]
+    Precondition(&'static str),
+    /// A write or the first pull failed after the landing began; the text states what is left.
+    #[error("{0}")]
+    Landing(String),
 }
 
 /// The offer: what the offerer shows (QR / pasted text) and the joiner parses.

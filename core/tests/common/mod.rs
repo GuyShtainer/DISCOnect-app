@@ -25,4 +25,5 @@ pub fn encrypted_copy() -> (tempfile::TempDir, PathBuf) {
     (dir, db)
 }
 
+pub mod convergence;
 pub mod decoded_cmp;

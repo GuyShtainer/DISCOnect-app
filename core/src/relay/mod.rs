@@ -12,4 +12,5 @@ pub mod config;
 pub mod folder;
 pub mod lan;
 pub mod lan_server;
+pub mod pair_routes;
 pub mod sync;

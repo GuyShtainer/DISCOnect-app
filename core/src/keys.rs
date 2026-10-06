@@ -117,6 +117,12 @@ pub fn read_key_file(path: &Path) -> Result<KeyFile, KeyError> {
     parse_document(&raw)
 }
 
+/// Parse key file bytes (the same checks as [`read_key_file`]) without touching a file.
+pub fn parse_key_file(bytes: &[u8]) -> Result<KeyFile, KeyError> {
+    let raw: Value = serde_json::from_slice(bytes).or_else(|_| corrupt("key file is unreadable"))?;
+    parse_document(&raw)
+}
+
 fn parse_document(raw: &Value) -> Result<KeyFile, KeyError> {
     let format_ok = raw.get("format").and_then(Value::as_str) == Some(KEY_FILE_FORMAT);
     let version = raw.get("format_version").and_then(Value::as_u64).unwrap_or(0);

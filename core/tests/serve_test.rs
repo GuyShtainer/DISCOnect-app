@@ -424,7 +424,8 @@ fn the_dependency_tree_has_no_network_crate_but_the_lan_relays_client() {
     // Bet 12 slice 12-B: the LAN relay is the one network feature (ADR 0005, "self-hosted"): `ureq` (client, no
     // TLS) and a std `TcpListener` server of its own (the review replaced `tiny_http`, which has no
     // time-outs), and nothing else in the crate may name them
-    let allowed = ["src/relay/lan.rs", "src/relay/lan_server.rs"];
+    // Bet 12-E: the pairing joiner (`pair_client.rs`) is a second `ureq` client of the same LAN server
+    let allowed = ["src/relay/lan.rs", "src/relay/lan_server.rs", "src/pair_client.rs"];
     let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
     while let Some(folder) = stack.pop() {
         for entry in std::fs::read_dir(&folder).expect("read src") {

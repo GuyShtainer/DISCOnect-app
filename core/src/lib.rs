@@ -23,6 +23,7 @@ pub mod mcp_start;
 pub mod mcp_tools;
 pub mod model;
 pub mod pair;
+pub mod pair_client;
 pub mod read;
 pub mod redact;
 pub mod relay;

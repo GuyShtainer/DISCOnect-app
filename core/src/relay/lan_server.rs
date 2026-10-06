@@ -12,6 +12,9 @@
 //! * `GET|PUT|DELETE /v1/objects/<account>/<32 hex>` -- one object (`FolderRelay` semantics:
 //!   a write is an atomic rename and replaces an existing object; a missing object is 404).
 //!
+//! * `POST /v1/pair/<id>` and `GET /v1/pair/<id>/payload` -- only when an offer is attached (`pair offer`),
+//!   unauthenticated by design; see `pair_routes.rs` and `docs/relay-protocol.md`, "Pairing routes".
+//!
 //! Everything else answers 404 or 405; a bad token 401 with an empty body whatever the reason; a
 //! name outside the pattern 400; a name under another account 403; a body over one bundle 413; a
 //! body that stops arriving 408. Nothing but the method and the status is ever logged.
@@ -52,6 +55,7 @@ use super::folder::{FolderRelay, MAX_OBJECT, Relay, RelayError, is_object_name};
 use super::lan::{
     API_VERSION, HEALTH, OBJECTS, parse_auth, token_key, verify_pre, verify_tag, wall_clock,
 };
+use super::pair_routes::{self, PAIR, PairHandle, PairOffer, PairShared};
 use crate::identity::PRODUCT;
 
 /// Connections served at once; one more is closed unanswered.
@@ -119,6 +123,8 @@ pub struct Ctx {
     key: Zeroizing<[u8; 32]>,
     limits: Limits,
     lingers: Arc<AtomicUsize>,
+    /// The pairing offer, if this server carries one (`pair offer`); `None`: every pair route is 404.
+    offer: Option<Arc<PairShared>>,
 }
 
 impl Ctx {
@@ -133,7 +139,14 @@ impl Ctx {
             key: token_key(master),
             limits,
             lingers: Arc::new(AtomicUsize::new(0)),
+            offer: None,
         }
+    }
+
+    /// This context also serves `handle`'s offer on the pairing routes.
+    pub fn with_offer(mut self, offer: Arc<PairShared>) -> Ctx {
+        self.offer = Some(offer);
+        self
     }
 }
 
@@ -179,6 +192,9 @@ pub fn handle(
 ) -> Reply {
     if url.contains('?') {
         return Reply::status(404);
+    }
+    if url == PAIR || url.starts_with(&format!("{PAIR}/")) {
+        return pair_routes::handle(ctx.offer.as_deref(), method, url, declared_len, body, now);
     }
     if url == HEALTH {
         if method != "GET" {
@@ -266,6 +282,15 @@ pub fn handle(
 /// (`?` stands for a request whose method could not be read).
 pub type Logger = Arc<dyn Fn(&str, u16) + Send + Sync>;
 
+fn bind(listen: &str) -> Result<TcpListener, String> {
+    let listener =
+        TcpListener::bind(listen).map_err(|_| "cannot listen on that address".to_string())?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| "cannot configure the listener".to_string())?;
+    Ok(listener)
+}
+
 /// A running server: an accept loop and one thread per connection, until [`LanServer::stop`] (or drop).
 pub struct LanServer {
     addr: SocketAddr,
@@ -293,15 +318,38 @@ impl LanServer {
         log: Logger,
         limits: Limits,
     ) -> Result<LanServer, String> {
-        let listener =
-            TcpListener::bind(listen).map_err(|_| "cannot listen on that address".to_string())?;
+        let listener = bind(listen)?;
+        let ctx = Ctx::with_limits(folder, master, limits);
+        LanServer::spawn(listener, ctx, log)
+    }
+
+    /// [`LanServer::start_with`] plus one pairing offer (Bet 12-E): binds first, so the offer carries
+    /// the address actually bound (`http://<local_addr>`; `listen` must therefore be an address the
+    /// joiner can reach, and a caller that wants a fixed URL refuses port 0 itself). Returns the
+    /// server, the offer text and the offer's handle.
+    pub fn start_with_offer(
+        listen: &str,
+        folder: impl Into<PathBuf>,
+        master: &[u8],
+        log: Logger,
+        limits: Limits,
+    ) -> Result<(LanServer, String, PairHandle), String> {
+        let listener = bind(listen)?;
         let addr = listener
             .local_addr()
             .map_err(|_| "the listener has no address".to_string())?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "cannot configure the listener".to_string())?;
-        let ctx = Arc::new(Ctx::with_limits(folder, master, limits));
+        let (text, handle) = PairOffer::new(&format!("http://{addr}"))
+            .map_err(|_| "cannot make an offer".to_string())?;
+        let ctx = Ctx::with_limits(folder, master, limits).with_offer(handle.shared());
+        let server = LanServer::spawn(listener, ctx, log)?;
+        Ok((server, text, handle))
+    }
+
+    fn spawn(listener: TcpListener, ctx: Ctx, log: Logger) -> Result<LanServer, String> {
+        let addr = listener
+            .local_addr()
+            .map_err(|_| "the listener has no address".to_string())?;
+        let ctx = Arc::new(ctx);
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let (loop_stop, loop_active) = (Arc::clone(&stop), Arc::clone(&active));
@@ -541,6 +589,7 @@ fn parse_head(text: &str) -> Result<Head, u16> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -548,6 +597,7 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        410 => "Gone",
         413 => "Content Too Large",
         _ => "Internal Server Error",
     }

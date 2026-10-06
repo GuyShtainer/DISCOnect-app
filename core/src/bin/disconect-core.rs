@@ -15,6 +15,17 @@
 //! unlocked key only to derive the token key and the account, never decrypts a bundle, binds `127.0.0.1:0` unless
 //! `--listen` says otherwise, prints `listening http://<addr>` on stdout and logs only method and status to stderr.
 //!
+//! `disconect-core --db <path> --passphrase-file <file> --relay <folder> --listen <addr:port> pair offer`
+//! pairs a second device (Bet 12-E, ADR 0011): it is `relay-serve` plus one offer. It pushes the store to the
+//! folder first, prints the offer text (one line, stdout; treat it like a QR photo), waits for a device, prints
+//! the code on stderr, reads the six digits the other device shows from stdin and releases the key only if they
+//! match; then it keeps serving until Ctrl-C. `--listen` must be an address the joiner can reach; port 0 is
+//! refused (the URL becomes the joiner's relay).
+//! `disconect-core --db <new db> [--relay-file <path>] pair join` reads the offer text from stdin (never argv),
+//! refuses before any request when the store, its key file, `<keys>.next`, `DISCONECT_KEYS` or a different relay
+//! file are in the way, shows its code on stderr, then writes the relay file (`<db>.relay.json` by default), the
+//! key file (atomically), the encrypted store, and pulls; stdout is `{"paired": true, "pulled": {...}}`.
+//!
 //! `reparse` replays decoding over the retained raw records (`sources::reparse_all`, the Python `reparse`);
 //! `--json` prints the run's `ImportStats` plus `status`, the same keys as the Python CLI.
 //!
@@ -39,7 +50,11 @@ use disconect_core::identity;
 use disconect_core::serve;
 use disconect_core::relay::config::{self as relay_cfg, RelayConfig};
 use disconect_core::relay::folder::{Relay, RelayError};
-use disconect_core::relay::lan_server::LanServer;
+use disconect_core::pair::{EXPIRY_S, PairError};
+use disconect_core::pair_client;
+use disconect_core::relay::folder::FolderRelay;
+use disconect_core::relay::lan_server::{LanServer, Limits};
+use disconect_core::relay::pair_routes::PairState;
 use disconect_core::relay::sync::{self, PullResult, StatusReport, SyncError};
 use disconect_core::sources::{self, SourceError, TRANSPORTS};
 use disconect_core::writer::{ImportStats, WriterError};
@@ -70,6 +85,8 @@ struct Args {
     remember: bool,
     streams: Vec<String>,
     force: bool,
+    pair_action: Option<String>,
+    relay_file: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -79,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut sync_action, mut relay, mut remember) = (None, None, false);
     let mut listen = None;
     let (mut streams, mut force) = (Vec::new(), false);
+    let (mut pair_action, mut relay_file) = (None, None);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(it.next().ok_or("--db needs a path")?)),
@@ -96,7 +114,9 @@ fn parse_args() -> Result<Args, String> {
             "--remember" => remember = true,
             "--stream" => streams.push(it.next().ok_or("--stream needs a value")?),
             "--force" => force = true,
-            "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" | "relay-serve" if command.is_none() => command = Some(arg),
+            "--relay-file" => relay_file = Some(PathBuf::from(it.next().ok_or("--relay-file needs a path")?)),
+            "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" | "relay-serve" | "pair" if command.is_none() => command = Some(arg),
+            "offer" | "join" if command.as_deref() == Some("pair") && pair_action.is_none() => pair_action = Some(arg),
             "push" | "pull" | "status" | "forget"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
@@ -121,6 +141,8 @@ fn parse_args() -> Result<Args, String> {
         remember,
         streams,
         force,
+        pair_action,
+        relay_file,
     })
 }
 
@@ -463,6 +485,106 @@ fn run_relay_serve(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8,
     Ok(())
 }
 
+/// The refusal text of a pairing step. Never the offer text, a code or a key.
+fn pair_failure(error: &PairError) -> (u8, String) {
+    let code = match error {
+        PairError::Precondition(_) | PairError::BadOffer(_) => EXIT_USAGE,
+        PairError::Network => EXIT_UNREACHABLE,
+        _ => 1,
+    };
+    (code, error.to_string())
+}
+
+/// `pair offer`: `relay-serve` plus one offer slot (Bet 12-E).
+fn run_pair_offer(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String)> {
+    if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay_file.is_some() {
+        return Err((EXIT_USAGE, "usage: pair offer takes --db, --passphrase-file, --relay <folder> and --listen".into()));
+    }
+    let listen = args.listen.as_deref().ok_or((EXIT_USAGE, "usage: pair offer needs --listen <addr:port>".to_string()))?;
+    let port = listen.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+    if port.is_none_or(|p| p == 0) {
+        return Err((EXIT_USAGE, "usage: --listen needs an explicit port (not 0): the URL becomes the joiner's relay".into()));
+    }
+    let db = db_of(args)?;
+    let master = store::resolve_master(db, source).map_err(|e| (open_error_code(&e), e.to_string()))?;
+    let Some(master) = master else {
+        return Err((
+            EXIT_LOCKED,
+            format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
+        ));
+    };
+    let folder = match relay_config_for(args)? {
+        RelayConfig::Folder(folder) => expand_user(&folder),
+        RelayConfig::Lan(_) => return Err((EXIT_USAGE, "usage: pair offer serves a folder, not an http:// address".into())),
+    };
+    let key_file_bytes = std::fs::read(keys::key_path_for(db)).map_err(|_| (1, "cannot read the key file".to_string()))?;
+    // the joiner bootstraps from what was last pushed: push first, then release the write lock
+    {
+        let opened = store::open_for_write_with(db, "pair", 10.0, Some(&master)).map_err(|e| (open_error_code(&e), e.to_string()))?;
+        let relay = FolderRelay::new(folder.clone());
+        sync::push(opened.conn(), &*master, &relay).map_err(|e| (sync_exit(&e), e.to_string()))?;
+    }
+    let log: disconect_core::relay::lan_server::Logger = std::sync::Arc::new(|method, status| eprintln!("{method} {status}"));
+    let (server, offer, handle) =
+        LanServer::start_with_offer(listen, folder, master.as_slice(), log, Limits::default()).map_err(|m| (1, m))?;
+    println!("{offer}");
+    eprintln!("Waiting for a device\u{2026}");
+    let sas = handle.wait_joined(std::time::Duration::from_secs(EXPIRY_S + 5));
+    let Some(sas) = sas else {
+        return Err((
+            1,
+            match handle.state() {
+                PairState::Aborted => "another device answered — start over".to_string(),
+                _ => "the offer expired".to_string(),
+            },
+        ));
+    };
+    eprintln!("Code on the Mac: {sas:06}");
+    eprintln!("Type the code shown on the other device:");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    match handle.release(line.trim(), &master, &key_file_bytes) {
+        Ok(()) => {}
+        Err(PairError::CodesDiffer) => {
+            // stay up a moment so the joiner's next poll reads 410 rather than a closed port
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            return Err((1, "the codes differ — aborted".to_string()));
+        }
+        Err(e) => return Err(pair_failure(&e)),
+    }
+    eprintln!("released");
+    eprintln!("Pairing done; serving the relay (Ctrl-C to stop)");
+    server.wait();
+    Ok(())
+}
+
+/// `pair join`: the offer text comes from stdin, never argv.
+fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
+    if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay.is_some() || args.listen.is_some() {
+        return Err((EXIT_USAGE, "usage: pair join takes --db <new store> and --relay-file <path>; the offer text comes on stdin".into()));
+    }
+    let db = db_of(args)?;
+    let mut text = String::new();
+    std::io::stdin().read_line(&mut text).map_err(|_| (1, "cannot read the offer text from stdin".to_string()))?;
+    let text = Zeroizing::new(text.trim().to_string());
+    let offer = disconect_core::pair::Offer::parse(&text).map_err(|e| pair_failure(&e))?;
+    let relay_file = args
+        .relay_file
+        .clone()
+        .unwrap_or_else(|| keys::sibling_with_suffix(db, ".relay.json"));
+    pair_client::check_landing_site(db, &relay_file, &offer.url).map_err(|e| pair_failure(&e))?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let joined = pair_client::join(
+        &text,
+        &mut |code| eprintln!("Code on this device: {code} — type it into the offerer"),
+        &cancel,
+    )
+    .map_err(|e| pair_failure(&e))?;
+    let pulled = pair_client::land(&joined, db, &relay_file).map_err(|e| pair_failure(&e))?;
+    println!("{}", json!({"paired": true, "pulled": pull_json(&pulled)}));
+    if pulled.status == "ok" { Ok(()) } else { Err((1, String::new())) }
+}
+
 /// The store a command works on: `--db` is required for everything except `serve`.
 fn db_of(args: &Args) -> Result<&PathBuf, (u8, String)> {
     args.db.as_ref().ok_or((1, "--db <path> is required".to_string()))
@@ -483,6 +605,11 @@ fn run(args: &Args) -> Result<(), (u8, String)> {
         "reparse" => run_reparse(args, source),
         "sync" => run_sync(args, source),
         "relay-serve" => run_relay_serve(args, source),
+        "pair" => match args.pair_action.as_deref() {
+            Some("offer") => run_pair_offer(args, source),
+            Some("join") => run_pair_join(args),
+            _ => Err((EXIT_USAGE, "pair needs an action: offer | join".to_string())),
+        },
         "status" if args.json => {
             let value = status(db_of(args)?, source).map_err(fail)?;
             println!("{value}");
