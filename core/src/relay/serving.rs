@@ -111,6 +111,8 @@ pub struct RelayState {
     /// A `pair.offer` is pushing: the offer is reserved, not yet attached.
     reserved: bool,
     reserved_cancelled: bool,
+    /// The address the reserved push will serve.
+    reserved_listen: Option<SocketAddr>,
     stopping: bool,
     last_port: Option<u16>,
     /// The session is over: nothing binds any more.
@@ -129,6 +131,7 @@ pub fn new_state() -> Shared {
         offer: None,
         reserved: false,
         reserved_cancelled: false,
+        reserved_listen: None,
         stopping: false,
         last_port: None,
         ended: false,
@@ -236,6 +239,9 @@ pub fn parse_listen(text: &str) -> Result<SocketAddr, String> {
     } else {
         IpAddr::V4(host.parse::<Ipv4Addr>().map_err(|_| shape())?)
     };
+    if matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()) {
+        return Err(shape());
+    }
     let port_ok = !port.is_empty()
         && port.len() <= 5
         && port.bytes().all(|b| b.is_ascii_digit())
@@ -302,9 +308,22 @@ fn finish_stop(shared: &Shared, taken: Option<Running>) {
     }
 }
 
+/// Keep a thread to join at the end of the session, dropping the ones that already finished.
+fn push_thread(st: &mut RelayState, handle: JoinHandle<()>) {
+    st.threads.retain(|t| !t.is_finished());
+    st.threads.push(handle);
+}
+
 /// Start the server on `listen` if none runs; a running one must serve the same address. Returns
-/// whether this call started it.
-fn ensure_server(env: &Env, st: &mut RelayState, listen: SocketAddr, site: &Site) -> Result<bool, Refusal> {
+/// whether this call started it. A server whose watcher could not start is left in `orphan` for the
+/// caller to stop once it holds no lock.
+fn ensure_server(
+    env: &Env,
+    st: &mut RelayState,
+    listen: SocketAddr,
+    site: &Site,
+    orphan: &mut Option<LanServer>,
+) -> Result<bool, Refusal> {
     if st.ended {
         return Err(refuse("internal", "the session ended"));
     }
@@ -331,9 +350,10 @@ fn ensure_server(env: &Env, st: &mut RelayState, listen: SocketAddr, site: &Site
     st.next_id += 1;
     let watcher = spawn_address_watcher(env, id, addr.ip());
     match watcher {
-        Ok(handle) => st.threads.push(handle),
+        Ok(handle) => push_thread(st, handle),
         Err(_) => {
-            server.stop();
+            // stopped by the caller, outside the lock
+            *orphan = Some(server);
             return Err(refuse("internal", "cannot start the address watcher"));
         }
     }
@@ -363,6 +383,7 @@ fn spawn_address_watcher(env: &Env, id: u64, ip: IpAddr) -> std::io::Result<Join
                     if let Some(offer) = st.offer.take() {
                         offer.handle.abort();
                     }
+                    st.keep = false;
                     take_server(&mut st)
                 };
                 emit_event(
@@ -377,10 +398,24 @@ fn spawn_address_watcher(env: &Env, id: u64, ip: IpAddr) -> std::io::Result<Join
 
 /// `relay.serve {"on": true}`: start (or keep) the server on `listen`; `keep` becomes true.
 pub fn serve_on(env: &Env, listen: SocketAddr, site: &Site) -> Result<String, Refusal> {
-    let mut st = lock(&env.shared);
-    ensure_server(env, &mut st, listen, site)?;
-    st.keep = true;
-    Ok(st.server.as_ref().map(|r| url_of(r.addr)).unwrap_or_default())
+    let mut orphan = None;
+    let result = {
+        let mut st = lock(&env.shared);
+        if st.reserved && st.reserved_listen.is_some_and(|a| a != listen) {
+            return Err(refuse("bad_params", "the relay already serves another address"));
+        }
+        match ensure_server(env, &mut st, listen, site, &mut orphan) {
+            Ok(_) => {
+                st.keep = true;
+                Ok(st.server.as_ref().map(|r| url_of(r.addr)).unwrap_or_default())
+            }
+            Err(refusal) => Err(refusal),
+        }
+    };
+    if let Some(server) = orphan {
+        server.stop();
+    }
+    result
 }
 
 /// Is an offer still needing the server: reserved, open, bound, or released and not yet fetched.
@@ -450,6 +485,7 @@ pub fn reserve_offer(env: &Env, listen: SocketAddr) -> Result<(), Refusal> {
     }
     st.reserved = true;
     st.reserved_cancelled = false;
+    st.reserved_listen = Some(listen);
     Ok(())
 }
 
@@ -458,6 +494,7 @@ pub fn drop_reservation(env: &Env) {
     let mut st = lock(&env.shared);
     st.reserved = false;
     st.reserved_cancelled = false;
+    st.reserved_listen = None;
 }
 
 /// The offer a finished push turns into: the server is started if none runs, the offer attached and
@@ -467,13 +504,24 @@ pub fn finish_offer(env: &Env, listen: SocketAddr, site: &Site) -> Result<(Strin
     let cancelled = st.reserved_cancelled;
     st.reserved = false;
     st.reserved_cancelled = false;
+    st.reserved_listen = None;
     if st.ended {
         return Err(refuse("internal", "the session ended"));
     }
     if cancelled {
         return Err(refuse("pair_failed", "the offer ended"));
     }
-    let started = ensure_server(env, &mut st, listen, site)?;
+    let mut orphan = None;
+    let started = match ensure_server(env, &mut st, listen, site, &mut orphan) {
+        Ok(started) => started,
+        Err(refusal) => {
+            drop(st);
+            if let Some(server) = orphan {
+                server.stop();
+            }
+            return Err(refusal);
+        }
+    };
     let Some(addr) = st.server.as_ref().map(|r| r.addr) else {
         return Err(refuse("internal", "cannot listen on that address"));
     };
@@ -507,7 +555,7 @@ pub fn finish_offer(env: &Env, listen: SocketAddr, site: &Site) -> Result<(Strin
         .name("relay-pair".into())
         .spawn(move || watch_offer(&watcher_env, serial, &watch_handle, &watch_events));
     match spawned {
-        Ok(thread) => st.threads.push(thread),
+        Ok(thread) => push_thread(&mut st, thread),
         Err(_) => {
             handle.abort();
             let taken = if started && !st.keep { take_server(&mut st) } else { None };
@@ -554,7 +602,7 @@ fn watch_offer(env: &Env, serial: u64, handle: &PairHandle, events: &Mutex<Event
                 }
             }
             PairState::Aborted => {
-                if !ev.ended && !ev.delivered {
+                if !ev.ended && !ev.delivered && !delivered {
                     say(env, &mut ev, "aborted", Some("another_device"), true);
                 }
                 drop(ev);
@@ -586,7 +634,7 @@ fn end_of_offer(env: &Env, serial: u64, linger: bool) {
     }
     let taken = {
         let mut st = lock(&env.shared);
-        if st.ended || st.offer.as_ref().is_none_or(|o| o.serial != serial) || st.keep {
+        if st.ended || st.offer.as_ref().is_none_or(|o| o.serial != serial) || st.keep || st.reserved {
             return;
         }
         take_server(&mut st)

@@ -21,7 +21,7 @@ use common::{PASSPHRASE, encrypted_copy, fixtures};
 use disconect_core::keys::{self, PassphraseSource};
 use disconect_core::pair::PairError;
 use disconect_core::pair_client;
-use disconect_core::relay::serving::{self, Hooks};
+use disconect_core::relay::serving::{self, Env, Hooks, Site};
 use disconect_core::relay::sync::PullResult;
 use disconect_core::serve::{self, Channel, Session};
 use disconect_core::sources::import_path;
@@ -543,10 +543,12 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
         let reply = locked.call(method, params.clone());
         assert_eq!(reply["error"]["code"], "locked", "{method}");
     }
+    // pair.cancel is a stop path: only `locked` precedes it (see `the_stop_paths_...` below)
+    let prefixed: Vec<_> = calls.iter().filter(|(method, _)| *method != "pair.cancel").collect();
     // (2) no relay: not_found with sync.run's text, before any parameter is looked at
     let (_d2, unconfigured) = encrypted_store(false);
     let mut live = Live::unlocked(&unconfigured, Hooks::default());
-    for (method, params) in &calls {
+    for (method, params) in prefixed.iter().map(|call| (&call.0, &call.1)) {
         let reply = live.call(method, params.clone());
         assert_eq!(
             error_of(&reply),
@@ -556,7 +558,7 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
     }
     // (3) a lan relay serves nothing
     relay_json(&unconfigured, json!({"lan": "http://127.0.0.1:9"}));
-    for (method, params) in &calls {
+    for (method, params) in prefixed.iter().map(|call| (&call.0, &call.1)) {
         let reply = live.call(method, params.clone());
         assert_eq!(error_of(&reply), ("bad_params", "this device is a joiner; it serves nothing"), "{method}");
     }
@@ -566,7 +568,7 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
     store::open_for_write(&plain, "test", 1.0, PassphraseSource::Explicit("unused")).expect("create");
     relay_json(&plain, json!({"folder": dir.path().join("relay")}));
     let mut plain_live = Live::start(&plain, Hooks::default(), None);
-    for (method, params) in &calls {
+    for (method, params) in prefixed.iter().map(|call| (&call.0, &call.1)) {
         let reply = plain_live.call(method, params.clone());
         assert_eq!(reply["error"]["code"], "not_encrypted", "{method}");
         assert!(
@@ -581,7 +583,7 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
     let (_d3, rotating) = serving_store(false);
     std::fs::write(keys::next_path_for(&keys::key_path_for(&rotating)), "{}").expect("next file");
     let mut rot = Live::unlocked(&rotating, Hooks::default());
-    for (method, params) in &calls {
+    for (method, params) in prefixed.iter().map(|call| (&call.0, &call.1)) {
         let reply = rot.call(method, params.clone());
         assert_eq!(error_of(&reply), ("busy", "a key rotation is in progress; finish it first"), "{method}");
     }
@@ -627,6 +629,9 @@ fn listen_refusals_name_the_rule_and_never_the_address() {
         ("169.254.9.9:24816", "listen cannot carry a zone id"),
         ("::1:24816", "listen must be an IP address and a port"),
         ("[::1]24816", "listen must be an IP address and a port"),
+        ("[::ffff:0.0.0.0]:24816", "listen must be an IP address and a port"),
+        ("[::ffff:169.254.1.1]:24816", "listen must be an IP address and a port"),
+        ("[::ffff:192.168.1.20]:24816", "listen must be an IP address and a port"),
     ];
     for (value, rule) in refused_values {
         for method in ["relay.serve", "pair.offer"] {
@@ -656,6 +661,12 @@ fn listen_refusals_name_the_rule_and_never_the_address() {
     assert_eq!(live.serving(), Value::Null);
     assert!(serving::parse_listen("[::1]:24816").is_ok());
     assert!(serving::parse_listen("10.0.0.2:1").is_ok());
+    for mapped in ["[::ffff:0.0.0.0]:24816", "[::ffff:169.254.1.1]:24816", "[::ffff:192.168.1.20]:24816"] {
+        assert_eq!(
+            serving::parse_listen(mapped).expect_err("an IPv4-mapped literal"),
+            "listen must be an IP address and a port, like 192.168.1.20:24816"
+        );
+    }
 }
 
 #[test]
@@ -750,6 +761,204 @@ fn the_session_end_stops_the_server_before_the_import_wait() {
 
 /// The leaf paths allowed to carry an address (the offer text carries the offerer's key and the URL).
 const ALLOWED_PATHS: [&str; 3] = ["result.offer", "result.url", "result.serving.url"];
+
+/// A joiner that goes all the way to delivery (digits confirmed, first pull landed).
+fn deliver(live: &mut Live, offer_text: &str) -> String {
+    let joiner = spawn_joiner(offer_text.to_string());
+    let digits = joiner.digits();
+    live.event("pair", "bound");
+    assert_eq!(live.call("pair.confirm", json!({"digits": digits}))["result"], json!({"state": "released"}));
+    live.event("pair", "delivered");
+    joiner.thread.join().expect("joiner thread").expect("lands");
+    digits
+}
+
+fn offer_text(reply: &Value) -> String {
+    reply["result"]["offer"].as_str().expect("offer").to_string()
+}
+
+fn pair_states(live: &mut Live) -> Vec<String> {
+    live.events("pair").iter().map(|e| e["state"].as_str().expect("state").to_string()).collect()
+}
+
+#[test]
+fn a_cancel_after_delivery_stops_the_server_after_the_linger_with_no_pair_event() {
+    let (_dir, db) = serving_store(true);
+    let mut live = Live::unlocked(&db, fast(None, 300));
+    let listen = listen_on_free_port();
+    let reply = live.call("pair.offer", json!({"listen": listen}));
+    deliver(&mut live, &offer_text(&reply));
+    assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
+    assert!(wait_until(15, || live.serving().is_null()), "keep is off: the server stops after the linger");
+    assert!(refused(&listen));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(pair_states(&mut live), ["bound", "delivered"], "no aborted event after a delivery");
+}
+
+#[test]
+fn keep_on_across_a_delivered_offer_that_reaches_its_expiry_keeps_the_server() {
+    let (_dir, db) = serving_store(true);
+    let mut live = Live::unlocked(&db, fast(Some(4), 200));
+    let listen = listen_on_free_port();
+    live.call("relay.serve", json!({"on": true, "listen": listen}));
+    let reply = live.call("pair.offer", json!({"listen": listen}));
+    deliver(&mut live, &offer_text(&reply));
+    // the offer's exp passes (4 s) and the linger after it
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(http_status(&listen, "/v1/health"), Some(200), "keep is on: the server stays");
+    assert_eq!(live.serving(), json!({"url": format!("http://{listen}"), "keep": true, "offer": null}));
+    assert_eq!(pair_states(&mut live), ["bound", "delivered"], "no expiry event after a delivery");
+}
+
+#[test]
+fn the_address_watcher_takes_an_open_offer_silently_and_the_offer_is_gone() {
+    let (_dir, db) = serving_store(false);
+    let present = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&present);
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let hooks = Hooks {
+        address_check: Duration::from_millis(100),
+        addresses: Arc::new(move || if flag.load(Ordering::SeqCst) { vec![loopback] } else { Vec::new() }),
+        ..Hooks::default()
+    };
+    let mut live = Live::unlocked(&db, hooks);
+    let listen = listen_on_free_port();
+    assert!(live.call("pair.offer", json!({"listen": listen}))["result"]["offer"].is_string());
+    present.store(false, Ordering::SeqCst);
+    assert_eq!(live.event("relay", "stopped")["reason"], "address_gone");
+    assert!(wait_until(10, || refused(&listen)));
+    assert!(pair_states(&mut live).is_empty(), "the offer ends with no pair event");
+    // documented in serve-protocol.md: the offer is gone, so confirm and cancel both say not_found
+    let confirm = live.call("pair.confirm", json!({"digits": "123456"}));
+    assert_eq!(error_of(&confirm), ("not_found", "there is no offer"));
+    let cancel = live.call("pair.cancel", json!({}));
+    assert_eq!(error_of(&cancel), ("not_found", "there is no offer to cancel"));
+}
+
+#[test]
+fn a_second_offer_after_a_delivery_reuses_the_running_server_and_refuses_another_address() {
+    let (_dir, db) = serving_store(true);
+    let mut live = Live::unlocked(&db, fast(Some(30), 200));
+    let listen = listen_on_free_port();
+    let first = live.call("pair.offer", json!({"listen": listen}));
+    deliver(&mut live, &offer_text(&first));
+    assert_eq!(live.serving()["offer"], "delivered");
+    let other = listen_on_free_port();
+    let refused_other = live.call("pair.offer", json!({"listen": other}));
+    assert_eq!(error_of(&refused_other), ("bad_params", "the relay already serves another address"));
+    let second = live.call("pair.offer", json!({"listen": listen}));
+    assert_eq!(second["result"]["url"], format!("http://{listen}"), "the same address is reused");
+    assert_ne!(offer_text(&second), offer_text(&first), "a new offer, a new QR text");
+    assert_eq!(live.serving()["offer"], "open");
+    assert_eq!(http_status(&listen, "/v1/health"), Some(200));
+    live.call("pair.cancel", json!({}));
+}
+
+#[test]
+fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifetime_rule() {
+    let (_dir, db) = serving_store(false);
+    let present = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&present);
+    let loopback: IpAddr = "127.0.0.1".parse().expect("ip");
+    let hooks = Hooks {
+        address_check: Duration::from_millis(100),
+        linger: Duration::from_millis(200),
+        addresses: Arc::new(move || if flag.load(Ordering::SeqCst) { vec![loopback] } else { Vec::new() }),
+        ..Hooks::default()
+    };
+    let mut live = Live::unlocked(&db, hooks);
+    let listen = listen_on_free_port();
+    live.call("relay.serve", json!({"on": true, "listen": listen}));
+    present.store(false, Ordering::SeqCst);
+    live.event("relay", "stopped");
+    assert_eq!(live.serving(), Value::Null);
+    present.store(true, Ordering::SeqCst);
+    let reply = live.call("pair.offer", json!({"listen": listen}));
+    assert!(reply["result"]["offer"].is_string());
+    assert_eq!(live.serving()["keep"], false, "the switch and the core agree: keep is off");
+    live.call("pair.cancel", json!({}));
+    assert!(wait_until(15, || live.serving().is_null()), "the server stops after the linger");
+    assert!(refused(&listen));
+}
+
+#[test]
+fn the_stop_paths_work_without_the_relay_checks() {
+    let (dir, db) = serving_store(false);
+    let mut live = Live::unlocked(&db, fast(None, 200));
+    let listen = listen_on_free_port();
+    live.call("relay.serve", json!({"on": true, "listen": listen}));
+    assert!(live.call("pair.offer", json!({"listen": listen}))["result"]["offer"].is_string());
+    // `sync forget`-like state: no relay.json; then a lan one; then a rotation file
+    std::fs::remove_file(dir.path().join("relay.json")).expect("remove relay.json");
+    assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
+    assert_eq!(live.event("pair", "aborted")["reason"], "cancelled");
+    relay_json(&db, json!({"lan": "http://127.0.0.1:9"}));
+    std::fs::write(keys::next_path_for(&keys::key_path_for(&db)), "{}").expect("next file");
+    // the other methods still refuse...
+    let on = live.call("relay.serve", json!({"on": true, "listen": listen}));
+    assert_eq!(error_of(&on), ("bad_params", "this device is a joiner; it serves nothing"));
+    // ...and the stop path stops the running listener (keep goes off, no offer needs it)
+    let off = live.call("relay.serve", json!({"on": false}));
+    assert_eq!(off["result"], json!({"serving": false, "url": null}));
+    assert!(refused(&listen));
+    assert_eq!(live.serving(), Value::Null);
+    // nothing running: both answer in their no-op shapes, whatever relay.json says
+    std::fs::remove_file(dir.path().join("relay.json")).expect("remove relay.json");
+    assert_eq!(live.call("relay.serve", json!({"on": false}))["result"], json!({"serving": false, "url": null}));
+    let cancel = live.call("pair.cancel", json!({}));
+    assert_eq!(error_of(&cancel), ("not_found", "there is no offer to cancel"));
+    // the parameter shape is still checked
+    let shape = live.call("relay.serve", json!({"on": false, "listen": "localhost:1"}));
+    assert_eq!(shape["error"]["code"], "bad_params");
+}
+
+/// The library-level rig: an env on the shared state with a site, no protocol loop.
+fn library_env(linger_ms: u64) -> (tempfile::TempDir, Env, Site) {
+    let (dir, db) = serving_store(false);
+    let secret = keys::unlock(&keys::key_path_for(&db), PassphraseSource::Explicit(PASSPHRASE)).expect("unlock");
+    let env = Env {
+        shared: serving::new_state(),
+        hooks: fast(None, linger_ms),
+        emit: Arc::new(|_| {}),
+    };
+    let site = Site {
+        folder: dir.path().join("relay"),
+        master: secret,
+    };
+    (dir, env, site)
+}
+
+#[test]
+fn a_reserved_push_outlasting_the_linger_keeps_the_server_and_is_not_busy() {
+    let (_dir, env, site) = library_env(150);
+    let listen: std::net::SocketAddr = listen_on_free_port().parse().expect("addr");
+    serving::reserve_offer(&env, listen).expect("reserve");
+    serving::finish_offer(&env, listen, &site).expect("first offer");
+    serving::cancel(&env).expect("cancel");
+    // a second push is reserved right away and takes longer than the linger
+    serving::reserve_offer(&env, listen).expect("reserve again");
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(http_status(&listen.to_string(), "/v1/health"), Some(200), "the reservation keeps the server");
+    // another address is refused while the push is reserved
+    let other: std::net::SocketAddr = listen_on_free_port().parse().expect("addr");
+    let refusal = serving::serve_on(&env, other, &site).expect_err("another address");
+    assert_eq!((refusal.code, refusal.message.as_str()), ("bad_params", "the relay already serves another address"));
+    let (_, url, _) = serving::finish_offer(&env, listen, &site).expect("not busy: the relay is not stopping");
+    assert_eq!(url, format!("http://{listen}"));
+    serving::end_session(&env);
+}
+
+#[test]
+fn a_cancel_during_the_push_ends_the_offer_with_pair_failed() {
+    let (_dir, env, site) = library_env(150);
+    let listen: std::net::SocketAddr = listen_on_free_port().parse().expect("addr");
+    serving::reserve_offer(&env, listen).expect("reserve");
+    serving::cancel(&env).expect("a cancel during the push is accepted");
+    let refusal = serving::finish_offer(&env, listen, &site).expect_err("the offer ended");
+    assert_eq!((refusal.code, refusal.message.as_str()), ("pair_failed", "the offer ended"));
+    assert!(refused(&listen.to_string()), "no server was started for a cancelled offer");
+    serving::end_session(&env);
+}
 
 fn strip(value: &mut Value, path: &[&str]) {
     match path {

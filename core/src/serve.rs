@@ -1246,6 +1246,14 @@ fn relay_addresses(session: &mut Session, _call: &Call) -> Result<Value, Failure
 /// The user's switch: serve the relay on `listen` while the app runs (`on` true), or stop (`on` false: the
 /// server stays while an offer still needs it, then follows the offer's lifetime rule).
 fn relay_serve(session: &mut Session, call: &Call) -> Result<Value, Failure> {
+    // the stop path checks only `locked` and the parameter shapes: a running listener must always be
+    // stoppable, even after `sync forget`, a rewritten relay.json or a CLI key rotation
+    session.require_unlocked()?;
+    if matches!(bool_param(call, "on"), Ok(false)) {
+        listen_param(call)?;
+        let url = serving::serve_off(&session.relay_env());
+        return Ok(json!({"serving": url.is_some(), "url": url}));
+    }
     let site = relay_prefix(session)?;
     let on = bool_param(call, "on")?;
     let listen = listen_param(call)?;
@@ -1385,7 +1393,7 @@ fn pair_confirm(session: &mut Session, call: &Call) -> Result<Value, Failure> {
 
 /// End the open offer (idempotent); `not_found` when there is none.
 fn pair_cancel(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
-    relay_prefix(session)?;
+    session.require_unlocked()?;
     serving::cancel(&session.relay_env())?;
     Ok(json!({"state": "aborted"}))
 }
