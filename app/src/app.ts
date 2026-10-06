@@ -678,7 +678,7 @@ async function screenKey(out: ParentNode): Promise<void> {
   about.append(el("span", "muted", `database ${info.db}`));
   const mcp = await core.mcpCommand().catch(() => "");
   if (mcp) {
-    about.append(el("span", "", "Claude Desktop can use this app's core as its MCP server with this command:"));
+    about.append(el("span", "", "Your AI tools can use this app's core as their MCP server with this command:"));
     about.append(el("pre", "mono caption", mcp));
     // The MCP is a separate program with its own keychain item: it needs its own one-time cache.
     const cache = mcp.replace(/ mcp$/, " cli key cache");
@@ -688,7 +688,7 @@ async function screenKey(out: ParentNode): Promise<void> {
       about.append(el("span", "caption muted", "If it reports an existing entry (error -25244), a different copy of the core made it: delete the “disconect-cli” item (not the “disconect” item, which is the app’s own) in Keychain Access, then run it again."));
     }
   }
-  about.append(el("span", "caption muted", "If macOS refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
+  about.append(el("span", "caption muted", "If the system refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
   out.append(about);
 }
 
