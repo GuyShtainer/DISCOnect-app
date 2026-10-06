@@ -493,29 +493,42 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
         }
     }
     // every debug env name appears only in lib.rs, each inside an item that starts at a `#[cfg(debug_assertions)]`
-    // line (the item is the text from that attribute to the next top-level closing brace)
-    for name in [
-        "DISCONECT_DEBUG_IMPORT_PATH",
-        "DISCONECT_DEBUG_DROP_OVER",
-        "DISCONECT_DEBUG_CACHE_KEY",
-        "DISCONECT_DEBUG_SYNC_ON_START",
-        "DISCONECT_DEBUG_KEYCHAIN_PROOF",
-    ] {
-        for path in files_under(&src, "rs") {
-            let code = text(&path);
-            let code = non_test_code(&code);
-            for (at, _) in code.match_indices(name) {
-                let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
-                if code[line_start..at].trim_start().starts_with("//") {
-                    continue; // a doc comment naming the variable
-                }
+    // line (the item is the text from that attribute to the next top-level closing brace); a `#[cfg(test)]` item may
+    // name one anywhere. Whole files are read and every `DISCONECT_DEBUG_*` spelling is checked, not a list: lib.rs
+    // has a test module in its middle, and cutting each file at its first `#[cfg(test)]` once hid every door (12-D
+    // review S1).
+    let doors = debug_env_names(&lib);
+    assert!(doors.len() >= 7, "the check reads lib.rs's debug doors: {doors:?}");
+    for path in files_under(&src, "rs") {
+        let code = text(&path);
+        for (at, _) in code.match_indices("DISCONECT_DEBUG_") {
+            let name = debug_env_names(&code[at..]).into_iter().next().unwrap_or_default();
+            let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            if code[line_start..at].trim_start().starts_with("//") {
+                continue; // a doc comment naming the variable
+            }
+            let gate = ["#[cfg(debug_assertions)]", "#[cfg(test)]"]
+                .into_iter()
+                .filter_map(|attr| code[..at].rfind(attr).map(|i| (i, attr)))
+                .max();
+            let head = gate.map_or("\n}\n", |(i, _)| &code[i..at]);
+            assert!(!head.contains("\n}\n"), "{name} sits outside a `#[cfg(debug_assertions)]` item: {}", path.display());
+            if gate.is_some_and(|(_, attr)| attr == "#[cfg(debug_assertions)]") {
                 assert!(path.ends_with("lib.rs"), "{name} appears outside lib.rs: {}", path.display());
-                let attr = code[..at].rfind("#[cfg(debug_assertions)]");
-                let head = attr.map_or("\n}\n", |i| &code[i..at]);
-                assert!(!head.contains("\n}\n"), "{name} sits outside a `#[cfg(debug_assertions)]` item");
             }
         }
     }
+}
+
+/// Every `DISCONECT_DEBUG_*` name a source spells out.
+fn debug_env_names(code: &str) -> BTreeSet<String> {
+    code.match_indices("DISCONECT_DEBUG_")
+        .map(|(at, prefix)| {
+            let rest = &code[at + prefix.len()..];
+            let len = rest.find(|c: char| !(c.is_ascii_uppercase() || c == '_')).unwrap_or(rest.len());
+            format!("{prefix}{}", &rest[..len])
+        })
+        .collect()
 }
 
 // ---- one web client on the phone (12-D item 5) -----------------------------------------------------------

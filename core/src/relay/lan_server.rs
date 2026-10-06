@@ -4,8 +4,8 @@
 //!
 //! It is blind. It never opens a bundle, never learns a record, and needs the master key only to
 //! derive the token key and the account name (`lan::token_key`). Everything an authenticated
-//! client can do is what a folder relay already allows: list, read, write and delete the objects of
-//! the one account this server's master derives. Routes (docs/relay-protocol.md, "LAN relay"):
+//! client can do is less than a folder relay allows: list, read and write the objects of the one
+//! account this server's master derives (a DELETE is answered 405, 12-D). Routes (docs/relay-protocol.md, "LAN relay"):
 //!
 //! * `GET /v1/health` -- unauthenticated: product, `"lan"`, version. No host name, no path.
 //! * `GET /v1/objects` -- the account's object names, a JSON array.

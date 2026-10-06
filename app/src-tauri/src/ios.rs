@@ -7,9 +7,10 @@
 //!    (`keychain_leftovers`), and the first-run marker is written;
 //! 3. the data folder and each regular file in it are flagged `NSURLIsExcludedFromBackupKey` (every launch: Apple
 //!    says some file operations reset the flag);
-//! 4. the key file gets `NSFileProtectionComplete` (unreadable while the phone is locked; it is read only during a
-//!    passphrase unlock). The folder and the store keep the default class, so a sync running as the phone locks
-//!    does not fail.
+//! 4. the key file gets `NSFileProtectionComplete` (unreadable while the phone is locked). It is read at start-up,
+//!    by `key.status`, by `key.unlock` (also the keychain path) and by `key.cache`, so those fail while the phone is
+//!    locked (today as a `database` error, "key file is unreadable"; the phone half measures it, 12-F words it).
+//!    The folder and the store keep the default class, so a sync running as the phone locks does not fail.
 //!
 //! A failure in any step is a note (plain words, counts and OS error text only, never an account or a key) and
 //! never blocks start-up; the notes reach the core's diagnostics through `Sidecar::note`.
@@ -29,8 +30,13 @@ use tauri::Manager;
 /// The marker that says the leftover-items rule has run for this install.
 const MARKER_FILE: &str = "first-run.done";
 
-/// Run the hook for this app's data folder; returns the notes.
+/// Run the hook for this app's data folder; returns the notes. A release that `start_core` will refuse over a test
+/// switch (`sidecar::inproc_env_refusal`) touches nothing here either: `DISCONECT_KEYS` would point the leftover rule
+/// and the protection class at a file the phone does not use (12-D review S3).
 pub fn prepare(app: &tauri::AppHandle) -> Vec<String> {
+    if crate::sidecar::inproc_env_refusal(cfg!(debug_assertions), cfg!(desktop), |name| std::env::var_os(name)).is_some() {
+        return vec!["start-up hook skipped: a test switch is set in a release".into()];
+    }
     match app.path().app_data_dir() {
         Ok(dir) => prepare_in(&mut RealKeychain, &dir),
         Err(e) => vec![format!("start-up hook skipped: no app data folder ({e})")],
