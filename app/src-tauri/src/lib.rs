@@ -109,6 +109,32 @@ async fn debug_unlock_from_file(state: State<'_, Core>) -> Result<Value, CoreErr
     core_of(&state)?.unlock(debug_passphrase()?).await
 }
 
+/// Evidence hook, debug builds only: the six digits the other device shows, read from the file named by
+/// `DISCONECT_DEBUG_DIGITS_FILE` (the file usually appears a moment after the `bound` event, so it is polled
+/// every 500 ms for up to 60 s), then `pair.confirm` through the core. Compiled out of release builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+async fn debug_pair_digits_from_file(state: State<'_, Core>) -> Result<Value, CoreError> {
+    let no_file = || CoreError { code: "bad_params".into(), message: "no debug digits file".into() };
+    let path = std::env::var_os("DISCONECT_DEBUG_DIGITS_FILE").ok_or_else(no_file)?;
+    let digits = tauri::async_runtime::spawn_blocking(move || {
+        for _ in 0..120 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let t = text.trim();
+                if t.len() == 6 && t.bytes().all(|b| b.is_ascii_digit()) {
+                    return Some(t.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        None
+    })
+    .await
+    .map_err(|_| no_file())?
+    .ok_or_else(no_file)?;
+    core_of(&state)?.call("pair.confirm", serde_json::json!({ "digits": digits })).await
+}
+
 /// The store the in-process core serves, resolved here and handed over explicitly (the core is
 /// never left to look at `$HOME` itself). Desktop: `--db` from argv, else the binary's own rule
 /// (`$DISCONECT_DB`, else `~/.disconect/disconect.db`, or the legacy folder while only it exists).
@@ -219,12 +245,12 @@ pub fn run() {
     // debug/release split below is crossed with `target_os = "macos"` rather than naming them unconditionally
     // (a non-macOS build, e.g. the iOS shell `tests/mobile_config.rs` checks, must still compile).
     #[cfg(all(debug_assertions, target_os = "macos"))]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file,
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
         coach::commands::support_sites, coach::commands::support_open,
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(debug_assertions, not(target_os = "macos")))]
-    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file,
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,
         coach::commands::coach_settings_get, coach::commands::coach_settings_set, coach::commands::coach_key_set, coach::commands::coach_key_forget, coach::commands::coach_key_state, coach::commands::coach_ask, coach::commands::coach_reset, coach::commands::coach_probe, coach::commands::handoff_build, coach::commands::handoff_open,
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(not(debug_assertions), target_os = "macos"))]

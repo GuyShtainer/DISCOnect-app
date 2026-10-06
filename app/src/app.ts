@@ -2,6 +2,7 @@
 // Rules: every value carries its source word; a missing day is drawn as absence; the UI never
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
+import qrcode from "qrcode-generator";
 import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord } from "./identity";
 import { disposeCharts, drawTrend, type Series } from "./charts";
 
@@ -47,6 +48,7 @@ function trendLabel(metric: string): string {
 const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
   { id: "watch", title: "Watch" },
+  { id: "sync", title: "Sync" },
   { id: "trend", title: "Trends" },
   { id: "health", title: "Data health" },
   { id: "coach", title: "Coach" },
@@ -131,7 +133,7 @@ function renderNav(): void {
     if (s.id === "support" && !supportShown) continue;
     const a = el("a", "", s.title) as HTMLAnchorElement;
     a.href = `#/${s.id}`;
-    if (current() === s.id) a.setAttribute("aria-current", "page");
+    if (current().split("/")[0] === s.id) a.setAttribute("aria-current", "page");
     if (s.id === "coach") a.append(coachFlag());
     if (s.id === "watch" && liveRunning) a.append(liveFlag());
     nav.append(a);
@@ -179,7 +181,7 @@ async function route(): Promise<void> {
   await refreshCoach();
   if (mine !== generation) return;
   renderNav();
-  const id = current();
+  const [id, sub] = current().split("/");
   // the coach settings need no data from the store (the probe works on a locked one), so they stay reachable
   // the watch screen reads the link, not the store
   if (locked() && id !== "key" && id !== "coach-settings" && id !== "watch" && id !== "support") {
@@ -196,6 +198,7 @@ async function route(): Promise<void> {
   try {
     if (id === "today") await screenToday(out);
     else if (id === "watch") await screenWatch(out, later);
+    else if (id === "sync") await screenSync(out, later, sub === "pair");
     else if (id === "trend") await screenTrend(out, later);
     else if (id === "health") await screenHealth(out);
     else if (id === "coach") screenCoach(out, later);
@@ -559,6 +562,435 @@ void core.onLiveEnded(() => {
 setInterval(() => {
   if (liveNodes.status && document.contains(liveNodes.status)) drawLive();
 }, 1000);
+
+// ---- Sync and pairing (Bet 7b-2) ---------------------------------------------------------
+// Every method that opens a network connection (sync.run, relay.serve, pair.*) is called from a click inside
+// screenSync, and only there (test_lint_app.py slices this function). State lives at module level so a re-render
+// (route()) draws the same walk; the event listeners are registered per render and the old ones dropped.
+type SyncStatus = {
+  bundles: Record<string, number>; records_unsent: number; records_seen: number; conflicts: number; superseded: number;
+  gaps: unknown[]; last_pushed_at: string | null; last_pulled_at: string | null;
+  serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
+};
+type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
+type OfferReply = { offer: string; url: string; expires_at: number };
+type PairPhase = "idle" | "pushing" | "open" | "bound" | "released" | "done";
+type Step = "idle" | "now" | "done";
+
+const syncRun = { running: false, push: "idle" as Step, pull: "idle" as Step, pushNote: "", pullNote: "", result: "" };
+let syncError: core.CoreError | null = null; // shown once
+let relayStoppedNote = false; // shown once
+let chosenIp: string | null = null;
+let pairPhase: PairPhase = "idle";
+let pairOffer: OfferReply | null = null;
+let pairEnding: { text: string; error: boolean } | null = null;
+let pairNoDevice = false;
+let pairPushing = false;
+let pairDigitsTried = false;
+let debugListen: { ip: string; port: number } | null = null; // --debug-listen ip:port (evidence runs): preselects that address and uses its port
+let debugPairDigits = false; // --debug-pair-digits (evidence runs, debug builds)
+let pairTimer: ReturnType<typeof setTimeout> | null = null;
+let syncUnlisten: (() => void)[] = [];
+
+function dropSyncListeners(): void {
+  for (const fn of syncUnlisten) fn();
+  syncUnlisten = [];
+}
+
+/** The offer is over (any ending): the QR, the text and the typed digits go with it. No redraw here. */
+function endOfferState(ending: { text: string; error: boolean } | null): void {
+  pairOffer = null;
+  pairPhase = "idle";
+  pairNoDevice = false;
+  pairPushing = false;
+  pairDigitsTried = false;
+  if (pairTimer) clearTimeout(pairTimer);
+  pairTimer = null;
+  if (ending) pairEnding = ending;
+}
+
+/** `[ip]:port` for an IPv6 literal, else `ip:port`. */
+function listenOf(ip: string, port: number): string {
+  return ip.includes(":") ? `[${ip}]:${port}` : `${ip}:${port}`;
+}
+
+function drawQr(text: string): HTMLElement {
+  const box = el("div", "qr");
+  try {
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    const size = 216;
+    const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
+    const canvas = el("canvas");
+    canvas.width = size * dpr;
+    canvas.height = size * dpr;
+    canvas.style.width = `${size}px`;
+    canvas.style.height = `${size}px`;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", "Pairing code to scan with the other device");
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--qr-ink").trim() || "CanvasText";
+      const px = size * dpr;
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          if (!qr.isDark(r, c)) continue;
+          const x0 = Math.round((c * px) / n);
+          const y0 = Math.round((r * px) / n);
+          ctx.fillRect(x0, y0, Math.round(((c + 1) * px) / n) - x0, Math.round(((r + 1) * px) / n) - y0);
+        }
+      }
+    }
+    box.append(canvas);
+  } catch {
+    box.append(el("span", "caption muted", "The code is too long to draw; use the text."));
+  }
+  return box;
+}
+
+async function screenSync(out: ParentNode, later: Later, pairing: boolean): Promise<void> {
+  const mine = generation; // a render that lost to a newer route() must not touch the offer state below
+  dropSyncListeners();
+  let status: SyncStatus | null = null;
+  let statusErr: core.CoreError | null = null;
+  try {
+    status = await core.call<SyncStatus>("sync.status");
+  } catch (e) {
+    if (core.isCoreError(e) && e.code === "locked") throw e;
+    statusErr = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+  }
+  let addrs: RelayAddresses | null = null;
+  let addrErr: core.CoreError | null = null;
+  if (status) {
+    try {
+      addrs = await core.call<RelayAddresses>("relay.addresses");
+    } catch (e) {
+      addrErr = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+    }
+  }
+  if (mine !== generation) return; // stale: its sync.status may predate the offer that a newer render already holds
+  const serving = status?.serving ?? null;
+  // reconcile with the core: an offer this screen holds but the core no longer has is over
+  if (status && pairOffer && !serving?.offer) endOfferState({ text: "The offer ended.", error: false });
+  if (serving?.offer === "bound" && pairPhase === "open") pairPhase = "bound";
+  if (serving?.offer === "released" && (pairPhase === "open" || pairPhase === "bound")) pairPhase = "released";
+  if (serving?.offer === "delivered" && pairPhase !== "done") { endOfferState(null); pairPhase = "done"; } // missed the event
+  if (!pairing) {
+    pairEnding = null;
+    if (pairPhase === "done") pairPhase = "idle";
+  }
+  const hostOfUrl = serving ? serving.url.replace(/^https?:\/\//, "").replace(/:\d+$/, "").replace(/^\[|\]$/g, "") : null;
+  if (hostOfUrl) chosenIp = hostOfUrl;
+  else if (debugListen && chosenIp === null && addrs?.addresses.some((a) => a.ip === debugListen?.ip)) chosenIp = debugListen.ip;
+  if (addrs && !addrs.addresses.some((a) => a.ip === chosenIp)) chosenIp = addrs.addresses[0]?.ip ?? null;
+  const redraw = (): void => { void route(); };
+
+  const addressSelect = (): HTMLSelectElement => {
+    const select = el("select") as HTMLSelectElement;
+    select.setAttribute("aria-label", "Network address to serve on");
+    for (const a of addrs?.addresses ?? []) {
+      const o = el("option", "", `${a.ip} · ${a.label}`) as HTMLOptionElement;
+      o.value = a.ip;
+      o.selected = a.ip === chosenIp;
+      select.append(o);
+    }
+    select.disabled = !addrs || !addrs.addresses.length;
+    select.onchange = () => { chosenIp = select.value; };
+    return select;
+  };
+  const listen = (): string | null => (addrs && chosenIp ? listenOf(chosenIp, debugListen && debugListen.ip === chosenIp ? debugListen.port : addrs.port) : null);
+  const fail = (e: unknown): void => {
+    syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+    redraw();
+  };
+
+  // ---- Sync now ----
+  const runSync = async (): Promise<void> => {
+    syncRun.running = true;
+    syncRun.push = "idle"; syncRun.pull = "idle"; syncRun.pushNote = ""; syncRun.pullNote = ""; syncRun.result = "";
+    redraw();
+    try {
+      const r = await core.call<{ push: { bundles: number; records: number }; pull: { applied: number; records_new: number; status: string } }>("sync.run");
+      syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (partial)" : ""}.`;
+    } catch (e) {
+      syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+    }
+    syncRun.running = false;
+    redraw();
+  };
+
+  // ---- serving ----
+  const setServing = async (on: boolean): Promise<void> => {
+    try {
+      if (on) {
+        const l = listen();
+        if (!l) throw { code: "bad_params", message: "no network address to serve on" };
+        await core.call("relay.serve", { on: true, listen: l });
+      } else {
+        await core.call("relay.serve", { on: false });
+      }
+      redraw();
+    } catch (e) { fail(e); }
+  };
+
+  // ---- pairing ----
+  const startOffer = async (): Promise<void> => {
+    const l = listen();
+    if (!l) return;
+    pairEnding = null;
+    pairNoDevice = false;
+    pairDigitsTried = false;
+    pairPhase = "pushing";
+    pairPushing = true;
+    redraw();
+    try {
+      const reply = await core.call<OfferReply>("pair.offer", { listen: l });
+      pairPushing = false;
+      pairOffer = reply;
+      if (pairPhase === "pushing") pairPhase = "open";
+      if (pairTimer) clearTimeout(pairTimer);
+      pairTimer = setTimeout(() => { if (pairPhase === "open") { pairNoDevice = true; redraw(); } }, 60000);
+      redraw();
+    } catch (e) {
+      endOfferState(null);
+      fail(e);
+    }
+  };
+  const confirmDigits = async (digits: string): Promise<void> => {
+    try {
+      await core.call("pair.confirm", { digits });
+      if (pairPhase === "bound") pairPhase = "released";
+      redraw();
+    } catch (e) {
+      if (!pairEnding) { syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) }; }
+      redraw();
+    }
+  };
+  const cancelOffer = async (): Promise<void> => {
+    try {
+      await core.call("pair.cancel");
+    } catch (e) {
+      if (!(core.isCoreError(e) && e.code === "not_found")) { fail(e); return; }
+    }
+    endOfferState({ text: "Offer cancelled.", error: false });
+    redraw();
+  };
+  const onPair = (payload: unknown): void => {
+    const p = payload as { state?: string; reason?: string };
+    if (p.state === "bound") {
+      if (pairPhase === "open" || pairPhase === "idle") pairPhase = "bound";
+      pairNoDevice = false;
+      if (debugPairDigits && !pairDigitsTried) {
+        pairDigitsTried = true;
+        void core.debugPairDigitsFromFile().then(() => { if (pairPhase === "bound") pairPhase = "released"; redraw(); }, fail);
+      }
+      redraw();
+    } else if (p.state === "delivered") {
+      endOfferState(null);
+      pairPhase = "done";
+      redraw();
+    } else if (p.state === "aborted") {
+      const text = p.reason === "codes_differ" ? "The codes differ. The offer is closed; start a new one."
+        : p.reason === "another_device" ? "Another device answered. Start over."
+        : "Offer cancelled.";
+      endOfferState({ text, error: p.reason !== "cancelled" });
+      redraw();
+    } else if (p.state === "expired") {
+      endOfferState({ text: "The offer expired after 15 minutes.", error: false });
+      redraw();
+    }
+  };
+  const onRelay = (payload: unknown): void => {
+    const p = payload as { state?: string };
+    if (p.state !== "stopped") return;
+    if (pairOffer || pairPhase !== "idle") endOfferState({ text: "This Mac's address changed; the relay stopped. Start over on the new address.", error: true });
+    else relayStoppedNote = true;
+    redraw();
+  };
+  const onProgress = (payload: unknown): void => {
+    const p = payload as { op?: string; phase?: string; state?: string; bundles?: number; records?: number; applied?: number; rejected?: number };
+    if (p.op === "sync") {
+      const key = p.phase === "pull" ? "pull" : "push";
+      syncRun[key] = p.state === "done" ? "done" : "now";
+      if (p.state === "done") {
+        syncRun[key === "push" ? "pushNote" : "pullNote"] = key === "push" ? `${p.bundles ?? 0} bundles, ${p.records ?? 0} records` : `${p.applied ?? 0} applied, ${p.rejected ?? 0} refused`;
+      }
+      redraw();
+    } else if (p.op === "pair") {
+      redraw();
+    }
+  };
+  later(() => {
+    dropSyncListeners();
+    for (const [name, fn] of [["progress", onProgress], ["pair", onPair], ["relay", onRelay]] as const) {
+      void core.onCoreEvent(name, fn).then((un) => { syncUnlisten.push(un); });
+    }
+    if (pairing && debugPairDigits && serving?.offer === "bound" && !pairDigitsTried) onPair({ state: "bound" });
+  });
+
+  // ---- drawing ----
+  const stepsList = (items: { text: string; state: Step }[]): HTMLElement => {
+    const ol = el("ol", "steps");
+    items.forEach((it, i) => {
+      const li = el("li", it.state === "idle" ? "" : it.state);
+      if (it.state === "now") li.setAttribute("aria-current", "step");
+      li.append(el("span", "n", String(i + 1)), el("span", "", it.text));
+      ol.append(li);
+    });
+    return ol;
+  };
+  const errorBanners = (): void => {
+    if (syncError) {
+      out.append(bannerEl(syncError.code, syncError.message, true));
+      syncError = null;
+    }
+    if (relayStoppedNote) {
+      out.append(bannerEl("Relay stopped", "This Mac's address changed; the relay stopped. Start over on the new address.", true));
+      relayStoppedNote = false;
+    }
+  };
+
+  if (pairing) {
+    header(out, "Pair a device", "The other device gets your key; nothing about it is stored here");
+    errorBanners();
+    const back = el("a", "", "Back to Sync") as HTMLAnchorElement;
+    back.href = "#/sync";
+    out.append(back);
+    if (pairEnding) out.append(bannerEl(pairEnding.text, "", pairEnding.error));
+    if (pairNoDevice) out.append(bannerEl("Nothing yet", "No device has reached this Mac yet. If macOS asked about incoming connections, allow them; both devices must be on the same network."));
+    if (addrErr) out.append(bannerEl(addrErr.code, addrErr.message, true));
+    const grid = el("div", "card pair");
+    const left = el("div", "field");
+    const offerOpen = pairPhase === "open" || pairPhase === "bound" || pairPhase === "released";
+    if (pairOffer && offerOpen) {
+      left.append(drawQr(pairOffer.offer));
+      const row = el("div", "offer-text");
+      row.append(el("code", "", pairOffer.offer));
+      const text = pairOffer.offer;
+      const copy = el("button", "secondary", "Copy") as HTMLButtonElement;
+      const said = el("span", "caption muted", "Copies to the clipboard, which other devices and clipboard managers may keep.");
+      copy.onclick = () => {
+        navigator.clipboard.writeText(text).then(() => { copy.textContent = "Copied"; }, () => { said.textContent = "The clipboard refused the write."; });
+      };
+      row.append(copy);
+      left.append(row, said);
+    } else if (serving?.offer && serving.offer !== "delivered" && !pairOffer) {
+      left.append(el("p", "body muted", "An offer is open, but its text is not on this screen any more. Cancel it and start a new one."));
+    } else if (pairPhase === "pushing") {
+      left.append(el("p", "body", "Sending your data to the relay first…"));
+    } else {
+      if (pairPhase === "done") left.append(el("p", "body", "Done — the other device holds your key. Start a new offer to pair another device."));
+      left.append(addressSelect());
+      const start = el("button", "", "Start an offer") as HTMLButtonElement;
+      start.disabled = !listen() || syncRun.running;
+      start.onclick = () => void startOffer();
+      left.append(start);
+      left.append(el("p", "caption muted", "Other devices on this network can reach the relay while the offer is open. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
+    }
+    const right = el("div", "field");
+    const reached = pairPhase === "bound" || pairPhase === "released" || pairPhase === "done" || serving?.offer === "bound";
+    const typed = pairPhase === "released" || pairPhase === "done";
+    right.append(stepsList([
+      { text: "Offer shown — scan it or paste the text on the other device", state: offerOpen || pairPhase === "done" ? "done" : pairPhase === "pushing" ? "now" : "idle" },
+      { text: "A device answered", state: reached ? "done" : offerOpen ? "now" : "idle" },
+      { text: "Type the code the other device shows", state: typed ? "done" : pairPhase === "bound" || serving?.offer === "bound" ? "now" : "idle" },
+      { text: "Done — the device holds your key", state: pairPhase === "done" ? "done" : pairPhase === "released" ? "now" : "idle" },
+    ]));
+    const input = el("input", "code-input") as HTMLInputElement;
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.maxLength = 6;
+    input.pattern = "[0-9]{6}";
+    input.autocomplete = "off";
+    input.setAttribute("aria-label", "The six digits the other device shows");
+    const canType = (pairPhase === "bound" || (serving?.offer === "bound" && pairPhase !== "released" && pairPhase !== "done")) && !!(pairOffer || serving?.offer);
+    input.disabled = !canType;
+    const pair = el("button", "", "Pair") as HTMLButtonElement;
+    pair.disabled = !canType;
+    pair.onclick = () => {
+      const digits = input.value.trim();
+      input.value = "";
+      void confirmDigits(digits);
+    };
+    input.oninput = () => { input.value = input.value.replace(/\D/g, "").slice(0, 6); };
+    const cancel = el("button", "secondary", "Cancel offer") as HTMLButtonElement;
+    cancel.disabled = !(offerOpen || (serving?.offer && serving.offer !== "delivered"));
+    cancel.onclick = () => void cancelOffer();
+    const actions = el("div", "actions");
+    actions.append(input, pair, cancel);
+    right.append(actions);
+    if (pairPhase === "done") right.append(el("p", "caption muted", "The relay keeps serving until the offer expires (15 minutes) so the new device can make its first pull; turn the switch on to keep serving."));
+    grid.append(left, right);
+    out.append(grid);
+    return;
+  }
+
+  header(out, "Sync", "Move your data between this Mac and your other devices through a relay you run");
+  errorBanners();
+  const card = el("section", "card");
+  card.append(el("h2", "heading", "Relay"));
+  const kv = el("dl", "kv");
+  kv.append(el("dt", "", "Kind"), el("dd", "", statusErr?.code === "not_found" ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
+  card.append(kv);
+  if (statusErr?.code === "not_found") {
+    card.append(el("p", "caption muted", "Set with the command line: disconect sync push --relay <folder> --remember"));
+  } else if (statusErr) {
+    out.append(bannerEl(statusErr.code, statusErr.message, true));
+  }
+  if (status && addrs) {
+    const sw = el("label", "switch");
+    sw.append(el("span", "", "Serve the relay on this network"));
+    const box = el("input") as HTMLInputElement;
+    box.type = "checkbox";
+    box.checked = serving?.keep === true;
+    box.onchange = () => { box.disabled = true; void setServing(box.checked); };
+    sw.append(box);
+    card.append(sw, addressSelect());
+    if (serving) card.append(el("p", "body", `Serving at ${serving.url}`));
+    card.append(el("p", "caption muted", "Other devices on this network can reach the relay while it serves. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
+  } else if (status && addrErr) {
+    card.append(el("p", "caption muted", `${addrErr.code}: ${addrErr.message}`));
+  }
+  out.append(card);
+  if (!status) return;
+
+  const stat = el("section", "card");
+  stat.append(el("h2", "heading", "Status"));
+  const when = (t: string | null): string => (t ? new Date(t).toLocaleString() : "never");
+  const rows: [string, string][] = [
+    ["Bundles pushed", String(status.bundles.pushed_applied ?? 0)],
+    ["Bundles pulled", String(status.bundles.pulled_applied ?? 0)],
+    ["Bundles refused", String(status.bundles.pulled_rejected ?? 0)],
+    ["Records on the relay", String(status.records_seen)],
+    ["Records not sent yet", String(status.records_unsent)],
+    ["Conflicts", String(status.conflicts)],
+    ["Versions kept aside", String(status.superseded)],
+    ["Chain gaps", String(status.gaps.length)],
+    ["Last sent", when(status.last_pushed_at)],
+    ["Last received", when(status.last_pulled_at)],
+  ];
+  const kv2 = el("dl", "kv");
+  for (const [k, v] of rows) kv2.append(el("dt", "", k), el("dd", "value-small", v));
+  stat.append(kv2);
+  const actions = el("div", "actions");
+  const now = el("button", "", "Sync now") as HTMLButtonElement;
+  now.disabled = syncRun.running || pairPushing;
+  now.onclick = () => void runSync();
+  const pairBtn = el("a", "button", "Pair a device") as HTMLAnchorElement;
+  pairBtn.href = "#/sync/pair";
+  actions.append(now, pairBtn);
+  stat.append(actions);
+  if (syncRun.running || syncRun.push !== "idle") {
+    stat.append(stepsList([
+      { text: `Push${syncRun.pushNote ? ` · ${syncRun.pushNote}` : ""}`, state: syncRun.push },
+      { text: `Pull${syncRun.pullNote ? ` · ${syncRun.pullNote}` : ""}`, state: syncRun.pull },
+    ]));
+  }
+  if (syncRun.result) stat.append(el("p", "body", syncRun.result));
+  out.append(stat);
+}
 
 // ---- Trend ------------------------------------------------------------------------------
 let trendMetric = TREND_METRICS[0];
@@ -1355,6 +1787,7 @@ async function screenSupport(out: ParentNode): Promise<void> {
 window.addEventListener("hashchange", () => void route());
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 void core.onCoreEvent("restarted", () => {
+  if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core restarted; the offer is gone.", error: true });
   banner = "The core restarted after an error; the last request was lost.";
   void (async () => {
     await refreshKey();
@@ -1362,7 +1795,7 @@ void core.onCoreEvent("restarted", () => {
     await route();
   })();
 });
-void core.onCoreEvent("exited", () => { banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
+void core.onCoreEvent("exited", () => { if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core restarted; the offer is gone.", error: true }); banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
 void (async () => {
   await refreshKey();
   if (locked() && (await core.unlockFromKeychain())) await refreshKey();
@@ -1374,8 +1807,13 @@ void (async () => {
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
   if (t >= 0 && TREND_METRICS.includes(args[t + 1])) trendMetric = args[t + 1];
-  if (wanted && current() !== wanted) {
-    location.hash = `#/${wanted}`; // hashchange runs route()
+  const dl = args.indexOf("--debug-listen");
+  const m = dl >= 0 ? /^(.+):(\d{1,5})$/.exec(args[dl + 1] ?? "") : null;
+  if (m) debugListen = { ip: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) };
+  debugPairDigits = args.includes("--debug-pair-digits"); // debug builds only: the Rust command is compiled out of release
+  const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
+  if (target && current() !== target) {
+    location.hash = `#/${target}`; // hashchange runs route()
   } else {
     await route();
   }

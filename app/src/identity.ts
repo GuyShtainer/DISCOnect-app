@@ -6,7 +6,7 @@ export const NOTICE = "Not affiliated with or endorsed by any watch manufacturer
 export const DISCLAIMER = "This describes patterns in your own data. It is not medical advice, a diagnosis or a treatment plan.";
 // The Off card's claim (Bet 15c pitch section 4): a hand-off makes health text leave by clipboard and
 // browser while the coach is off, so the previous, narrower claim no longer held.
-export const OFF_NETWORK = "This app opens no network connection while coaching is off.";
+export const OFF_NETWORK = "This app opens no network connection while coaching is off, except the relay sync and the relay serving you start yourself on the Sync screen.";
 // Shown beside the hand-off's provider picker (Bet 15c, legal review condition 5): no claim about any provider's
 // own behaviour, only what this app is and is not.
 export const AI_NOTICE =

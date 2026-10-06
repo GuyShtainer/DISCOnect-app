@@ -193,7 +193,7 @@ pub struct Sidecar(Arc<Inner>);
 /// Timeout per method family. Imports and `sync.run` (a pull over the LAN can be long) run as long as they need; key operations may wait on a
 /// keychain prompt; everything else is a read.
 pub fn timeout_for(method: &str) -> Option<Duration> {
-    if method.starts_with("import.") || method == "sync.run" {
+    if method.starts_with("import.") || method == "sync.run" || method == "pair.offer" {
         None
     } else if method.starts_with("key.") {
         Some(Duration::from_secs(60))
@@ -778,6 +778,8 @@ mod tests {
         assert_eq!(timeout_for("data.metric"), Some(Duration::from_secs(30)));
         assert_eq!(timeout_for("sync.run"), None);
         assert_eq!(timeout_for("sync.status"), Some(Duration::from_secs(30)));
+        assert_eq!(timeout_for("pair.offer"), None);
+        assert_eq!(timeout_for("pair.confirm"), Some(Duration::from_secs(30)));
     }
 
     #[test]

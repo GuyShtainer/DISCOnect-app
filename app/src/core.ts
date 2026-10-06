@@ -19,8 +19,13 @@ export function unlock(passphrase: string): Promise<{ unlocked: boolean }> {
   return invoke("core_unlock", { passphrase });
 }
 
-export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited", cb: (payload: unknown) => void): Promise<UnlistenFn> {
+export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | "pair" | "relay", cb: (payload: unknown) => void): Promise<UnlistenFn> {
   return listen(`core://${name}`, (e) => cb(e.payload));
+}
+
+/** Debug builds only: types the six digits read from DISCONECT_DEBUG_DIGITS_FILE (evidence runs). */
+export function debugPairDigitsFromFile(): Promise<unknown> {
+  return invoke("debug_pair_digits_from_file");
 }
 
 export function coreStderr(): Promise<string[]> {
