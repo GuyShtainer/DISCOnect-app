@@ -156,3 +156,26 @@ input.code-input:disabled { opacity: 0.6; }
 .progress > span { display: block; height: 100%; background: var(--accent); }
 .runs { display: grid; grid-template-columns: auto auto 1fr auto; gap: var(--space-2) var(--space-4); align-items: baseline; }
 @media (max-width: 720px) { .drops { grid-template-columns: 1fr; } .runs { grid-template-columns: 1fr 1fr; } }
+
+/* ---- Sleep (Bet 7b-4): tokens only ---- */
+.chart.short { height: 200px; }
+.absent { border: 1px solid var(--hairline); border-radius: var(--radius-md); padding: var(--space-3); background: repeating-linear-gradient(45deg, var(--ink-muted) 0 1px, transparent 1px 7px); display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: var(--space-1); }
+.absent > span { background: var(--surface-raised); padding: 0 var(--space-1); border-radius: var(--radius-sm); }
+.calendar { display: grid; grid-template-columns: repeat(7, 36px); gap: var(--space-1); justify-content: start; }
+.calendar > .caption { text-align: center; line-height: 24px; }
+.calendar .cell { position: relative; width: 36px; height: 36px; min-height: 36px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-md); font: inherit; font-family: var(--font-mono); }
+.calendar button.cell { background: var(--surface); color: var(--ink); border: 1px solid var(--hairline); font-weight: 400; }
+.calendar .cell.off { color: var(--ink-muted); opacity: 0.6; }
+.calendar .cell[aria-current="date"] { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); font-weight: 600; }
+.calendar .pip { position: absolute; bottom: 3px; width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+.hypno svg { width: 100%; height: auto; display: block; }
+.hypno .grid { stroke: var(--hairline); stroke-width: 1; }
+.hypno .tick { fill: var(--ink-muted); font-size: 12px; font-family: var(--font-sans); }
+.hypno .hatch { stroke: var(--stage-unmeasurable); stroke-width: 1.5; }
+.hypno .unmeasurable { stroke: var(--stage-unmeasurable); stroke-width: 1; }
+.hypno .stage-deep, .legend .chip.stage-deep { fill: var(--stage-deep); background: var(--stage-deep); }
+.hypno .stage-light, .legend .chip.stage-light { fill: var(--stage-light); background: var(--stage-light); }
+.hypno .stage-rem, .legend .chip.stage-rem { fill: var(--stage-rem); background: var(--stage-rem); }
+.hypno .stage-awake, .legend .chip.stage-awake { fill: var(--stage-awake); background: var(--stage-awake); }
+.legend .chip.stage-unmeasurable { background: repeating-linear-gradient(45deg, var(--stage-unmeasurable) 0 1px, var(--surface) 1px 4px); }
+@media (max-width: 720px) { .calendar { grid-template-columns: repeat(7, minmax(0, 1fr)); } .calendar .cell { width: auto; } }

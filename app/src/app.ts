@@ -47,6 +47,7 @@ function trendLabel(metric: string): string {
 }
 const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
+  { id: "sleep", title: "Sleep" },
   { id: "watch", title: "Watch" },
   { id: "sync", title: "Sync" },
   { id: "import", title: "Import" },
@@ -202,6 +203,7 @@ async function route(): Promise<void> {
   }
   try {
     if (id === "today") await screenToday(out);
+    else if (id === "sleep") await screenSleep(out, later, sub);
     else if (id === "watch") await screenWatch(out, later);
     else if (id === "sync") await screenSync(out, later, sub === "pair");
     else if (id === "import") await screenImport(out);
@@ -230,6 +232,7 @@ async function route(): Promise<void> {
   disposeCharts();
   main.replaceChildren(out);
   for (const fn of queue) fn();
+  if (scrollDebug > 0) requestAnimationFrame(() => { window.scrollTo(0, scrollDebug); main.scrollTop = scrollDebug; (document.scrollingElement ?? document.body).scrollTop = scrollDebug; });
 }
 
 function header(out: ParentNode, title: string, sub: string): void {
@@ -1109,6 +1112,279 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   later(() => drawTrend(chart, series, trendLabel(trendMetric)));
 }
 
+// ---- Sleep (Bet 7b-4) -------------------------------------------------------------------
+type SleepStage = { stage: string; start_utc: string; end_utc: string; minutes: number; start_local?: string; end_local?: string };
+type SleepSession = {
+  source_scope: string; start_utc?: string; end_utc?: string; overall_score?: number; retro: boolean;
+  stage_minutes: Record<string, number>; stages?: SleepStage[]; utc_offset_s?: number;
+  avg_hr?: number; avg_spo2?: number; avg_respiration?: number; awakenings_count?: number;
+};
+type Night = { date: string | null; sessions: SleepSession[]; reason?: string };
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const SLEEP_SCOPES = ["device", "vendor_cloud"];
+const STAGE_ROWS = ["awake", "rem", "light", "deep"];
+const STAGE_WORD: Record<string, string> = { awake: "Awake", rem: "REM", light: "Light", deep: "Deep", unmeasurable: "Not measured" };
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** The core's lowercase reasons start a sentence on screen. */
+function sentence(t: string | undefined | null): string | null {
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : null;
+}
+
+function sleepMinutes(m: number): string {
+  const n = Math.round(m);
+  return n >= 60 ? `${Math.floor(n / 60)} h ${String(n % 60).padStart(2, "0")} min` : `${n} min`;
+}
+
+/** A day's daily sleep figures, by source: the device's sleep length (seconds) and the vendor cloud's score. */
+type DailySleep = { device?: number; vendor_cloud?: number };
+
+/** The days of a month (`YYYY-MM`) on which any source has a night (sleep duration from the device, sleep score from the
+ *  vendor cloud), each with the daily figure that marks it. */
+async function sleepMarks(month: string): Promise<Map<string, DailySleep>> {
+  const [y, m] = month.split("-").map(Number);
+  const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const last = `${month}-${String(days).padStart(2, "0")}`;
+  const reads = await Promise.all([["sleep_duration", "device"], ["sleep_score", "vendor_cloud"]].map(([metric, scope]) =>
+    core.call<Metric>("data.metric", { metric, scope, days, last_day: last }).catch(() => null)));
+  const marked = new Map<string, DailySleep>();
+  reads.forEach((r, i) => {
+    const scope = i === 0 ? "device" : "vendor_cloud";
+    for (const d of r?.days ?? []) if (d.value !== null) marked.set(d.day, { ...(marked.get(d.day) ?? {}), [scope]: d.value });
+  });
+  return marked;
+}
+
+/** The month calendar: Monday first, a dot on the nights that have data, the chosen night accented; a night without
+ *  data is drawn and not selectable. Moving a month re-reads the marks only. */
+function sleepCalendar(chosen: string | null, firstMonth: string, firstMarks: Map<string, DailySleep>): HTMLElement {
+  const box = el("section", "card");
+  box.setAttribute("aria-label", "Nights");
+  let month = firstMonth;
+  let marks = firstMarks;
+  let ticket = 0;
+  const draw = (): void => {
+    const [y, m] = month.split("-").map(Number);
+    const head = el("div", "row");
+    const prev = el("button", "secondary", "‹") as HTMLButtonElement;
+    prev.setAttribute("aria-label", "Previous month");
+    const next = el("button", "secondary", "›") as HTMLButtonElement;
+    next.setAttribute("aria-label", "Next month");
+    const step = (by: number): void => {
+      const d = new Date(Date.UTC(y, m - 1 + by, 1));
+      month = d.toISOString().slice(0, 7);
+      const mine = ++ticket;
+      void sleepMarks(month).then((got) => { if (mine === ticket) { marks = got; draw(); } });
+    };
+    prev.onclick = () => step(-1);
+    next.onclick = () => step(1);
+    head.append(prev, el("h2", "heading", `${MONTHS[m - 1]} ${y}`), next);
+    const grid = el("div", "calendar");
+    for (const w of WEEKDAYS) grid.append(el("span", "caption muted", w));
+    const lead = (new Date(Date.UTC(y, m - 1, 1)).getUTCDay() + 6) % 7;
+    for (let i = 0; i < lead; i++) grid.append(el("span"));
+    const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    for (let d = 1; d <= days; d++) {
+      const day = `${month}-${String(d).padStart(2, "0")}`;
+      const has = marks.has(day);
+      const cell = has ? el("button", "cell has", String(d)) : el("span", "cell off", String(d));
+      if (has) {
+        const target = day;
+        cell.setAttribute("aria-label", `Night of ${day}`);
+        (cell as HTMLButtonElement).onclick = () => { location.hash = `#/sleep/${target}`; };
+        cell.append(el("span", "pip"));
+      }
+      if (day === chosen) cell.setAttribute("aria-current", "date");
+      grid.append(cell);
+    }
+    box.replaceChildren(head, grid, el("span", "caption muted", "A dot marks a night with data; the others cannot be opened."));
+  };
+  draw();
+  return box;
+}
+
+function svgEl(tag: string, attrs: Record<string, string>): SVGElement {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+
+/** A local `HH:MM` of an instant on the watch's clock (offset in seconds; 0 for UTC). */
+function hhmm(ms: number, offsetS: number): string {
+  return new Date(ms + offsetS * 1000).toISOString().slice(11, 16);
+}
+
+/** The hypnogram: stage bands placed by their UTC instants plus the session's offset, so a stage that crosses local
+ *  midnight stays one contiguous bar; ticks are labelled with local HH:MM. Without a stored offset the axis is UTC
+ *  and says so. Unmeasurable is a full-height hatched band. */
+function hypnogram(session: SleepSession): HTMLElement {
+  const stages = (session.stages ?? []).map((s) => ({ ...s, a: Date.parse(s.start_utc), b: Date.parse(s.end_utc) })).filter((s) => s.b > s.a);
+  const box = el("div", "hypno");
+  if (!stages.length) return box;
+  const t0 = Math.min(...stages.map((s) => s.a));
+  const t1 = Math.max(...stages.map((s) => s.b));
+  const known = typeof session.utc_offset_s === "number";
+  const off = known ? (session.utc_offset_s as number) : 0;
+  const W = 960, X0 = 64, X1 = 944, ROW = 32, TOP = 8, H = TOP + ROW * 4 + 28;
+  const x = (t: number): number => X0 + ((t - t0) / (t1 - t0)) * (X1 - X0);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Sleep stages through the night" });
+  const defs = svgEl("defs", {});
+  const pat = svgEl("pattern", { id: "hypno-unmeasurable", patternUnits: "userSpaceOnUse", width: "6", height: "6", patternTransform: "rotate(45)" });
+  pat.append(svgEl("line", { x1: "0", y1: "0", x2: "0", y2: "6", class: "hatch" }));
+  defs.append(pat);
+  svg.append(defs);
+  STAGE_ROWS.forEach((name, i) => {
+    const y = TOP + i * ROW;
+    svg.append(svgEl("line", { x1: String(X0), x2: String(X1), y1: String(y + ROW), y2: String(y + ROW), class: "grid" }));
+    const label = svgEl("text", { x: String(X0 - 8), y: String(y + ROW / 2 + 4), "text-anchor": "end", class: "tick" });
+    label.textContent = STAGE_WORD[name];
+    svg.append(label);
+  });
+  for (const s of stages) {
+    const x0 = x(s.a), w = Math.max(1, x(s.b) - x0);
+    if (s.stage === "unmeasurable") {
+      svg.append(svgEl("rect", { x: String(x0), y: String(TOP), width: String(w), height: String(ROW * 4), fill: "url(#hypno-unmeasurable)", class: "unmeasurable" }));
+      continue;
+    }
+    const row = STAGE_ROWS.indexOf(s.stage);
+    if (row < 0) continue; // a stage word this screen does not know is not drawn
+    svg.append(svgEl("rect", { x: String(x0), y: String(TOP + row * ROW + 4), width: String(w), height: String(ROW - 8), class: `stage-${s.stage}` }));
+  }
+  const hour = 3600000;
+  const span = (t1 - t0) / hour;
+  const stride = Math.max(1, Math.ceil(span / 8)) * hour;
+  for (let t = Math.ceil((t0 + off * 1000) / stride) * stride - off * 1000; t <= t1; t += stride) {
+    const tx = svgEl("text", { x: String(x(t)), y: String(TOP + ROW * 4 + 18), "text-anchor": "middle", class: "tick" });
+    tx.textContent = hhmm(t, off);
+    svg.append(tx);
+  }
+  box.append(svg);
+  return box;
+}
+
+async function screenSleep(out: ParentNode, later: Later, sub: string | undefined): Promise<void> {
+  const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
+  header(out, "Sleep", sub ?? "");
+  if (health?.never_imported) {
+    const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen. Every screen fills from the first import.");
+    nothing.append(importLink());
+    out.append(nothing);
+    return;
+  }
+  if (sub !== undefined && !DAY_RE.test(sub)) {
+    out.append(bannerEl("Not a night", "A night is written as a date, like 2025-06-15. Pick one in the calendar."));
+    sub = undefined;
+  }
+  const night = await core.call<Night>("data.sleep", sub ? { date: sub } : {});
+  const date = night.date;
+  const month = (date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
+  const marks = await sleepMarks(month);
+  if (date && night.sessions.length && !marks.has(date)) marks.set(date, {});
+  out.append(sleepCalendar(date, month, marks));
+  if (!date) {
+    out.append(el("span", "caption muted", night.reason ?? "No sleep is stored yet."));
+    return;
+  }
+  const head = out.querySelector(".row .caption");
+  if (head) head.textContent = date;
+
+  const two = el("div", "two");
+  for (const scope of SLEEP_SCOPES) {
+    const s = night.sessions.find((x) => x.source_scope === scope);
+    if (!s) {
+      const box = el("div", "absent");
+      const daily = date ? marks.get(date)?.[scope as keyof DailySleep] : undefined;
+      box.append(el("span", "body", `No stage record of this night from ${scopeWord(scope)}`));
+      if (typeof daily === "number") {
+        // the day is marked by a daily figure alone (a summary without a session): say what is stored
+        box.append(el("span", "caption muted", scope === "device"
+          ? `Only a sleep length is stored for the day: ${sleepMinutes(daily / 60)}.`
+          : `Only a sleep score is stored for the day: ${Math.round(daily)}.`));
+      }
+      two.append(box);
+      continue;
+    }
+    const card = el("section", "card");
+    card.setAttribute("aria-label", scopeWord(scope));
+    const top = el("div", "row");
+    top.append(scopeTag(scope));
+    if (s.retro) top.append(el("span", "badge", "added later"));
+    card.append(top, el("span", "caption muted", "Sleep score"));
+    card.append(el("span", "value", typeof s.overall_score === "number" ? String(s.overall_score) : "not recorded"));
+    const kv = el("dl", "kv body");
+    const row = (k: string, v: string): void => { kv.append(el("dt", "", k), el("dd", "", v)); };
+    const span = s.start_utc && s.end_utc ? (Date.parse(s.end_utc) - Date.parse(s.start_utc)) / 60000 : null;
+    row("In bed", span !== null && span > 0 ? sleepMinutes(span) : "not recorded");
+    const slept = ["deep", "light", "rem"].filter((k) => typeof s.stage_minutes[k] === "number");
+    row("Asleep", slept.length ? sleepMinutes(slept.reduce((acc, k) => acc + s.stage_minutes[k], 0)) : "not recorded");
+    card.append(kv);
+    two.append(card);
+  }
+  out.append(two);
+  if (!night.sessions.length) out.append(el("span", "caption muted", sentence(night.reason) ?? "No record of that night."));
+  if (!night.sessions.length) return;
+  out.append(el("span", "caption muted", "In bed is the span from start to end. Asleep is the deep, light and REM minutes added up."));
+
+  const drawn = night.sessions.filter((x) => x.stages?.length);
+  for (const s of drawn) {
+    const card = el("section", "card");
+    const top = el("div", "row");
+    top.append(el("h2", "heading", "Stages"), scopeTag(s.source_scope));
+    card.append(top, hypnogram(s));
+    const legend = el("div", "legend caption");
+    for (const k of [...STAGE_ROWS, "unmeasurable"]) {
+      const item = el("span");
+      item.append(el("span", `chip stage-${k}`), document.createTextNode(STAGE_WORD[k]));
+      legend.append(item);
+    }
+    card.append(legend);
+    card.append(el("span", "caption muted", typeof s.utc_offset_s === "number"
+      ? "Hours are the watch's own clock."
+      : "watch clock unknown · UTC"));
+    out.append(card);
+  }
+
+  const table = el("section", "card");
+  table.append(el("h2", "heading", "Stage minutes and overnight"));
+  const grid = el("div", "grid3 body");
+  grid.append(el("span"), ...SLEEP_SCOPES.map((sc) => el("span", `caption scope-${sc}`, scopeWord(sc))));
+  const line = (label: string, get: (s: SleepSession) => string | null): void => {
+    grid.append(el("span", "", label));
+    for (const sc of SLEEP_SCOPES) {
+      const s = night.sessions.find((x) => x.source_scope === sc);
+      const v = s ? get(s) : null;
+      grid.append(el("span", v === null ? "muted" : "value-small", v ?? "not recorded"));
+    }
+  };
+  for (const k of [...STAGE_ROWS, "unmeasurable"]) {
+    if (!night.sessions.some((s) => typeof s.stage_minutes[k] === "number")) continue;
+    line(STAGE_WORD[k], (s) => (typeof s.stage_minutes[k] === "number" ? sleepMinutes(s.stage_minutes[k]) : null));
+  }
+  const num = (v: number | undefined, unit: string): string | null => (typeof v === "number" ? fmt(v, unit) : null);
+  line("Average heart rate", (s) => num(s.avg_hr, "bpm"));
+  line("Average oxygen", (s) => num(s.avg_spo2, "%"));
+  if (night.sessions.some((s) => typeof s.avg_respiration === "number")) line("Average breathing", (s) => num(s.avg_respiration, "breaths/min"));
+  if (night.sessions.some((s) => typeof s.awakenings_count === "number")) line("Awakenings", (s) => (typeof s.awakenings_count === "number" ? String(s.awakenings_count) : null));
+  table.append(grid);
+  out.append(table);
+
+  const hrv = await core.call<Metric>("data.metric", { metric: "hrv_rmssd", scope: "device", days: 30, last_day: date }).catch(() => null);
+  const card = el("section", "card");
+  card.append(el("h2", "heading", metricLabel("hrv_rmssd")));
+  const tonight = hrv?.days.find((d) => d.day === date)?.value ?? null;
+  card.append(el("span", "value", tonight === null ? "not recorded" : fmt(tonight, "ms")));
+  out.append(card);
+  if (hrv && hrv.days.some((d) => d.value !== null)) {
+    const chart = el("div", "chart short");
+    card.append(chart, el("span", "caption muted", `The 30 days ending ${date}, the ${scopeWord("device")} source; a line never bridges a gap.`));
+    later(() => drawTrend(chart, [{ scope: hrv.scope, unit: hrv.unit, days: hrv.days }], metricLabel("hrv_rmssd")));
+  } else {
+    card.append(el("span", "caption muted", "No HRV readings in these 30 days."));
+  }
+}
+
 // ---- Import (Bet 7b-3) ------------------------------------------------------------------
 // The drop is handled in Rust (import_drop.rs): the window's OS drop event becomes the core's import call there and
 // `core://import` events (started / done / failed) come back here. This screen never starts an import and never
@@ -1349,6 +1625,7 @@ async function screenImport(out: ParentNode): Promise<void> {
 
 // ---- Data health ------------------------------------------------------------------------
 let healthDays = 90;
+let scrollDebug = 0; // evidence runs: `--scroll <px>` scrolls every drawn screen so a shot shows its lower part
 
 function bannerEl(lead: string, text: string, error = false): HTMLElement {
   const b = el("section", error ? "banner body error" : "banner body");
@@ -2097,9 +2374,13 @@ void (async () => {
   await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);
   const i = args.indexOf("--screen");
-  const wanted = i >= 0 && SCREENS.some((s) => s.id === args[i + 1]) ? args[i + 1] : null;
+  const arg = args[i + 1] ?? "";
+  const night = /^sleep\/\d{4}-\d{2}-\d{2}$/.test(arg); // evidence runs: open one night
+  const wanted = i >= 0 && (night || SCREENS.some((s) => s.id === arg)) ? arg : null;
   const h = args.indexOf("--health-days");
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
+  const sc = args.indexOf("--scroll"); // evidence runs: scroll the drawn screen
+  if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
   if (t >= 0 && TREND_METRICS.includes(args[t + 1])) trendMetric = args[t + 1];
   const dl = args.indexOf("--debug-listen");
