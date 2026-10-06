@@ -10,6 +10,13 @@
 //! so a peer without the key cannot make it wait for a body (Bet 12 review F1). `token_key = HKDF-SHA256(master, salt = account, info = "disconect/lan/v1/token")`. The
 //! server (`lan_server.rs`) never decrypts anything; it derives the same key from the same master.
 //!
+//! **Response tag (Bet 12-RA).** Every answer of the object routes carries
+//! `X-Disconect-Resp: v1.<server unix seconds>.<rtag>` with `rtag = hex HMAC-SHA256(token_key, "resp" LF
+//! METHOD LF target LF <request auth value as the server received it, or empty> LF <seconds> LF status LF
+//! hex(sha256(body)))`. The client verifies it, in constant time, before it interprets the status: a
+//! fake server (or a network that rewrites answers) cannot make it book a push, trust a list or read a
+//! refusal as real. Health and the pairing routes carry none.
+//!
 //! Wire format and what the server never does: `docs/relay-protocol.md`, "LAN relay".
 
 use std::io::{Error as IoError, ErrorKind};
@@ -24,6 +31,8 @@ use super::folder::{MAX_OBJECT, Relay, RelayError, is_object_name};
 
 /// The request header carrying the token.
 pub const AUTH_HEADER: &str = "X-Disconect-Auth";
+/// The response header carrying the answer's tag (frozen, docs/kb/24-wire-constants.md).
+pub const RESP_HEADER: &str = "X-Disconect-Resp";
 /// The route prefix of the object API.
 pub const OBJECTS: &str = "/v1/objects";
 /// The unauthenticated health route.
@@ -181,6 +190,98 @@ pub fn verify_tag(
     mac.verify_slice(tag).map_err(|_| AuthError::Mismatch)
 }
 
+/// The MAC behind a response tag: `"resp" LF METHOD LF target LF auth LF server_secs LF status LF
+/// hex(sha256(body))`. `auth` is the request's auth value as the server received it (SP/HTAB-trimmed),
+/// empty when there was none.
+fn resp_mac(
+    key: &[u8],
+    method: &str,
+    target: &str,
+    auth: &str,
+    server_secs: u64,
+    status: u16,
+    body: &[u8],
+) -> Option<Hmac<Sha256>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    let digest = hex::encode(Sha256::digest(body));
+    let auth = auth.trim_matches([' ', '\t']);
+    mac.update(
+        format!("resp\n{method}\n{target}\n{auth}\n{server_secs}\n{status}\n{digest}").as_bytes(),
+    );
+    Some(mac)
+}
+
+/// The response tag for one answer. `None` only if the key is unusable (it never is).
+pub fn resp_tag(
+    key: &[u8],
+    method: &str,
+    target: &str,
+    auth: &str,
+    server_secs: u64,
+    status: u16,
+    body: &[u8],
+) -> Option<[u8; 32]> {
+    let tag = resp_mac(key, method, target, auth, server_secs, status, body)?
+        .finalize()
+        .into_bytes();
+    Some(tag.into())
+}
+
+/// The `X-Disconect-Resp` value: `v1.<server secs>.<hex rtag>`.
+pub fn resp_header_value(
+    key: &[u8],
+    method: &str,
+    target: &str,
+    auth: &str,
+    server_secs: u64,
+    status: u16,
+    body: &[u8],
+) -> Option<String> {
+    let tag = resp_tag(key, method, target, auth, server_secs, status, body)?;
+    Some(format!("v{API_VERSION}.{server_secs}.{}", hex::encode(tag)))
+}
+
+/// A response header's parts: the server's seconds and the tag. Exact shape only:
+/// `v1.` + decimal + `.` + 64 lower-case hex.
+pub fn parse_resp(header: &str) -> Result<(u64, [u8; 32]), AuthError> {
+    let mut parts = header.split('.');
+    let (Some(version), Some(stamp), Some(tag), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(AuthError::Malformed);
+    };
+    if version != format!("v{API_VERSION}")
+        || stamp.is_empty()
+        || stamp.len() > 20
+        || !stamp.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(AuthError::Malformed);
+    }
+    let secs: u64 = stamp.parse().map_err(|_| AuthError::Malformed)?;
+    let lower = tag.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let bytes: [u8; 32] = mac_bytes(tag)?.try_into().map_err(|_| AuthError::Malformed)?;
+    if !lower {
+        return Err(AuthError::Malformed);
+    }
+    Ok((secs, bytes))
+}
+
+/// Verify a response tag in constant time. `request` is `(method, target, auth value sent)`.
+pub fn verify_resp(
+    key: &[u8],
+    request: (&str, &str, &str),
+    server_secs: u64,
+    status: u16,
+    body: &[u8],
+    tag: &[u8],
+) -> Result<(), AuthError> {
+    let (method, target, auth) = request;
+    resp_mac(key, method, target, auth, server_secs, status, body)
+        .ok_or(AuthError::Mismatch)?
+        .verify_slice(tag)
+        .map_err(|_| AuthError::Mismatch)
+}
+
 /// Unix seconds now. The wall clock itself, never the `DISCONECT_NOW` test pin: this is a security
 /// check, and a pinned clock would make every token stale.
 pub fn wall_clock() -> u64 {
@@ -245,7 +346,9 @@ impl LanRelay {
         })
     }
 
-    /// One authenticated request; the status and the body (capped at one bundle).
+    /// One authenticated request; the status and the body (capped at one bundle), returned only
+    /// after the answer's response tag verified against this request. A missing, repeated,
+    /// malformed or wrong tag is `Unverified`: nothing about the answer is interpreted.
     fn call(&self, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), RelayError> {
         let header = auth_value(&*self.key, method, path, wall_clock(), body)
             .ok_or(RelayError::Unreachable)?;
@@ -257,14 +360,28 @@ impl LanRelay {
         };
         let mut response = outcome.map_err(|_| RelayError::Unreachable)?;
         let status = response.status().as_u16();
+        let tag = single_resp_header(&response)?;
         let bytes = response
             .body_mut()
             .with_config()
             .limit(MAX_OBJECT)
             .read_to_vec()
             .map_err(|_| RelayError::Unreachable)?;
+        let (secs, tag) = tag;
+        verify_resp(&*self.key, (method, path, &header), secs, status, &bytes, &tag)
+            .map_err(|_| RelayError::Unverified)?;
         Ok((status, bytes))
     }
+}
+
+/// The one `X-Disconect-Resp` of an answer, parsed; none, two or a malformed one is `Unverified`.
+fn single_resp_header<B>(response: &ureq::http::Response<B>) -> Result<(u64, [u8; 32]), RelayError> {
+    let mut values = response.headers().get_all(RESP_HEADER).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return Err(RelayError::Unverified);
+    };
+    let text = value.to_str().map_err(|_| RelayError::Unverified)?;
+    parse_resp(text).map_err(|_| RelayError::Unverified)
 }
 
 /// An HTTP status as the `Relay` error the folder relay would have raised for the same thing.
@@ -477,6 +594,77 @@ mod tests {
                 AuthError::Malformed,
                 "{bad}"
             );
+        }
+    }
+
+    // response-tag vector (12-RA), computed independently in Python (hmac + hashlib): master 1..=32,
+    // GET /v1/objects at ts 1000, server secs 1000, status 200, body `[]`
+    const RESP_AUTH: &str = "v1.1000.eed0250402d3d138d4e77395553d05816469803b8a03dcac4811847d3d64e336.52e8ccfb4c2e95caa0ffa97acbfa52153b8ddf74a685275aabddba18689282ff";
+    const RESP_VECTOR: &str = "v1.1000.6547026cb33f306df7bbbe0198be015aa23c3c756b5ef5c2ebe93bc191a8289c";
+
+    #[test]
+    fn the_response_tag_known_answer_vector() {
+        let key = token_key(&master());
+        assert_eq!(
+            auth_value(&*key, "GET", "/v1/objects", 1_000, b"").as_deref(),
+            Some(RESP_AUTH)
+        );
+        assert_eq!(
+            resp_header_value(&*key, "GET", "/v1/objects", RESP_AUTH, 1_000, 200, b"[]").as_deref(),
+            Some(RESP_VECTOR)
+        );
+        // the binder is trimmed of spaces and tabs, as the server's header parser does
+        let padded = format!(" \t{RESP_AUTH}\t ");
+        assert_eq!(
+            resp_header_value(&*key, "GET", "/v1/objects", &padded, 1_000, 200, b"[]").as_deref(),
+            Some(RESP_VECTOR)
+        );
+        assert_eq!(RESP_HEADER, "X-Disconect-Resp");
+    }
+
+    #[test]
+    fn a_response_tag_round_trips_and_every_part_is_bound() {
+        let key = token_key(&master());
+        let value = resp_header_value(&*key, "GET", "/v1/objects", "hdr", 1_000, 200, b"[]").expect("value");
+        let (secs, tag) = parse_resp(&value).expect("parse");
+        assert_eq!(secs, 1_000);
+        let check = |m: &str, t: &str, a: &str, s: u64, st: u16, b: &[u8]| verify_resp(&*key, (m, t, a), s, st, b, &tag);
+        assert!(check("GET", "/v1/objects", "hdr", 1_000, 200, b"[]").is_ok());
+        for bad in [
+            check("PUT", "/v1/objects", "hdr", 1_000, 200, b"[]"),
+            check("GET", "/v1/objects?x", "hdr", 1_000, 200, b"[]"),
+            check("GET", "/v1/objects", "hdr2", 1_000, 200, b"[]"),
+            check("GET", "/v1/objects", "hdr", 1_001, 200, b"[]"),
+            check("GET", "/v1/objects", "hdr", 1_000, 204, b"[]"),
+            check("GET", "/v1/objects", "hdr", 1_000, 200, b"[ ]"),
+        ] {
+            assert_eq!(bad, Err(AuthError::Mismatch));
+        }
+        let other = token_key(&(2u8..34).collect::<Vec<_>>());
+        assert_eq!(
+            verify_resp(&*other, ("GET", "/v1/objects", "hdr"), 1_000, 200, b"[]", &tag),
+            Err(AuthError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn the_response_header_shape_is_exact() {
+        let mac = "ab".repeat(32);
+        assert!(parse_resp(&format!("v1.5.{mac}")).is_ok());
+        for bad in [
+            String::new(),
+            "v1".into(),
+            format!("v2.5.{mac}"),
+            format!("v1..{mac}"),
+            format!("v1.5x.{mac}"),
+            format!("v1.5.{mac}.{mac}"),
+            format!("v1.5.{}", "ab".repeat(31)),
+            format!("v1.5.{}", "AB".repeat(32)),
+            format!("v1.5.{}", "zz".repeat(32)),
+            format!("v1.{}.{mac}", "9".repeat(21)),
+            format!("v1.5. {mac}"),
+        ] {
+            assert_eq!(parse_resp(&bad).unwrap_err(), AuthError::Malformed, "{bad}");
         }
     }
 

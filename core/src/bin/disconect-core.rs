@@ -325,7 +325,7 @@ fn sync_exit(error: &SyncError) -> u8 {
         SyncError::Db(_) | SyncError::Writer(WriterError::Db(_)) | SyncError::WriteFailed(_) => EXIT_DATABASE,
         SyncError::Source(SourceError::Db(_)) => EXIT_DATABASE,
         SyncError::Relay(RelayError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => EXIT_USAGE,
-        SyncError::Relay(RelayError::Unreachable) => EXIT_UNREACHABLE,
+        SyncError::Relay(RelayError::Unreachable | RelayError::Unverified) => EXIT_UNREACHABLE,
         _ => 1,
     }
 }

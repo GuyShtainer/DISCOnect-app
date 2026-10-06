@@ -169,7 +169,8 @@ fn source_parts(error: &SourceError) -> (&'static str, String) {
 
 /// A sync failure under the oracle's class-to-code map. A folder relay's I/O errors map as every
 /// other I/O error does; a network relay (Rust only) says `not_found` when it cannot be reached
-/// (the text says "unreachable"), `relay_auth_failed` when it refuses the token, `internal` with
+/// (the text says "unreachable"), `relay_auth_failed` when it proves the key and refuses the request (clocks), `relay_unverified` when its answer
+/// cannot be verified, `internal` with
 /// the HTTP status for anything else.
 fn sync_parts(error: &SyncError) -> (&'static str, String) {
     match error {
@@ -203,6 +204,7 @@ fn relay_parts(error: &RelayError) -> (&'static str, String) {
         RelayError::TooLarge | RelayError::BadName => ("bad_params", error.to_string()),
         RelayError::Unreachable => ("not_found", error.to_string()),
         RelayError::Unauthorized => ("relay_auth_failed", error.to_string()),
+        RelayError::Unverified => ("relay_unverified", error.to_string()),
         RelayError::Status(_) => ("internal", error.to_string()),
     }
 }

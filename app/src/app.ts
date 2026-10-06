@@ -662,6 +662,12 @@ let syncListenersArmed = false;
 function syncRedraw(): void {
   if (current().split("/")[0] === "sync") void route();
 }
+// The relay's two answers a person can act on, in plain words (the core's own text names the causes at length).
+const SYNC_WORDS: Record<string, string> = {
+  relay_auth_failed: "The relay refused this device: check the date and time on both devices.",
+  relay_unverified: "The relay's answer could not be verified. It is not the relay this device paired with, it was set up again with a new key, or the network altered the answer.",
+};
+
 function syncFail(e: unknown): void {
   syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
   syncRedraw();
@@ -927,7 +933,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   };
   const errorBanners = (): void => {
     if (syncError) {
-      out.append(bannerEl(syncError.code, syncError.message, true));
+      out.append(bannerEl(syncError.code, SYNC_WORDS[syncError.code] ?? syncError.message, true));
       syncError = null;
     }
     if (relayStoppedNote) {

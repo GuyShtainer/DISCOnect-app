@@ -15,6 +15,11 @@
 //! * `POST /v1/pair/<id>` and `GET /v1/pair/<id>/payload` -- only when an offer is attached (`pair offer`),
 //!   unauthenticated by design; see `pair_routes.rs` and `docs/relay-protocol.md`, "Pairing routes".
 //!
+//! Every answer of the object routes (all statuses) carries `X-Disconect-Resp` (`lan.rs`, the response
+//! tag, computed in [`handle`] over the method, the target, the request's auth value, the server's seconds,
+//! the status and the body); health, the pairing routes and the head errors (400/408 before a head exists)
+//! carry none.
+//!
 //! Everything else answers 404 or 405; a bad token 401 with an empty body whatever the reason; a
 //! name outside the pattern 400; a name under another account 403; a body over one bundle 413; a
 //! body that stops arriving 408. Nothing but the method and the status is ever logged.
@@ -53,7 +58,7 @@ use zeroize::Zeroizing;
 use super::bundle::account_for;
 use super::folder::{FolderRelay, MAX_OBJECT, Relay, RelayError, is_object_name};
 use super::lan::{
-    API_VERSION, HEALTH, OBJECTS, parse_auth, token_key, verify_pre, verify_tag, wall_clock,
+    API_VERSION, HEALTH, OBJECTS, RESP_HEADER, parse_auth, resp_header_value, token_key, verify_pre, verify_tag, wall_clock,
 };
 use super::pair_routes::{self, PAIR, PairHandle, PairOffer, PairShared};
 use crate::identity::PRODUCT;
@@ -104,6 +109,9 @@ pub struct Reply {
     pub status: u16,
     pub body: Vec<u8>,
     pub json: bool,
+    /// The `X-Disconect-Resp` value (`v1.<secs>.<rtag>`), set by [`handle`] for every object-route
+    /// answer; `None` for health, the pairing routes and the head errors of `serve_connection`.
+    pub resp: Option<String>,
 }
 
 impl Reply {
@@ -112,6 +120,7 @@ impl Reply {
             status,
             body: Vec::new(),
             json: false,
+            resp: None,
         }
     }
 }
@@ -187,10 +196,42 @@ fn read_declared(body: &mut dyn Read, declared: u64) -> Result<Vec<u8>, BodyErro
     }
 }
 
+/// True for the routes that carry no response tag: health (no token) and the pairing routes (their
+/// own transcript). A target with a query is a 404 of the object API's kind and is tagged.
+fn untagged_route(url: &str) -> bool {
+    !url.contains('?') && (url == HEALTH || url == PAIR || url.starts_with(&format!("{PAIR}/")))
+}
+
 /// Answer one request. `now` is the server's clock in Unix seconds (a parameter so tests can move
 /// it); `body` is read only after the header's shape, its timestamp and its pre-tag (over the
-/// declared length) pass, and the tag is checked before anything touches the folder.
+/// declared length) pass, and the tag is checked before anything touches the folder. Every answer
+/// but health's and the pairing routes' carries a response tag (`lan::resp_tag`) over the method,
+/// the target, the request's auth value as received, `now`, the final status and the body.
 pub fn handle(
+    ctx: &Ctx,
+    method: &str,
+    url: &str,
+    auth: Option<&str>,
+    declared_len: Option<usize>,
+    body: &mut dyn Read,
+    now: u64,
+) -> Reply {
+    let mut reply = handle_untagged(ctx, method, url, auth, declared_len, body, now);
+    if !untagged_route(url) {
+        reply.resp = resp_header_value(
+            &*ctx.key,
+            method,
+            url,
+            auth.unwrap_or(""),
+            now,
+            reply.status,
+            &reply.body,
+        );
+    }
+    reply
+}
+
+fn handle_untagged(
     ctx: &Ctx,
     method: &str,
     url: &str,
@@ -215,6 +256,7 @@ pub fn handle(
             status: 200,
             body: text.into_bytes(),
             json: true,
+            resp: None,
         };
     }
     let name = match url.strip_prefix(OBJECTS) {
@@ -258,6 +300,7 @@ pub fn handle(
                 status: 200,
                 body: json!(names).to_string().into_bytes(),
                 json: true,
+                resp: None,
             },
             Err(error) => relay_failure(&error),
         };
@@ -274,6 +317,7 @@ pub fn handle(
                 status: 200,
                 body: object,
                 json: false,
+                resp: None,
             },
             Err(error) => relay_failure(&error),
         },
@@ -640,6 +684,9 @@ fn write_reply(mut stream: &TcpStream, reply: &Reply, limits: &Limits) -> std::i
     if reply.status != 204 {
         head.push_str(&format!("Content-Length: {}\r\n", reply.body.len()));
     }
+    if let Some(resp) = &reply.resp {
+        head.push_str(&format!("{RESP_HEADER}: {resp}\r\n"));
+    }
     head.push_str("\r\n");
     let deadline = Instant::now() + limits.body_budget(reply.body.len() as u64);
     stream.write_all(head.as_bytes())?;
@@ -730,7 +777,7 @@ fn linger(ctx: &Ctx, stream: TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::lan::{MAX_SKEW_SECS, auth_value, auth_value_declaring};
+    use crate::relay::lan::{MAX_SKEW_SECS, auth_value, auth_value_declaring, parse_resp, verify_resp};
 
     fn master() -> Vec<u8> {
         (1u8..33).collect()
@@ -861,6 +908,130 @@ mod tests {
         );
         // nothing was written by any of them
         assert_eq!(signed(&ctx, "GET", &path, b"", 100, 100).status, 404);
+    }
+
+    /// Does `reply` carry a response tag that verifies for exactly this request, status and body?
+    fn tag_verifies(
+        ctx: &Ctx,
+        reply: &Reply,
+        method: &str,
+        target: &str,
+        auth: &str,
+        now: u64,
+    ) -> bool {
+        let Some(value) = &reply.resp else {
+            return false;
+        };
+        let Ok((secs, tag)) = parse_resp(value) else {
+            return false;
+        };
+        secs == now
+            && verify_resp(&*ctx.key, (method, target, auth), secs, reply.status, &reply.body, &tag)
+                .is_ok()
+    }
+
+    #[test]
+    fn every_object_route_answer_carries_a_valid_response_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx(dir.path());
+        let path = object(&ctx, "a");
+        let now = 100;
+        let call = |method: &str, target: &str, body: &[u8], declared: Option<usize>| {
+            let header = auth_value(&*ctx.key, method, target, now, body).expect("header");
+            let reply = handle(
+                &ctx,
+                method,
+                target,
+                Some(&header),
+                declared,
+                &mut &body[..],
+                now,
+            );
+            (reply, header)
+        };
+        let foreign = format!("{OBJECTS}/{}/{}", "f".repeat(64), "a".repeat(32));
+        let cases: [(&str, String, &[u8], u16); 8] = [
+            ("PUT", path.clone(), b"x", 204),
+            ("GET", path.clone(), b"", 200),
+            ("GET", OBJECTS.into(), b"", 200),
+            ("PUT", format!("{OBJECTS}/../escape"), b"x", 400),
+            ("PUT", foreign, b"x", 403),
+            ("GET", object(&ctx, "b"), b"", 404),
+            ("PUT", OBJECTS.into(), b"", 405),
+            ("GET", "/v1/other".into(), b"", 404),
+        ];
+        for (method, target, body, status) in cases {
+            let (reply, header) = call(method, &target, body, Some(body.len()));
+            assert_eq!(reply.status, status, "{method} {target}");
+            assert!(tag_verifies(&ctx, &reply, method, &target, &header, now), "{method} {target}");
+        }
+        // 413: declared over one bundle, refused before the body is read
+        let big = MAX_OBJECT + 1;
+        let header = auth_value_declaring(&*ctx.key, "PUT", &path, now, big, b"").expect("header");
+        let reply = handle(&ctx, "PUT", &path, Some(&header), Some(big as usize), &mut std::io::empty(), now);
+        assert_eq!(reply.status, 413);
+        assert!(tag_verifies(&ctx, &reply, "PUT", &path, &header, now));
+        // 401 in every form is tagged over what was received (nothing, junk, stale, wrong key)
+        let none = handle(&ctx, "GET", &path, None, None, &mut std::io::empty(), now);
+        assert_eq!(none.status, 401);
+        assert!(tag_verifies(&ctx, &none, "GET", &path, "", now));
+        let junk = handle(&ctx, "GET", &path, Some("junk"), None, &mut std::io::empty(), now);
+        assert_eq!(junk.status, 401);
+        assert!(tag_verifies(&ctx, &junk, "GET", &path, "junk", now));
+        let other = Ctx::new(dir.path().join("relay"), &(2u8..34).collect::<Vec<_>>());
+        let foreign_key = auth_value(&*other.key, "GET", &path, now, b"").expect("header");
+        let refused = handle(&ctx, "GET", &path, Some(&foreign_key), None, &mut std::io::empty(), now);
+        assert_eq!(refused.status, 401);
+        assert!(tag_verifies(&ctx, &refused, "GET", &path, &foreign_key, now));
+        // the tag is never one a key-less peer could make, and a tag of another key does not verify
+        assert!(!tag_verifies(&other, &refused, "GET", &path, &foreign_key, now));
+    }
+
+    #[test]
+    fn health_and_the_pair_routes_carry_no_response_tag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx(dir.path());
+        let health = handle(&ctx, "GET", HEALTH, None, None, &mut std::io::empty(), 5);
+        assert_eq!((health.status, health.resp), (200, None));
+        let wrong = handle(&ctx, "PUT", HEALTH, None, None, &mut std::io::empty(), 5);
+        assert_eq!((wrong.status, wrong.resp), (405, None));
+        for (method, url) in [
+            ("POST", "/v1/pair/abc"),
+            ("GET", "/v1/pair/abc/payload"),
+            ("GET", "/v1/pair"),
+        ] {
+            let reply = handle(&ctx, method, url, None, None, &mut std::io::empty(), 5);
+            assert_eq!(reply.resp, None, "{method} {url}");
+        }
+    }
+
+    #[test]
+    fn a_transplanted_request_gets_an_answer_the_original_client_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ctx = ctx(dir.path());
+        let now = 100;
+        // the client signed GET /v1/objects; a MITM adds a query and forwards the same header
+        let header = auth_value(&*ctx.key, "GET", OBJECTS, now, b"").expect("header");
+        let target = format!("{OBJECTS}?x");
+        let moved = handle(&ctx, "GET", &target, Some(&header), None, &mut std::io::empty(), now);
+        assert_eq!(moved.status, 404);
+        assert!(tag_verifies(&ctx, &moved, "GET", &target, &header, now), "tagged for the target it saw");
+        assert!(
+            !tag_verifies(&ctx, &moved, "GET", OBJECTS, &header, now),
+            "not for the target the client sent"
+        );
+        // the same for another object's GET answered to a request for this one
+        let a = object(&ctx, "a");
+        let b = object(&ctx, "b");
+        let header_b = auth_value(&*ctx.key, "GET", &b, now, b"").expect("header");
+        let answer_b = handle(&ctx, "GET", &b, Some(&header_b), None, &mut std::io::empty(), now);
+        let header_a = auth_value(&*ctx.key, "GET", &a, now, b"").expect("header");
+        assert!(!tag_verifies(&ctx, &answer_b, "GET", &a, &header_a, now), "answer B replayed onto request A");
+        // a body length added to a GET: the real server answers a tagged 401, which the client reads as
+        // "the relay holds my key but refused the request" (a clock hint), never as a re-pair
+        let lured = handle(&ctx, "GET", OBJECTS, Some(&header), Some(5), &mut &b"12345"[..], now);
+        assert_eq!(lured.status, 401);
+        assert!(tag_verifies(&ctx, &lured, "GET", OBJECTS, &header, now));
     }
 
     #[test]

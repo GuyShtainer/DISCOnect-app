@@ -261,6 +261,7 @@ fn bare(status: u16) -> Reply {
         status,
         body: Vec::new(),
         json: false,
+        resp: None,
     }
 }
 
@@ -269,6 +270,7 @@ fn bytes(status: u16, body: Vec<u8>) -> Reply {
         status,
         body,
         json: false,
+        resp: None,
     }
 }
 

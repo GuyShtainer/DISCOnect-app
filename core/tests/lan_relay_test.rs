@@ -19,7 +19,8 @@ use disconect_core::keys::{self, PassphraseSource};
 use disconect_core::relay::bundle::account_for;
 use disconect_core::relay::folder::{FolderRelay, Relay, RelayError};
 use disconect_core::relay::lan::{
-    AUTH_HEADER, LanRelay, auth_value, auth_value_declaring, token_key, wall_clock,
+    AUTH_HEADER, LanRelay, RESP_HEADER, auth_value, auth_value_declaring, resp_header_value, token_key,
+    wall_clock,
 };
 use disconect_core::relay::lan_server::{LanServer, Limits, Logger};
 use disconect_core::relay::sync::{self, SyncError};
@@ -177,12 +178,14 @@ fn a_wrong_master_is_refused_and_nothing_is_marked() {
     let tmp = tempfile::tempdir().expect("tmp");
     let lan = Lan::start(tmp.path(), master());
     let stranger = lan.client(&other_master());
+    // the server tags its answers under ITS key: a client with another key cannot verify them, so a
+    // wrong master is `Unverified` (a Mac set up again with a new key looks exactly like this)
     let error = stranger
         .list(&account_for(&other_master()))
-        .expect_err("401");
-    assert!(matches!(error, RelayError::Unauthorized), "{error}");
-    assert_eq!(error.reason(), "authentication_failed");
-    assert!(error.to_string().starts_with("authentication_failed"));
+        .expect_err("unverified");
+    assert!(matches!(error, RelayError::Unverified), "{error}");
+    assert_eq!(error.reason(), "relay_unverified");
+    assert!(error.to_string().starts_with("relay_unverified"));
 
     let a = device();
     import_path(
@@ -196,10 +199,10 @@ fn a_wrong_master_is_refused_and_nothing_is_marked() {
         a.conn(),
         "SELECT count(*) FROM raw_records r LEFT JOIN relay_seen s ON s.raw_record_id=r.id WHERE s.raw_record_id IS NULL",
     );
-    // the stranger's master packs under its own account; the server refuses the token first
+    // the stranger's master packs under its own account; its first call is already unverifiable
     let refused = sync::push(a.conn(), &other_master(), &stranger).expect_err("refused");
     assert!(
-        matches!(refused, SyncError::Relay(RelayError::Unauthorized)),
+        matches!(refused, SyncError::Relay(RelayError::Unverified)),
         "{refused}"
     );
     assert_eq!(count(a.conn(), "SELECT count(*) FROM relay_bundles"), 0);
@@ -947,4 +950,294 @@ fn hostile_heads_and_paths_get_bare_refusals_and_a_slow_head_is_cut() {
     let mut mute = TcpStream::connect(addr).expect("connect");
     assert_eq!(first_status(&mut mute, Duration::from_secs(4)), None);
     server.stop();
+}
+
+// ------------------------------------------------------------------ 12-RA: response authentication
+
+/// What a fake server or a proxy sees of a request.
+#[derive(Clone)]
+struct Req {
+    method: String,
+    target: String,
+    auth: String,
+    raw: Vec<u8>,
+}
+
+/// Read one request (head and a declared body) off a connection.
+fn read_request(stream: &mut TcpStream) -> Option<Req> {
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let end = loop {
+        if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&raw[..end]).to_string();
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next()?.split(' ');
+    let (method, target) = (first.next()?.to_string(), first.next()?.to_string());
+    let (mut auth, mut length) = (String::new(), 0usize);
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.eq_ignore_ascii_case(AUTH_HEADER) {
+            auth = value.trim().to_string();
+        } else if name.eq_ignore_ascii_case("content-length") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    while raw.len() < end + length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    Some(Req { method, target, auth, raw })
+}
+
+/// A server thread: one request per connection, the answer is whatever `answer` returns (raw bytes).
+struct Fake {
+    addr: std::net::SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Fake {
+    fn start(answer: impl Fn(&Req) -> Vec<u8> + Send + 'static) -> Fake {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).expect("blocking");
+                if let Some(request) = read_request(&mut stream) {
+                    let _ = stream.write_all(&answer(&request));
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        Fake { addr, stop, thread: Some(thread) }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A raw answer: status, body and any number of `X-Disconect-Resp` lines.
+fn raw_answer(status: u16, body: &[u8], resp: &[String]) -> Vec<u8> {
+    let mut head = format!("HTTP/1.1 {status} X\r\nConnection: close\r\n");
+    for value in resp {
+        head.push_str(&format!("{RESP_HEADER}: {value}\r\n"));
+    }
+    if status != 204 {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn tag_for(key: &[u8], req: &Req, status: u16, body: &[u8]) -> String {
+    resp_header_value(key, &req.method, &req.target, &req.auth, wall_clock(), status, body).expect("tag")
+}
+
+fn list_of(url: &str) -> Result<Vec<String>, RelayError> {
+    LanRelay::new(url, master()).expect("client").list(&account_for(master()))
+}
+
+#[test]
+fn an_answer_without_a_valid_tag_is_unverified_and_a_tagged_401_is_the_clock() {
+    let key = token_key(master());
+    let other = token_key(&other_master());
+    let k: Vec<u8> = key.to_vec();
+    let o: Vec<u8> = other.to_vec();
+    type Make = Box<dyn Fn(&Req) -> Vec<u8> + Send>;
+    let cases: Vec<(&str, Make, bool)> = vec![
+        ("tagged, correct", Box::new({ let k = k.clone(); move |r| raw_answer(200, b"[]", &[tag_for(&k, r, 200, b"[]")]) }), true),
+        ("no header", Box::new(|_| raw_answer(200, b"[]", &[])), false),
+        ("two headers", Box::new({ let k = k.clone(); move |r| { let t = tag_for(&k, r, 200, b"[]"); raw_answer(200, b"[]", &[t.clone(), t]) } }), false),
+        ("malformed header", Box::new(|_| raw_answer(200, b"[]", &["v1.1.zz".to_string()])), false),
+        ("tag of another status", Box::new({ let k = k.clone(); move |r| raw_answer(200, b"[]", &[tag_for(&k, r, 204, b"[]")]) }), false),
+        ("tag of another body", Box::new({ let k = k.clone(); move |r| raw_answer(200, b"[]", &[tag_for(&k, r, 200, b"[ ]")]) }), false),
+        ("tag under another key", Box::new({ let o = o.clone(); move |r| raw_answer(200, b"[]", &[tag_for(&o, r, 200, b"[]")]) }), false),
+        ("answer A's tag on request B", Box::new({ let k = k.clone(); move |r| {
+            let a = Req { auth: auth_value(&k, "GET", "/v1/objects", 1_000, b"").expect("auth"), ..r.clone() };
+            raw_answer(200, b"[]", &[tag_for(&k, &a, 200, b"[]")]) } }), false),
+        ("tag of another target", Box::new({ let k = k.clone(); move |r| {
+            let a = Req { target: format!("{}?x", r.target), ..r.clone() };
+            raw_answer(200, b"[]", &[tag_for(&k, &a, 200, b"[]")]) } }), false),
+    ];
+    for (label, make, ok) in cases {
+        let fake = Fake::start(make);
+        let outcome = list_of(&fake.url());
+        if ok {
+            assert_eq!(outcome.expect(label), Vec::<String>::new(), "{label}");
+        } else {
+            assert!(matches!(outcome, Err(RelayError::Unverified)), "{label}: {outcome:?}");
+        }
+    }
+    // a 401 with a valid tag: the relay holds this key and refused the request (clocks)
+    let tagged = Fake::start({ let k = k.clone(); move |r| raw_answer(401, b"", &[tag_for(&k, r, 401, b"")]) });
+    let outcome = list_of(&tagged.url());
+    assert!(matches!(outcome, Err(RelayError::Unauthorized)), "{outcome:?}");
+    // the same 401 without a tag, or with a wrong one: only Unverified, never "re-pair" or "clock"
+    let bare = Fake::start(|_| raw_answer(401, b"", &[]));
+    assert!(matches!(list_of(&bare.url()), Err(RelayError::Unverified)));
+    let wrong = Fake::start({ let o = o.clone(); move |r| raw_answer(401, b"", &[tag_for(&o, r, 401, b"")]) });
+    assert!(matches!(list_of(&wrong.url()), Err(RelayError::Unverified)));
+}
+
+fn unsent(device: &Device) -> i64 {
+    count(
+        device.conn(),
+        "SELECT count(*) FROM raw_records r LEFT JOIN relay_seen s ON s.raw_record_id=r.id WHERE s.raw_record_id IS NULL",
+    )
+}
+
+fn nothing_booked(device: &Device) {
+    assert_eq!(count(device.conn(), "SELECT count(*) FROM relay_bundles"), 0);
+    assert_eq!(count(device.conn(), "SELECT count(*) FROM relay_seen"), 0);
+}
+
+#[test]
+fn a_fake_server_answering_204_to_everything_books_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fake = Fake::start(|_| raw_answer(204, b"", &[]));
+    let a = device();
+    import_path(a.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
+    let before = unsent(&a);
+    assert!(before > 0);
+    let client = LanRelay::new(&fake.url(), master()).expect("client");
+    let error = sync::push(a.conn(), master(), &client).expect_err("unverified");
+    assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
+    nothing_booked(&a);
+    assert_eq!(unsent(&a), before, "every record is still unsent");
+    let b = device();
+    let pull = sync::pull(b.conn(), master(), &client).expect_err("unverified");
+    assert!(matches!(pull, SyncError::Relay(RelayError::Unverified)), "{pull}");
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles"), 0);
+}
+
+/// A proxy between a client and a real server (one request per connection): `rewrite` gets the
+/// server's whole answer (head and body) and returns what the client is shown.
+fn proxy(upstream: std::net::SocketAddr, rewrite: impl Fn(&Req, Vec<u8>) -> Vec<u8> + Send + 'static) -> Fake {
+    Fake::start(move |request| {
+        let mut up = TcpStream::connect(upstream).expect("upstream");
+        up.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        up.write_all(&request.raw).expect("forward");
+        let mut answer = Vec::new();
+        let _ = up.read_to_end(&mut answer);
+        rewrite(request, answer)
+    })
+}
+
+fn split_answer(answer: &[u8]) -> (String, Vec<u8>) {
+    let end = answer.windows(4).position(|w| w == b"\r\n\r\n").expect("head end");
+    (String::from_utf8_lossy(&answer[..end]).to_string(), answer[end + 4..].to_vec())
+}
+
+fn without_resp_header(head: &str) -> String {
+    head.split("\r\n")
+        .filter(|line| !line.to_ascii_lowercase().starts_with(&RESP_HEADER.to_ascii_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+#[test]
+fn a_proxy_that_rewrites_the_list_makes_a_pull_unverified_and_books_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lan = Lan::start(tmp.path(), master());
+    let a = device();
+    import_path(a.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
+    sync::push(a.conn(), master(), &lan.client(master())).expect("push");
+    // the list answer becomes `[]` with a corrected Content-Length: the status stays 200, so only
+    // the tag can notice (a wrong length would end in `Unreachable` for the wrong reason)
+    let evil = proxy(lan.server.local_addr(), |request, answer| {
+        if request.target != "/v1/objects" {
+            return answer;
+        }
+        let (head, _) = split_answer(&answer);
+        let head = head
+            .split("\r\n")
+            .map(|line| {
+                if line.to_ascii_lowercase().starts_with("content-length") {
+                    "Content-Length: 2".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let mut out = format!("{head}\r\n\r\n").into_bytes();
+        out.extend_from_slice(b"[]");
+        out
+    });
+    let b = device();
+    let client = LanRelay::new(&evil.url(), master()).expect("client");
+    let error = sync::pull(b.conn(), master(), &client).expect_err("unverified");
+    assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles"), 0, "no row, not even rejected");
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM raw_records"), 0);
+    // the straight way still works
+    assert_eq!(sync::pull(b.conn(), master(), &lan.client(master())).expect("pull").status, "ok");
+    assert_eq!(fingerprint(&a), fingerprint(&b));
+    lan.server.stop();
+}
+
+#[test]
+fn a_proxy_that_strips_the_tag_books_nothing_and_the_retry_converges_without_a_gap() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lan = Lan::start(tmp.path(), master());
+    let a = device();
+    import_path(a.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
+    let strip = proxy(lan.server.local_addr(), |_, answer| {
+        let (head, body) = split_answer(&answer);
+        let mut out = format!("{}\r\n\r\n", without_resp_header(&head)).into_bytes();
+        out.extend_from_slice(&body);
+        out
+    });
+    let before = unsent(&a);
+    let blind = LanRelay::new(&strip.url(), master()).expect("client");
+    let error = sync::push(a.conn(), master(), &blind).expect_err("unverified");
+    assert!(matches!(error, SyncError::Relay(RelayError::Unverified)), "{error}");
+    nothing_booked(&a);
+    assert_eq!(unsent(&a), before);
+    // the PUT did land on the real server (an unverified PUT may have): the retry pushes the same
+    // records again as a second bundle
+    let account = account_for(master());
+    assert_eq!(lan.folder_relay().list(&account).expect("list").len(), 1, "the unverified PUT landed");
+    let retried = sync::push(a.conn(), master(), &lan.client(master())).expect("retry");
+    assert_eq!(retried.bundles.len(), 1);
+    assert_eq!(lan.folder_relay().list(&account).expect("list").len(), 2, "a duplicate bundle");
+    // a second store pulls both and de-duplicates: the same content as A, no gap
+    let b = device();
+    let pulled = sync::pull(b.conn(), master(), &lan.client(master())).expect("pull");
+    assert_eq!(pulled.status, "ok");
+    assert_eq!(fingerprint(&a), fingerprint(&b), "fingerprints converge");
+    assert!(sync::gaps(b.conn()).expect("gaps").is_empty(), "no gap");
+    lan.server.stop();
 }

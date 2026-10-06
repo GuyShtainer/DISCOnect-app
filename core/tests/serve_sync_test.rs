@@ -294,7 +294,7 @@ fn the_lan_transport_serves_sync_run_and_names_its_failures() {
     let lines = rig_b.send(2, "sync.run", json!({}));
     assert_eq!(only_response(&lines)["result"]["pull"]["records_new"], 2);
 
-    // a server for another master: the token is refused
+    // a server for another master: its answers carry a tag this device cannot verify
     let stranger = LanServer::start(
         "127.0.0.1:0",
         tmp.path().join("other"),
@@ -308,7 +308,7 @@ fn the_lan_transport_serves_sync_run_and_names_its_failures() {
     );
     let lines = rig_a.send(3, "sync.run", json!({}));
     let error = &only_response(&lines)["error"];
-    assert_eq!(error["code"], "relay_auth_failed");
+    assert_eq!(error["code"], "relay_unverified");
     stranger.stop();
 
     // a server that went away: unreachable, reported as not_found with its own text
