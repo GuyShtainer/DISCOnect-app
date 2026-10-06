@@ -7,7 +7,7 @@ import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT
 import { disposeCharts, drawTrend, hatchedDays, showTipOn, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
-type AppInfo = { product: string; core: string; db: string; encrypted: boolean };
+type AppInfo = { product: string; notice: string; core: string; db: string; encrypted: boolean; schema: number; contract: number };
 type Day = { day: string; value: number | null; status: string };
 type Metric = { metric: string; scope: string; unit: string | null; days: Day[] };
 type TodayRow = { metric: string; scope: string; value: number | null; unit: string | null; day: string | null; status: string };
@@ -34,17 +34,28 @@ type Health = {
 };
 const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files" };
 
-const LIVE_FOLDED: { metric: string; unit: string | null }[] = [
-  { metric: "heart_rate", unit: "bpm" }, { metric: "stress", unit: null }, { metric: "respiration_rate", unit: "breaths/min" },
-  { metric: "spo2", unit: "%" }, { metric: "energy_reserve", unit: null },
-];
-const SCOPES = ["device", "vendor_cloud", "local"];
-// The Trends metric list is read once per session from data.contract (contract order; sample cadence = daily mean).
+// The metric list is read once per session from data.contract (contract order; sample cadence = daily mean);
+// each entry's scopes (the live link last, where a session stream folds the metric) are what Trends and Sleep draw.
 type ContractMetric = { metric: string; unit: string | null; cadence: "daily" | "sample"; scopes: string[] };
-let trendList: ContractMetric[] | null = null;
+let contractList: ContractMetric[] | null = null;
+/** The product words on screen: the TS constants until `app.info` answers, then the core's. */
+const productWords = { product: PRODUCT, notice: NOTICE };
+/** The contract read both Trends and Sleep use: the list, or the failure that stopped it. A failed read is asked again. */
+async function contractMetrics(): Promise<ContractMetric[] | { failure: { code?: string } | null }> {
+  if (contractList === null) {
+    let failure: { code?: string } | null = null;
+    const c = await core.call<{ metrics: ContractMetric[] }>("data.contract").catch((e: { code?: string }) => { failure = e; return null; });
+    if (!c) return { failure };
+    contractList = c.metrics.filter((m) => m.scopes.length > 0);
+  }
+  return contractList;
+}
+function contractFailureWords(failure: { code?: string } | null): string {
+  return failure?.code === "core_unavailable" ? "The core is not running." : "The core did not answer with its metric list.";
+}
 let trendArg: string | null = null; // --trend <id>, resolved after the first contract read
 function trendLabel(metric: string): string {
-  const m = trendList?.find((c) => c.metric === metric);
+  const m = contractList?.find((c) => c.metric === metric);
   return m?.cadence === "sample" ? `${metricLabel(metric)}, daily mean` : metricLabel(metric);
 }
 const GROUPS = ["Your data", "Getting data in", "Coach", "This app"] as const;
@@ -136,7 +147,7 @@ const topbar = document.getElementById("topbar") as HTMLElement;
 const menuButton = document.getElementById("menu") as HTMLButtonElement;
 const scrim = document.getElementById("scrim") as HTMLElement;
 const narrow = window.matchMedia("(max-width: 720px)");
-(topbar.querySelector(".name") as HTMLElement).textContent = PRODUCT;
+(topbar.querySelector(".name") as HTMLElement).textContent = productWords.product;
 
 /** The drawer (under 720 px): the sidebar shown over a scrim, the page behind it inert. */
 function drawerOpen(): boolean {
@@ -165,9 +176,19 @@ narrow.addEventListener("change", () => {
   else if (nav.contains(document.activeElement)) menuButton.focus();
 });
 
+/** Paint the core's product words into what is already drawn (the title, the top bar, the sidebar brand and notice). */
+function paintIdentity(): void {
+  document.title = productWords.product;
+  (topbar.querySelector(".name") as HTMLElement).textContent = productWords.product;
+  const brand = nav.querySelector(".brand");
+  if (brand) brand.textContent = productWords.product;
+  const notice = nav.querySelector("footer.notice");
+  if (notice) notice.textContent = productWords.notice;
+}
+
 function renderNav(): void {
   nav.replaceChildren();
-  nav.append(el("div", "brand", PRODUCT));
+  nav.append(el("div", "brand", productWords.product));
   for (const g of GROUPS) {
     const box = el("div", "navgroup");
     box.setAttribute("role", "group");
@@ -194,7 +215,7 @@ function renderNav(): void {
       : "Not encrypted"
     : "";
   nav.append(status);
-  nav.append(el("footer", "notice", NOTICE));
+  nav.append(el("footer", "notice", productWords.notice));
   (topbar.querySelector(".keyword") as HTMLElement).textContent = keyStatus
     ? keyStatus.encrypted ? (keyStatus.unlocked ? "Unlocked" : "Locked") : "Not encrypted"
     : "";
@@ -278,7 +299,7 @@ async function route(): Promise<void> {
     }
   }
   if (mine !== generation) return;
-  out.append(el("footer", "notice", NOTICE));
+  out.append(el("footer", "notice", productWords.notice));
   disposeCharts();
   main.replaceChildren(out);
   for (const fn of queue) fn();
@@ -1111,21 +1132,13 @@ let trendMetric = "";
 let trendDays = 90;
 
 async function screenTrend(out: ParentNode, later: Later): Promise<void> {
-  let failure: { code?: string } | null = null;
-  if (trendList === null) {
-    const c = await core.call<{ metrics: ContractMetric[] }>("data.contract").catch((e: { code?: string }) => { failure = e; return null; });
-    trendList = c ? c.metrics.filter((m) => m.scopes.length > 0) : null;
-  }
-  const list = trendList ?? [];
-  if (!list.length) {
-    const asked = trendList !== null; // an empty answer is an answer; a failed read is asked again on the next visit
-    trendList = null;
+  const read = await contractMetrics();
+  if (!Array.isArray(read) || !read.length) {
     header(out, "Trends", "");
-    out.append(el("p", "caption muted", asked ? "The core answered with no metrics."
-      : (failure as { code?: string } | null)?.code === "core_unavailable" ? "The core is not running."
-        : "The core did not answer with its metric list."));
+    out.append(el("p", "caption muted", Array.isArray(read) ? "The core answered with no metrics." : contractFailureWords(read.failure)));
     return; // --trend stays unconsumed until a read succeeds
   }
+  const list = read;
   if (trendArg !== null) {
     if (list.some((m) => m.metric === trendArg)) trendMetric = trendArg;
     trendArg = null;
@@ -1155,11 +1168,13 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   // The window ends on the latest day any metric has data, so an archive still draws.
   const today = await core.call<Today>("data.today");
   const lastDay = today.metrics.reduce<string>((acc, m) => (m.value !== null && m.day && m.day > acc ? m.day : acc), "") || today.day;
-  // the live scope only exists for the metrics the link folds (decision 8: diamonds, never a line)
-  const scopes = LIVE_FOLDED.some((m) => m.metric === trendMetric) ? [...SCOPES, "live"] : SCOPES;
+  // the scopes the contract declares for this metric, the live link last (decision 8: diamonds, never a line)
+  const scopes = list.find((m) => m.metric === trendMetric)?.scopes ?? [];
   const results = await Promise.all(scopes.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays, last_day: lastDay })));
   const series: Series[] = results
-    .filter((m) => m.days.some((d) => d.value !== null))
+    // a declared source joins the legend, the gap band and the caption even when it holds no value in the window;
+    // the live link stays out when the window holds no session (a session claims no day)
+    .filter((m) => m.scope !== "live" || m.days.some((d) => d.value !== null))
     .map((m) => ({ scope: m.scope, unit: m.unit, days: m.days }));
   const legend = el("div", "legend caption");
   for (const s of series) {
@@ -1173,7 +1188,7 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   const chart = el("div", "chart");
   card.append(chart);
   out.append(card);
-  if (!series.length) {
+  if (!series.some((x) => x.days.some((d) => d.value !== null))) {
     card.append(el("span", "muted body", "No source has values for this metric in the window."));
     return;
   }
@@ -1182,9 +1197,10 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   const hatched = hatchedDays(series);
   const plural = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
   const lacks = drawn
-    .map((x) => ({ x, n: x.days.filter((d) => d.value === null && !hatched.has(d.day)).length }))
-    .filter((e) => e.n > 0)
-    .map((e) => `The ${scopeWord(e.x.scope)} line lacks ${hatched.size ? `${e.n} more day${e.n === 1 ? "" : "s"}` : plural(e.n)}.`)
+    .map((x) => ({ x, n: x.days.filter((d) => d.value === null && !hatched.has(d.day)).length, none: !x.days.some((d) => d.value !== null) }))
+    .filter((e) => e.none || e.n > 0)
+    .map((e) => e.none ? `The ${scopeWord(e.x.scope)} line has no value in this window.`
+      : `The ${scopeWord(e.x.scope)} line lacks ${hatched.size ? `${e.n} more day${e.n === 1 ? "" : "s"}` : plural(e.n)}.`)
     .join(" ");
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
   const liveNote = series.some((s) => s.scope === "live") ? ` Diamonds: days with a live-link session, the mean of the minutes the link recorded; a session claims no day, so it draws no band.` : "";
@@ -1210,7 +1226,8 @@ type SleepSession = {
 type Night = { date: string | null; sessions: SleepSession[]; reason?: string };
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const SLEEP_SCOPES = ["device", "vendor_cloud"];
+/** The sources the Sleep screen sets side by side: the `sleep_duration` entry's non-live scopes in the contract. */
+let sleepScopes: string[] = [];
 const STAGE_ROWS = ["awake", "rem", "light", "deep"];
 const STAGE_WORD: Record<string, string> = { awake: "Awake", rem: "REM", light: "Light", deep: "Deep", unmeasurable: "Not measured" };
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -1239,7 +1256,7 @@ async function sleepMarks(month: string): Promise<Map<string, DailySleep>> {
   const [y, m] = month.split("-").map(Number);
   const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
   const last = `${month}-${String(days).padStart(2, "0")}`;
-  const pairs = SLEEP_SCOPES.flatMap((scope) => (["sleep_duration", "sleep_score"] as const).map((metric) => ({ metric, scope })));
+  const pairs = sleepScopes.flatMap((scope) => (["sleep_duration", "sleep_score"] as const).map((metric) => ({ metric, scope })));
   const reads = await Promise.all(pairs.map(({ metric, scope }) =>
     core.call<Metric>("data.metric", { metric, scope, days, last_day: last }).catch(() => null)));
   const marked = new Map<string, DailySleep>();
@@ -1390,6 +1407,12 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
     out.append(nothing);
     return;
   }
+  const read = await contractMetrics();
+  if (!Array.isArray(read)) {
+    out.append(el("p", "caption muted", contractFailureWords(read.failure)));
+    return;
+  }
+  sleepScopes = read.find((m) => m.metric === "sleep_duration")?.scopes.filter((sc) => sc !== "live") ?? [];
   const notANight = (): void => {
     out.append(bannerEl("Not a night", "A night is written as a date, like 2025-06-15. Pick one in the calendar."));
   };
@@ -1419,7 +1442,7 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
   if (head) head.textContent = date;
 
   const two = el("div", "two");
-  for (const scope of SLEEP_SCOPES) {
+  for (const scope of sleepScopes) {
     const s = night.sessions.find((x) => x.source_scope === scope);
     if (!s) {
       const box = el("div", "absent");
@@ -1478,10 +1501,10 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
   const table = el("section", "card");
   table.append(el("h2", "heading", "Stage minutes and overnight"));
   const grid = el("div", "grid3 body");
-  grid.append(el("span"), ...SLEEP_SCOPES.map((sc) => el("span", `caption scope-${sc}`, scopeWord(sc))));
+  grid.append(el("span"), ...sleepScopes.map((sc) => el("span", `caption scope-${sc}`, scopeWord(sc))));
   const line = (label: string, get: (s: SleepSession) => string | null): void => {
     grid.append(el("span", "", label));
-    for (const sc of SLEEP_SCOPES) {
+    for (const sc of sleepScopes) {
       const s = night.sessions.find((x) => x.source_scope === sc);
       const v = s ? get(s) : null;
       grid.append(el("span", v === null ? "muted" : "value-small", v ?? "not recorded"));
@@ -2538,6 +2561,9 @@ armSyncListeners();
 void core.onCoreEvent("exited", () => { if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core restarted; the offer is gone.", error: true }); banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
 void (async () => {
   await refreshKey();
+  // the product words come from the core (it answers on a locked store); no core, the constants stay
+  const info = await core.call<AppInfo>("app.info").catch(() => null);
+  if (info) { productWords.product = info.product; productWords.notice = info.notice; paintIdentity(); }
   if (locked() && (await core.unlockFromKeychain())) await refreshKey();
   await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);

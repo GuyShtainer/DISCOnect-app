@@ -515,6 +515,21 @@ fn contract_lists_the_numeric_metrics_with_their_declared_scopes_and_answers_loc
 }
 
 #[test]
+fn contract_lists_live_last_for_the_five_folded_metrics_and_for_no_other() {
+    let (_dir, db) = plain_store();
+    let reply = Rig::new(&db).send("data.contract", json!({}))["result"].clone();
+    let folded = ["heart_rate", "stress", "respiration_rate", "spo2", "energy_reserve"];
+    for row in reply["metrics"].as_array().expect("metrics") {
+        let scopes = row["scopes"].as_array().expect("scopes");
+        let name = row["metric"].as_str().expect("metric");
+        assert_eq!(scopes.iter().any(|s| s == "live"), folded.contains(&name), "{name}");
+        if folded.contains(&name) {
+            assert_eq!(scopes.last().expect("scope"), "live", "{name}");
+        }
+    }
+}
+
+#[test]
 fn sleep_needs_the_store_unlocked() {
     let (_dir, db) = encrypted_copy();
     assert_eq!(Rig::new(&db).code("data.sleep", json!({})), "locked");

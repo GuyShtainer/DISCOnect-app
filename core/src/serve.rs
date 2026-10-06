@@ -843,6 +843,7 @@ fn data_contract(_session: &mut Session, _call: &Call) -> Result<Value, Failure>
                     contract
                         .streams_for
                         .iter()
+                        .chain(contract.session_streams_for.iter())
                         .any(|entry| entry.metric == item.metric && &entry.source_scope == *scope)
                 })
                 .collect();
