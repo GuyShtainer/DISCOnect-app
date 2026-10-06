@@ -21,7 +21,15 @@ type LedgerRow = {
   not_covered: number; gaps: { from?: string; to?: string; status?: string; days?: number }[]; gaps_truncated: boolean;
 };
 type LiveBlock = { records: number; samples: number; first_day: string | null; last_day: string | null };
-type Health = { live?: LiveBlock; coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[] }; never_imported: boolean };
+type ImportRun = {
+  id: number; started_at: string | null; finished_at: string | null; transport: string; status: string;
+  files_seen: number; files_imported: number; files_duplicate: number; files_failed: number; records_written: number; error: string | null;
+};
+type Health = {
+  live?: LiveBlock; never_imported: boolean; recent_imports?: ImportRun[];
+  coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[]; unattributed_failures?: number; undatable_files?: number };
+};
+const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files" };
 
 const LIVE_FOLDED: { metric: string; unit: string | null }[] = [
   { metric: "heart_rate", unit: "bpm" }, { metric: "stress", unit: null }, { metric: "respiration_rate", unit: "breaths/min" },
@@ -175,7 +183,7 @@ async function route(): Promise<void> {
   const queue: (() => void)[] = [];
   const later: Later = (fn) => queue.push(fn);
   if (banner) {
-    out.append(el("div", "banner body", banner));
+    out.append(bannerEl("The core", banner));
     banner = null; // shown once
   }
   try {
@@ -192,7 +200,7 @@ async function route(): Promise<void> {
       location.hash = "#/key";
       return;
     }
-    out.append(el("div", "banner body error", core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e)));
+    out.append(core.isCoreError(e) ? bannerEl(e.code, e.message, true) : bannerEl("Error", String(e), true));
   }
   if (mine !== generation) return;
   out.append(el("footer", "notice", NOTICE));
@@ -537,6 +545,56 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
 // ---- Data health ------------------------------------------------------------------------
 let healthDays = 90;
 
+function bannerEl(lead: string, text: string, error = false): HTMLElement {
+  const b = el("section", error ? "banner body error" : "banner body");
+  b.append(el("span", "lead", lead), el("span", "", text));
+  return b;
+}
+
+function healthLiveCard(out: ParentNode, live: LiveBlock | undefined): void {
+  if (!live || !live.records) return;
+  const card = el("section", "card body");
+  card.setAttribute("aria-label", "Live link");
+  const row = el("div", "row");
+  row.append(el("h2", "heading", "Live link"));
+  const tag = el("span", "caption scope-live");
+  tag.append(el("span", "swatch live"), document.createTextNode(scopeWord("live")));
+  row.append(tag);
+  card.append(row);
+  const days = live.first_day && live.last_day ? (live.first_day === live.last_day ? live.first_day : `${live.first_day} → ${live.last_day}`) : "no day";
+  card.append(el("span", "value-small", `${live.records} session records · ${live.samples} minute samples · ${days}`));
+  card.append(el("span", "caption muted", "Session days count as present or not covered only; the link's minutes are kept apart from the device's own figures and never compared with them."));
+  out.append(card);
+}
+
+function healthFailedCard(out: ParentNode, health: Health): void {
+  const rows = health.coverage.ledger.filter((r) => r.failed > 0);
+  const failedDays = rows.reduce((n, r) => n + r.failed, 0);
+  const runs = (health.recent_imports ?? []).filter((r) => r.files_failed > 0 || r.status === "failed");
+  const unplaced = health.coverage.unattributed_failures ?? 0;
+  const undatable = health.coverage.undatable_files ?? 0;
+  if (!failedDays && !runs.length && !unplaced && !undatable) return;
+  const card = el("section", "card body");
+  card.setAttribute("aria-label", "Failed to decode");
+  card.append(el("h2", "heading", "Failed to decode"));
+  if (failedDays) card.append(el("span", "value-small", `${failedDays} failed day${failedDays === 1 ? "" : "s"} across ${rows.length} metric row${rows.length === 1 ? "" : "s"} in this window`));
+  for (const run of runs) {
+    const when = run.started_at ? run.started_at.slice(0, 16).replace("T", " ") : "unknown time";
+    const line = el("span", "caption");
+    line.append(document.createTextNode(`${when} · ${TRANSPORT_WORD[run.transport] ?? run.transport} · ${run.files_failed} of ${run.files_seen} file${run.files_seen === 1 ? "" : "s"} failed`));
+    if (run.error) line.append(el("span", "muted", ` · ${run.error}`));
+    card.append(line);
+  }
+  if (unplaced || undatable) {
+    const parts: string[] = [];
+    if (unplaced) parts.push(`${unplaced} failure${unplaced === 1 ? "" : "s"} not placeable on a day`);
+    if (undatable) parts.push(`${undatable} retained file${undatable === 1 ? "" : "s"} without a date span`);
+    card.append(el("span", "caption muted", parts.join(" · ")));
+  }
+  card.append(el("span", "caption muted", "The core keeps counts and masked error text, never file names. A failed day is striped and taller in the bars below."));
+  out.append(card);
+}
+
 async function screenHealth(out: ParentNode): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: healthDays });
   const cov = health.coverage;
@@ -558,9 +616,11 @@ async function screenHealth(out: ParentNode): Promise<void> {
   }
   out.append(legend);
   if (health.never_imported) {
-    out.append(el("div", "banner body", "Nothing imported yet. Import with the command line for now: disconect import <export zip | watch folder>."));
+    out.append(bannerEl("Nothing imported yet", "Import with the command line for now: disconect import <export zip | watch folder>."));
     return;
   }
+  healthLiveCard(out, health.live);
+  healthFailedCard(out, health);
   const card = el("div", "card ledger");
   const rows = [...cov.ledger].sort((a, b) => (b.present - a.present) || a.metric.localeCompare(b.metric));
   for (const r of rows) {
@@ -587,10 +647,12 @@ async function screenHealth(out: ParentNode): Promise<void> {
       bar.append(seg);
     }
     block.append(bar);
-    if (r.gaps.length) {
-      const g = r.gaps.map((x) => (x.from && x.to ? (x.from === x.to ? x.from : `${x.from} → ${x.to}`) : JSON.stringify(x))).join(", ");
-      block.append(el("span", "caption muted", `gaps: ${g}${r.gaps_truncated ? " (newest shown)" : ""}`));
-    }
+    const span = (x: LedgerRow["gaps"][number]) => (x.from && x.to ? (x.from === x.to ? x.from : `${x.from} → ${x.to}`) : JSON.stringify(x));
+    const failedGaps = r.gaps.filter((x) => x.status === "failed");
+    const otherGaps = r.gaps.filter((x) => x.status !== "failed");
+    if (otherGaps.length) block.append(el("div", "caption muted", `gaps: ${otherGaps.map(span).join(", ")}${r.gaps_truncated ? " (newest shown)" : ""}`));
+    if (failedGaps.length) block.append(el("div", "caption status-failed", `failed: ${failedGaps.map(span).join(", ")}`));
+    if (r.source_scope === "live") block.append(el("div", "caption muted", "session days only"));
     card.append(block);
   }
   card.append(el("span", "caption muted", `Counts are days out of ${cov.window.days}, in status order, not time order. "present" can still be a partial day. A sparse metric is recorded only on some days, so its empty days are normal.`));

@@ -52,6 +52,8 @@ label.switch input { width: 24px; height: 24px; margin: 0; }
 .banner { border: 1px solid var(--axis); border-radius: var(--radius-md); padding: var(--space-3) var(--space-4); display: flex; flex-direction: column; gap: var(--space-1); }
 .banner .lead { font-weight: 700; }
 .banner.error { border-color: var(--status-failed); }
+.banner.error .lead { color: var(--status-failed); }
+.status-failed { color: var(--status-failed); }
 
 .ledger { display: flex; flex-direction: column; gap: var(--space-3); }
 .ledger .bar { display: flex; gap: 1px; height: 10px; align-items: center; }
