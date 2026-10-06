@@ -5,6 +5,10 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(() => ({
+  // The page reads its --debug-* flags only when import.meta.env.DEV is true. `tauri build --debug` runs a
+  // production-mode vite build, so say DEV is true there too (the tauri CLI sets TAURI_ENV_DEBUG); a release build keeps it false
+  // and the flag code is dropped from the bundle.
+  define: process.env.TAURI_ENV_DEBUG === "true" ? { "import.meta.env.DEV": "true" } : {},
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

@@ -4,7 +4,7 @@
 import * as core from "./core";
 import qrcode from "qrcode-generator";
 import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord } from "./identity";
-import { disposeCharts, drawTrend, hatchedDays, type Series } from "./charts";
+import { disposeCharts, drawTrend, hatchedDays, showTipOn, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
 type AppInfo = { product: string; core: string; db: string; encrypted: boolean };
@@ -398,7 +398,7 @@ async function screenToday(out: ParentNode): Promise<void> {
   if (cloud.length) {
     const drawer = el("details", "drawer");
     const latest = cloud.reduce<string | null>((m, r) => (r.day && (!m || r.day > m) ? r.day : m), null);
-    drawer.append(el("summary", "", `${scopeWord("vendor_cloud")} · ${cloud.length} figure${cloud.length === 1 ? "" : "s"}${latest ? ` · latest ${latest}` : ""}`));
+    drawer.append(el("summary", "", `${scopeWord("vendor_cloud")} · ${cloud.length} figure${cloud.length === 1 ? "" : "s"}${latest ? ` · the export ends ${latest}` : ""}`));
     const grid = el("div", "cards");
     for (const row of cloud) grid.append(todayCard(row, today.day));
     drawer.append(grid);
@@ -654,6 +654,7 @@ let pairNoDevice = false;
 let pairPushing = false;
 let pairDigitsTried = false;
 let debugListen: { ip: string; port: number } | null = null; // --debug-listen ip:port (evidence runs): preselects that address and uses its port
+let debugTipDay: string | null = null; // --debug-tip YYYY-MM-DD (evidence runs): the Trends tip shown on that day
 let debugPairDigits = false; // --debug-pair-digits (evidence runs, debug builds)
 let pairTimer: ReturnType<typeof setTimeout> | null = null;
 let syncListenersArmed = false;
@@ -1193,7 +1194,10 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   card.append(el("span", "caption muted", (!drawn.length
     ? "Only live-link sessions have values for this metric in the window."
     : bandWords + (lacks ? ` ${lacks}` : "")) + liveNote + ends));
-  later(() => drawTrend(chart, series, trendLabel(trendMetric)));
+  later(() => {
+    drawTrend(chart, series, trendLabel(trendMetric));
+    if (debugTipDay) { const day = debugTipDay; debugTipDay = null; setTimeout(() => showTipOn(day), 800); }
+  });
 }
 
 // ---- Sleep (Bet 7b-4) -------------------------------------------------------------------
@@ -1804,6 +1808,28 @@ function healthFailedCard(out: ParentNode, health: Health): void {
   out.append(card);
 }
 
+/** Whole days from a to b (both YYYY-MM-DD), by UTC midnights so a clock change never skews the count. */
+function dayDiff(a: string, b: string): number {
+  return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000);
+}
+
+/** A ledger row's bar in time order: [status, days] segments from the window's first day to its last, the gap runs
+ * as the core names them and `present` between them. Null when the core kept only the newest gaps (the older ones
+ * are unknown) or the days do not add up to the window; the bar then runs in status order. */
+function timeOrderSegments(r: LedgerRow, window: { from: string; to: string; days: number }): [string, number][] | null {
+  if (r.gaps_truncated) return null;
+  const segs: [string, number][] = [];
+  let cursor = window.from;
+  for (const g of r.gaps) {
+    if (!g.from || !g.to || !g.status || g.from < cursor) return null;
+    if (g.from > cursor) segs.push(["present", dayDiff(cursor, g.from)]);
+    segs.push([g.status, dayDiff(g.from, g.to) + 1]);
+    cursor = new Date(Date.parse(`${g.to}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+  }
+  if (cursor <= window.to) segs.push(["present", dayDiff(cursor, window.to) + 1]);
+  return segs.reduce((n, [, d]) => n + d, 0) === window.days ? segs : null;
+}
+
 async function screenHealth(out: ParentNode): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: healthDays });
   const cov = health.coverage;
@@ -1834,6 +1860,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
   healthFailedCard(out, health);
   const card = el("div", "card ledger");
   const rows = [...cov.ledger].sort((a, b) => (b.present - a.present) || a.metric.localeCompare(b.metric));
+  const ordered: boolean[] = []; // per row: true when its bar runs in time order
   for (const r of rows) {
     const block = el("div");
     const top = el("div", "row body");
@@ -1849,8 +1876,9 @@ async function screenHealth(out: ParentNode): Promise<void> {
     top.append(el("span", "value-small", words.join(" · ")));
     block.append(top);
     const bar = el("div", "bar");
-    for (const k of ["present", "failed", "source_empty", "not_covered"] as const) {
-      const n = r[k] as number;
+    const segs = timeOrderSegments(r, cov.window);
+    ordered.push(segs !== null);
+    for (const [k, n] of segs ?? (["present", "failed", "source_empty", "not_covered"] as const).map((k) => [k, r[k] as number] as const)) {
       if (!n) continue;
       const seg = el("span", `seg ${k}`);
       seg.style.flexGrow = String(n);
@@ -1861,12 +1889,16 @@ async function screenHealth(out: ParentNode): Promise<void> {
     const span = (x: LedgerRow["gaps"][number]) => (x.from && x.to ? (x.from === x.to ? x.from : `${x.from} → ${x.to}`) : JSON.stringify(x));
     const failedGaps = r.gaps.filter((x) => x.status === "failed");
     const otherGaps = r.gaps.filter((x) => x.status !== "failed");
-    if (otherGaps.length) block.append(el("div", "caption muted", `gaps: ${otherGaps.map(span).join(", ")}${r.gaps_truncated ? " (newest shown)" : ""}`));
+    if (otherGaps.length) block.append(el("div", "caption muted", `gaps: ${otherGaps.map(span).join(", ")}${r.gaps_truncated ? " (newest gaps shown)" : ""}`));
+    if (r.gaps_truncated && !otherGaps.length) block.append(el("div", "caption muted", "newest gaps shown"));
     if (failedGaps.length) block.append(el("div", "caption status-failed", `failed: ${failedGaps.map(span).join(", ")}`));
     if (r.source_scope === "live") block.append(el("div", "caption muted", "session days only"));
     card.append(block);
   }
-  card.append(el("span", "caption muted", `Counts are days out of ${cov.window.days}, in status order, not time order. "present" can still be a partial day. A sparse metric is recorded only on some days, so its empty days are normal.`));
+  const order = ordered.every((o) => o) ? "Bars run in time order."
+    : ordered.some((o) => o) ? "Bars run in time order except the rows marked 'newest gaps shown', which run in status order."
+      : "Bars run in status order, not time order.";
+  card.append(el("span", "caption muted", `Counts are days out of ${cov.window.days}. ${order} "present" can still be a partial day. A sparse metric is recorded only on some days, so its empty days are normal.`));
   out.append(card);
 }
 
@@ -2503,7 +2535,7 @@ void (async () => {
   await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);
   // evidence runs, debug builds only (Rust drops --debug-* argv in release): unlock from the passphrase file
-  if (args.includes("--debug-unlock") && locked()) {
+  if (import.meta.env.DEV && args.includes("--debug-unlock") && locked()) {
     await core.debugUnlockFromFile().then(() => undefined, () => undefined);
     await refreshKey();
   }
@@ -2519,25 +2551,31 @@ void (async () => {
   if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
   if (t >= 0 && args[t + 1]) trendArg = args[t + 1];
-  const dl = args.indexOf("--debug-listen");
-  const m = dl >= 0 ? /^(.+):(\d{1,5})$/.exec(args[dl + 1] ?? "") : null;
-  if (m) debugListen = { ip: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) };
-  dropOverDebug = args.includes("--debug-drop-over"); // debug builds only: Rust adds it from DISCONECT_DEBUG_DROP_OVER
-  debugPairDigits = args.includes("--debug-pair-digits"); // debug builds only: the Rust command is compiled out of release
+  if (import.meta.env.DEV) { // every --debug-* flag is read in dev builds only (the Rust side drops them from release argv too)
+    const dl = args.indexOf("--debug-listen");
+    const m = dl >= 0 ? /^(.+):(\d{1,5})$/.exec(args[dl + 1] ?? "") : null;
+    if (m) debugListen = { ip: m[1].replace(/^\[|\]$/g, ""), port: Number(m[2]) };
+    dropOverDebug = args.includes("--debug-drop-over"); // Rust adds it from DISCONECT_DEBUG_DROP_OVER
+    debugPairDigits = args.includes("--debug-pair-digits"); // the Rust command is compiled out of release
+    const tp = args.indexOf("--debug-tip"); // the Trends tip shown on one day
+    if (tp >= 0 && /^\d{4}-\d{2}-\d{2}$/.test(args[tp + 1] ?? "")) debugTipDay = args[tp + 1];
+  }
   const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
   if (target && current() !== target) {
     location.hash = `#/${target}`; // hashchange runs route()
   } else {
     await route();
   }
-  // evidence runs, debug builds only (Rust drops --debug-* argv in release): the drawer drawn open
-  if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
-  // evidence runs, debug builds only: a real click on the Sync screen's own "Sync now" button (the network call
-  // still comes from a click, never from the page's own code path)
-  if (args.includes("--debug-sync-run")) {
-    setTimeout(() => {
-      const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now");
-      button?.click();
-    }, 800);
+  if (import.meta.env.DEV) {
+    // evidence runs: the drawer drawn open
+    if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
+    // evidence runs: a real click on the Sync screen's own "Sync now" button (the network call
+    // still comes from a click, never from the page's own code path)
+    if (args.includes("--debug-sync-run")) {
+      setTimeout(() => {
+        const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now");
+        button?.click();
+      }, 800);
+    }
   }
 })();

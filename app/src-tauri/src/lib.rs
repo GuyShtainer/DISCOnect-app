@@ -129,6 +129,7 @@ mod release_args_tests {
         assert_eq!(release_args(v(&["--screen", "today", "--debug-drawer-open", "--theme", "dark"])), v(&["--screen", "today", "--theme", "dark"]));
         assert_eq!(release_args(v(&["--debug-listen", "127.0.0.1:9", "--debug-drop-over"])), v(&[]));
         assert_eq!(release_args(v(&["--screen", "sync", "--debug-sync-run", "--theme", "dark"])), v(&["--screen", "sync", "--theme", "dark"]));
+        assert_eq!(release_args(v(&["--screen", "trend", "--debug-tip", "2025-06-20", "--trend", "steps"])), v(&["--screen", "trend", "--trend", "steps"]));
     }
 }
 
