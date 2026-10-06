@@ -519,7 +519,11 @@ fn contract_lists_live_last_for_the_five_folded_metrics_and_for_no_other() {
     let (_dir, db) = plain_store();
     let reply = Rig::new(&db).send("data.contract", json!({}))["result"].clone();
     let folded = ["heart_rate", "stress", "respiration_rate", "spo2", "energy_reserve"];
-    for row in reply["metrics"].as_array().expect("metrics") {
+    let rows = reply["metrics"].as_array().expect("metrics");
+    for want in folded {
+        assert!(rows.iter().any(|r| r["metric"] == want), "{want} is missing from the contract");
+    }
+    for row in rows {
         let scopes = row["scopes"].as_array().expect("scopes");
         let name = row["metric"].as_str().expect("metric");
         assert_eq!(scopes.iter().any(|s| s == "live"), folded.contains(&name), "{name}");

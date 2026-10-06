@@ -40,7 +40,8 @@ type ContractMetric = { metric: string; unit: string | null; cadence: "daily" | 
 let contractList: ContractMetric[] | null = null;
 /** The product words on screen: the TS constants until `app.info` answers, then the core's. */
 const productWords = { product: PRODUCT, notice: NOTICE };
-/** The contract read both Trends and Sleep use: the list, or the failure that stopped it. A failed read is asked again. */
+/** The contract read both Trends and Sleep use: the list, or the failure that stopped it. A failed read is asked again;
+ *  an empty answer is kept for the session (the core's answer is fixed per build and reads no store). */
 async function contractMetrics(): Promise<ContractMetric[] | { failure: { code?: string } | null }> {
   if (contractList === null) {
     let failure: { code?: string } | null = null;
@@ -184,6 +185,8 @@ function paintIdentity(): void {
   if (brand) brand.textContent = productWords.product;
   const notice = nav.querySelector("footer.notice");
   if (notice) notice.textContent = productWords.notice;
+  const inMain = main.querySelector("footer.notice");
+  if (inMain) inMain.textContent = productWords.notice;
 }
 
 function renderNav(): void {
@@ -1205,11 +1208,14 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
   const liveNote = series.some((s) => s.scope === "live") ? ` Diamonds: days with a live-link session, the mean of the minutes the link recorded; a session claims no day, so it draws no band.` : "";
   const bandWords = hatched.size
-    ? `Hatched bands: ${plural(hatched.size)} no import covered any source. Nothing is drawn there; a line never bridges a gap.`
+    ? `Hatched bands: ${plural(hatched.size)} no import covered any source. No line is drawn there; a line never bridges a gap.`
     : "Every day in the window was covered by an import of at least one source.";
-  card.append(el("span", "caption muted", (!drawn.length
-    ? "Only live-link sessions have values for this metric in the window."
-    : bandWords + (lacks ? ` ${lacks}` : "")) + liveNote + ends));
+  const valued = drawn.filter((x) => x.days.some((d) => d.value !== null));
+  // no drawn line has a value: the live link alone holds this window, so the band sentence does not apply
+  const lead = !valued.length
+    ? `Only live-link sessions have values for this metric in the window.${lacks ? ` ${lacks}` : ""}`
+    : bandWords + (lacks ? ` ${lacks}` : "");
+  card.append(el("span", "caption muted", lead + liveNote + ends));
   later(() => {
     drawTrend(chart, series, trendLabel(trendMetric));
     if (debugTipDay) { const day = debugTipDay; debugTipDay = null; setTimeout(() => showTipOn(day), 800); }
@@ -1410,6 +1416,10 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
   const read = await contractMetrics();
   if (!Array.isArray(read)) {
     out.append(el("p", "caption muted", contractFailureWords(read.failure)));
+    return;
+  }
+  if (!read.some((m) => m.metric === "sleep_duration")) {
+    out.append(el("p", "caption muted", "The core answered with no metrics."));
     return;
   }
   sleepScopes = read.find((m) => m.metric === "sleep_duration")?.scopes.filter((sc) => sc !== "live") ?? [];
@@ -2563,7 +2573,11 @@ void (async () => {
   await refreshKey();
   // the product words come from the core (it answers on a locked store); no core, the constants stay
   const info = await core.call<AppInfo>("app.info").catch(() => null);
-  if (info) { productWords.product = info.product; productWords.notice = info.notice; paintIdentity(); }
+  if (info && typeof info.product === "string" && info.product.trim() && typeof info.notice === "string" && info.notice.trim()) {
+    productWords.product = info.product;
+    productWords.notice = info.notice;
+    paintIdentity();
+  }
   if (locked() && (await core.unlockFromKeychain())) await refreshKey();
   await core.supportSites().then(() => undefined, () => { supportShown = false; });
   const args = await core.launchArgs().catch(() => [] as string[]);
