@@ -200,7 +200,7 @@ const HUE_RULES: [string, RegExp][] = [
   ["stress", /stress/],
   ["breath", /respiration|spo2|pulse_ox/],
   ["activity", /step|distance|floor|calor|metabolic|active|intensity/],
-  ["body", /weight|hydration|sweat/],
+  ["body", /weight|hydration|sweat|skin_temp/],
 ];
 export function metricHue(id: string): string | null {
   for (const [group, re] of HUE_RULES) if (re.test(id)) return group;

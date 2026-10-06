@@ -26,14 +26,15 @@
   --focus: #c2641c;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #d2651c;
-  --hue-heart: #d6456a;
-  --hue-energy: #a8780a;
-  --hue-stress: #8a5fcf;
-  --hue-breath: #1f8c93;
-  --hue-sleep: #4b63d6;
-  --hue-fitness: #2e8b57;
-  --hue-body: #c0459c;
+  --hue-activity: #9a7400;
+  --hue-heart: #c8323f;
+  --hue-energy: #6b7d00;
+  --hue-stress: #b8338f;
+  --hue-breath: #1a7f8a;
+  --hue-sleep: #5a4fd6;
+  --hue-fitness: #4f5f82;
+  --hue-body: #8b6a4a;
+  color-scheme: light;
 }
 [data-theme="dark"], [data-theme="pastel-dark"] {
   --surface: #1b1826;
@@ -62,14 +63,15 @@
   --focus: #ffb783;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #ffb48a;
-  --hue-heart: #ff9db0;
-  --hue-energy: #ffd97a;
-  --hue-stress: #cdb0ff;
-  --hue-breath: #7fdbe0;
-  --hue-sleep: #a0b4ff;
-  --hue-fitness: #8fe3b0;
-  --hue-body: #f0a0dc;
+  --hue-activity: #ffd36a;
+  --hue-heart: #ff8f9a;
+  --hue-energy: #d8ea6e;
+  --hue-stress: #ff9ad8;
+  --hue-breath: #7fdfe8;
+  --hue-sleep: #b9b3ff;
+  --hue-fitness: #aab7cf;
+  --hue-body: #e8c3a0;
+  color-scheme: dark;
 }
 @media (prefers-color-scheme: dark) {
 :root:not([data-theme]), :root[data-theme="pastel"] {
@@ -99,14 +101,15 @@
   --focus: #ffb783;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #ffb48a;
-  --hue-heart: #ff9db0;
-  --hue-energy: #ffd97a;
-  --hue-stress: #cdb0ff;
-  --hue-breath: #7fdbe0;
-  --hue-sleep: #a0b4ff;
-  --hue-fitness: #8fe3b0;
-  --hue-body: #f0a0dc;
+  --hue-activity: #ffd36a;
+  --hue-heart: #ff8f9a;
+  --hue-energy: #d8ea6e;
+  --hue-stress: #ff9ad8;
+  --hue-breath: #7fdfe8;
+  --hue-sleep: #b9b3ff;
+  --hue-fitness: #aab7cf;
+  --hue-body: #e8c3a0;
+  color-scheme: dark;
 }
 }
 :root[data-theme="classic"], :root[data-theme="classic-light"] {
@@ -136,14 +139,15 @@
   --focus: #c96a16;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #d2651c;
-  --hue-heart: #d6456a;
-  --hue-energy: #a8780a;
-  --hue-stress: #8a5fcf;
-  --hue-breath: #1f8c93;
-  --hue-sleep: #4b63d6;
-  --hue-fitness: #2e8b57;
-  --hue-body: #c0459c;
+  --hue-activity: #9a7400;
+  --hue-heart: #c8323f;
+  --hue-energy: #6b7d00;
+  --hue-stress: #b8338f;
+  --hue-breath: #1a7f8a;
+  --hue-sleep: #5a4fd6;
+  --hue-fitness: #4f5f82;
+  --hue-body: #8b6a4a;
+  color-scheme: light;
 }
 :root[data-theme="classic-dark"] {
   --surface: #15171b;
@@ -172,14 +176,15 @@
   --focus: #f0a24e;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #ffb48a;
-  --hue-heart: #ff9db0;
-  --hue-energy: #ffd97a;
-  --hue-stress: #cdb0ff;
-  --hue-breath: #7fdbe0;
-  --hue-sleep: #a0b4ff;
-  --hue-fitness: #8fe3b0;
-  --hue-body: #f0a0dc;
+  --hue-activity: #ffd36a;
+  --hue-heart: #ff8f9a;
+  --hue-energy: #d8ea6e;
+  --hue-stress: #ff9ad8;
+  --hue-breath: #7fdfe8;
+  --hue-sleep: #b9b3ff;
+  --hue-fitness: #aab7cf;
+  --hue-body: #e8c3a0;
+  color-scheme: dark;
 }
 @media (prefers-color-scheme: dark) {
 :root[data-theme="classic"] {
@@ -209,14 +214,15 @@
   --focus: #f0a24e;
   --qr-ground: #ffffff;
   --qr-ink: #000000;
-  --hue-activity: #ffb48a;
-  --hue-heart: #ff9db0;
-  --hue-energy: #ffd97a;
-  --hue-stress: #cdb0ff;
-  --hue-breath: #7fdbe0;
-  --hue-sleep: #a0b4ff;
-  --hue-fitness: #8fe3b0;
-  --hue-body: #f0a0dc;
+  --hue-activity: #ffd36a;
+  --hue-heart: #ff8f9a;
+  --hue-energy: #d8ea6e;
+  --hue-stress: #ff9ad8;
+  --hue-breath: #7fdfe8;
+  --hue-sleep: #b9b3ff;
+  --hue-fitness: #aab7cf;
+  --hue-body: #e8c3a0;
+  color-scheme: dark;
 }
 }
 :root {

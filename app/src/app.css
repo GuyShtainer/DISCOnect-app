@@ -135,6 +135,7 @@ label.choice input { width: 20px; height: 20px; margin: 0; }
 .hue-activity { --hue: var(--hue-activity); } .hue-heart { --hue: var(--hue-heart); } .hue-energy { --hue: var(--hue-energy); } .hue-stress { --hue: var(--hue-stress); }
 .hue-breath { --hue: var(--hue-breath); } .hue-sleep { --hue: var(--hue-sleep); } .hue-fitness { --hue: var(--hue-fitness); } .hue-body { --hue: var(--hue-body); }
 .vcard { border-left: 4px solid var(--hue, var(--hairline)); }
+.picker { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; }
 .huedot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--hue, var(--ink-muted)); flex: none; margin-right: var(--space-2); vertical-align: middle; }
 .notlist { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-1) var(--space-6); }
 .notlist > span { display: flex; justify-content: space-between; gap: var(--space-2); min-height: 28px; align-items: center; border-bottom: 1px solid var(--hairline); font-size: 14px; line-height: 20px; }

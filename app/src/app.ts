@@ -1177,7 +1177,9 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   }
   range.onchange = () => { trendDays = Number(range.value); void route(); };
   header(out, trendLabel(trendMetric), "");
-  controls.append(hueDot(trendMetric), select, range);
+  const picker = el("span", "picker"); // the dot and the metric picker are one unit, so the row's space-between never parts them
+  picker.append(hueDot(trendMetric), select);
+  controls.append(picker, range);
   out.append(controls);
 
   // The window ends on the latest day any metric has data, so an archive still draws.
