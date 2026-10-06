@@ -492,9 +492,15 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
             panic!("{} has a function taking a path as a string, a webview-shaped door: {line}", path.display());
         }
     }
-    // both debug env names appear only in lib.rs, each inside an item that starts at a `#[cfg(debug_assertions)]`
+    // every debug env name appears only in lib.rs, each inside an item that starts at a `#[cfg(debug_assertions)]`
     // line (the item is the text from that attribute to the next top-level closing brace)
-    for name in ["DISCONECT_DEBUG_IMPORT_PATH", "DISCONECT_DEBUG_DROP_OVER"] {
+    for name in [
+        "DISCONECT_DEBUG_IMPORT_PATH",
+        "DISCONECT_DEBUG_DROP_OVER",
+        "DISCONECT_DEBUG_CACHE_KEY",
+        "DISCONECT_DEBUG_SYNC_ON_START",
+        "DISCONECT_DEBUG_KEYCHAIN_PROOF",
+    ] {
         for path in files_under(&src, "rs") {
             let code = text(&path);
             let code = non_test_code(&code);
@@ -510,6 +516,21 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
             }
         }
     }
+}
+
+// ---- one web client on the phone (12-D item 5) -----------------------------------------------------------
+
+#[test]
+fn an_ios_release_cannot_compile_with_tauris_dev_server_proxy() {
+    // `dev` is false only with `tauri/custom-protocol` (the tauri CLI sets it for a release); without it tauri's
+    // dev-server proxy (`reqwest`/`hyper`, a second web client) would ship in the phone's release build.
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let lines: Vec<&str> = lib.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| *l == "#[cfg(all(dev, target_os = \"ios\", not(debug_assertions)))]")
+        .expect("lib.rs has the pin's #[cfg(all(dev, target_os = \"ios\", not(debug_assertions)))] line");
+    assert!(lines[at + 1].starts_with("compile_error!("), "the pin's cfg line is followed directly by compile_error!: {}", lines[at + 1]);
 }
 
 // ---- the page's door to the core, and what the page hears about a drag (7b-3 review) -----------------

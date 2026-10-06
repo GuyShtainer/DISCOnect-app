@@ -5,10 +5,17 @@
 //! the Rust port as a sidecar child (macOS release), in this process ([`inproc`]; debug builds and
 //! phones), or the Python one via `--core hearthbeat`.
 
+// 12-D item 5: `dev` (tauri-build's alias) is false only with `tauri/custom-protocol`, which the tauri CLI sets for a
+// release. Without it, tauri's dev-server proxy (an HTTP client, the phone's second web client) would ship.
+#[cfg(all(dev, target_os = "ios", not(debug_assertions)))]
+compile_error!("an iOS release must be built with tauri/custom-protocol (the tauri CLI does this); without it tauri's dev-server proxy, the phone's second web client, would ship");
+
 #[allow(dead_code)] // slices 5-8 fill it
 pub mod coach;
 pub mod import_drop;
 pub mod inproc;
+#[cfg(target_os = "ios")]
+mod ios;
 pub mod live;
 pub mod sidecar;
 
@@ -214,13 +221,17 @@ fn inproc_db(_app: &tauri::AppHandle, core_note: &mut Vec<String>) -> Result<std
     Ok(default.path)
 }
 
+/// The phone's store file inside `app_data_dir()` (shared with the iOS start-up hook, which names the same file).
+#[cfg(not(desktop))]
+pub(crate) const PHONE_DB_FILE: &str = "disconect.db";
+
 #[cfg(not(desktop))]
 fn inproc_db(app: &tauri::AppHandle, _core_note: &mut Vec<String>) -> Result<std::path::PathBuf, CoreError> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| CoreError { code: "core_unavailable".into(), message: format!("no app data folder: {e}") })?;
-    Ok(dir.join("disconect.db"))
+    Ok(dir.join(PHONE_DB_FILE))
 }
 
 fn start_inproc(app: &tauri::AppHandle) -> Result<Sidecar, CoreError> {
@@ -281,6 +292,80 @@ fn debug_import_door(app: &tauri::AppHandle) {
             import_drop::handle_drop(&app, vec![std::path::PathBuf::from(path)]);
         });
     }
+}
+
+/// Whether the debug switch `name` is set to `1`.
+#[cfg(debug_assertions)]
+fn debug_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+/// Evidence door, debug builds only: with `DISCONECT_DEBUG_CACHE_KEY=1`, turn the keychain cache on right after the
+/// debug unlock (`key.cache` with `enable`; no key is passed or logged). The note holds the answer's state word only.
+#[cfg(debug_assertions)]
+fn debug_cache_key_door(core: &Sidecar) {
+    if !debug_flag("DISCONECT_DEBUG_CACHE_KEY") {
+        return;
+    }
+    let note = match tauri::async_runtime::block_on(core.call("key.cache", serde_json::json!({ "enable": true }))) {
+        Ok(v) => format!("debug door: key.cache enabled, keychain {}", v.get("keychain").and_then(Value::as_str).unwrap_or("?")),
+        Err(e) => format!("debug door: key.cache failed ({})", e.code),
+    };
+    core.note(note);
+}
+
+/// Evidence door, debug builds only: with `DISCONECT_DEBUG_SYNC_ON_START=1`, run `sync.run` once a moment after start
+/// (the page's own call, no parameters). The note holds counts and the status word, never a data value.
+#[cfg(debug_assertions)]
+fn debug_sync_on_start_door(core: &Sidecar) {
+    if !debug_flag("DISCONECT_DEBUG_SYNC_ON_START") {
+        return;
+    }
+    let core = core.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let note = match tauri::async_runtime::block_on(core.call("sync.run", serde_json::json!({}))) {
+            Ok(v) => {
+                let n = |part: &str, field: &str| v.get(part).and_then(|p| p.get(field)).and_then(Value::as_u64).unwrap_or(0);
+                format!(
+                    "debug door: sync.run push {} bundles {} records, pull {} applied {} new records, status {}",
+                    n("push", "bundles"),
+                    n("push", "records"),
+                    n("pull", "applied"),
+                    n("pull", "records_new"),
+                    v.get("pull").and_then(|p| p.get("status")).and_then(Value::as_str).unwrap_or("?")
+                )
+            }
+            Err(e) => format!("debug door: sync.run failed ({})", e.code),
+        };
+        core.note(note);
+    });
+}
+
+/// Evidence door, debug builds on iOS only: with `DISCONECT_DEBUG_KEYCHAIN_PROOF=1`, write `keychain-proof.json` to the
+/// container's `tmp/`: the number of items under each service and, for the key file's key id, the item's class
+/// (`pdmn`) and synchronizable flag. Never the account, never the value.
+#[cfg(debug_assertions)]
+#[cfg(target_os = "ios")]
+fn debug_keychain_proof_door(app: &tauri::AppHandle) {
+    use disconect_core::keychain_leftovers::{Keychain, RealKeychain, SERVICES};
+    if !debug_flag("DISCONECT_DEBUG_KEYCHAIN_PROOF") {
+        return;
+    }
+    let mut items = serde_json::Map::new();
+    for service in SERVICES {
+        let count = RealKeychain.accounts(service).map_or(Value::Null, |a| Value::from(a.len()));
+        items.insert(service.to_string(), count);
+    }
+    let key_item = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .and_then(|dir| disconect_core::keys::read_key_file(&disconect_core::keys::key_path_for(&dir.join(PHONE_DB_FILE))).ok())
+        .and_then(|file| disconect_core::keychain::item_class(&file.key_id).ok().flatten())
+        .map_or(Value::Null, |(pdmn, synchronizable)| serde_json::json!({ "pdmn": pdmn, "synchronizable": synchronizable }));
+    let proof = serde_json::json!({ "items": items, "key_item": key_item });
+    let _ = std::fs::write(std::env::temp_dir().join("keychain-proof.json"), proof.to_string());
 }
 
 /// Tell the page whether something is hovering. The payload is only the flag, never a path.
@@ -347,12 +432,27 @@ fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
 pub fn run() {
     let builder = tauri::Builder::default()
         .setup(|app| {
+            // iOS only: leftover keychain items, backup flags and the key file's protection class, before the
+            // store opens and before the page asks `key.unlock`. Its notes reach the core's diagnostics below.
+            #[cfg(target_os = "ios")]
+            let ios_notes = ios::prepare(app.handle());
             let core = start_core(app.handle());
+            #[cfg(target_os = "ios")]
+            if let Ok(core) = &core {
+                for line in ios_notes {
+                    core.note(line);
+                }
+            }
             // Evidence runs (debug builds, scratch stores): unlock before the window asks, so a
             // screenshot shows the unlocked screens; nothing is typed into the webview.
             #[cfg(debug_assertions)]
             if let (Ok(core), Ok(pass)) = (&core, debug_passphrase()) {
                 let _ = tauri::async_runtime::block_on(core.unlock(pass));
+            }
+            #[cfg(debug_assertions)]
+            if let Ok(core) = &core {
+                debug_cache_key_door(core);
+                debug_sync_on_start_door(core);
             }
             app.manage(Core(core));
             app.manage(coach::key::KeyHolder::default());
@@ -360,6 +460,8 @@ pub fn run() {
             app.manage(live::LiveState::default());
             build_main_window(app)?;
             debug_import_door(app.handle());
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            debug_keychain_proof_door(app.handle());
             Ok(())
         });
     // Bet 17: `support_sites`/`support_open` exist only on macOS (`coach/commands.rs`'s own `#[cfg]`), so the

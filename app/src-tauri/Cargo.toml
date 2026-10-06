@@ -34,6 +34,12 @@ ureq = { version = "3", default-features = false, features = ["rustls", "platfor
 # Already in the tree through tauri and ureq; the coach's endpoint rules parse with it.
 url = "2"
 
+# The iOS start-up hook (`src/ios.rs`): the backup flag and the file protection class. Already in the iOS graph
+# through tauri/wry (same locked version, so no new package); only the classes the hook names are enabled here.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSError", "NSFileManager"] }
+objc2 = "0.6.4"
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
