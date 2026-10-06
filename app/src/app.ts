@@ -590,11 +590,69 @@ let pairDigitsTried = false;
 let debugListen: { ip: string; port: number } | null = null; // --debug-listen ip:port (evidence runs): preselects that address and uses its port
 let debugPairDigits = false; // --debug-pair-digits (evidence runs, debug builds)
 let pairTimer: ReturnType<typeof setTimeout> | null = null;
-let syncUnlisten: (() => void)[] = [];
+let syncListenersArmed = false;
 
-function dropSyncListeners(): void {
-  for (const fn of syncUnlisten) fn();
-  syncUnlisten = [];
+/** Redraw only while the Sync screen (or its pairing view) is on; any other screen picks the state up on return. */
+function syncRedraw(): void {
+  if (current().split("/")[0] === "sync") void route();
+}
+function syncFail(e: unknown): void {
+  syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+  syncRedraw();
+}
+// The core's pair / relay / progress events mutate module state here; the listeners are armed once at boot (review
+// 7b-2 S3: per-render listeners lost the events that landed between a drop and the asynchronous re-registration).
+function onPairEvent(payload: unknown): void {
+  const p = payload as { state?: string; reason?: string };
+  if (p.state === "bound") {
+    if (pairPhase === "open" || pairPhase === "idle") pairPhase = "bound";
+    pairNoDevice = false;
+    if (debugPairDigits && !pairDigitsTried) {
+      pairDigitsTried = true;
+      void core.debugPairDigitsFromFile().then(() => { if (pairPhase === "bound") pairPhase = "released"; syncRedraw(); }, syncFail);
+    }
+    syncRedraw();
+  } else if (p.state === "delivered") {
+    endOfferState(null);
+    pairPhase = "done";
+    syncRedraw();
+  } else if (p.state === "aborted") {
+    const text = p.reason === "codes_differ" ? "The codes differ. The offer is closed; start a new one."
+      : p.reason === "another_device" ? "Another device answered. Start over."
+      : "Offer cancelled.";
+    endOfferState({ text, error: p.reason !== "cancelled" });
+    syncRedraw();
+  } else if (p.state === "expired") {
+    endOfferState({ text: "The offer expired after 15 minutes.", error: false });
+    syncRedraw();
+  }
+}
+function onRelayEvent(payload: unknown): void {
+  const p = payload as { state?: string };
+  if (p.state !== "stopped") return;
+  if (pairOffer || pairPhase !== "idle") endOfferState({ text: "This Mac's address changed; the relay stopped. Start over on the new address.", error: true });
+  else relayStoppedNote = true;
+  syncRedraw();
+}
+function onSyncProgress(payload: unknown): void {
+  const p = payload as { op?: string; phase?: string; state?: string; bundles?: number; records?: number; applied?: number; rejected?: number };
+  if (p.op === "sync") {
+    const key = p.phase === "pull" ? "pull" : "push";
+    syncRun[key] = p.state === "done" ? "done" : "now";
+    if (p.state === "done") {
+      syncRun[key === "push" ? "pushNote" : "pullNote"] = key === "push" ? `${p.bundles ?? 0} bundles, ${p.records ?? 0} records` : `${p.applied ?? 0} applied, ${p.rejected ?? 0} refused`;
+    }
+    syncRedraw();
+  } else if (p.op === "pair") {
+    syncRedraw();
+  }
+}
+function armSyncListeners(): void {
+  if (syncListenersArmed) return;
+  syncListenersArmed = true;
+  void core.onCoreEvent("progress", onSyncProgress);
+  void core.onCoreEvent("pair", onPairEvent);
+  void core.onCoreEvent("relay", onRelayEvent);
 }
 
 /** The offer is over (any ending): the QR, the text and the typed digits go with it. No redraw here. */
@@ -652,7 +710,6 @@ function drawQr(text: string): HTMLElement {
 
 async function screenSync(out: ParentNode, later: Later, pairing: boolean): Promise<void> {
   const mine = generation; // a render that lost to a newer route() must not touch the offer state below
-  dropSyncListeners();
   let status: SyncStatus | null = null;
   let statusErr: core.CoreError | null = null;
   try {
@@ -676,7 +733,12 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   if (status && pairOffer && !serving?.offer) endOfferState({ text: "The offer ended.", error: false });
   if (serving?.offer === "bound" && pairPhase === "open") pairPhase = "bound";
   if (serving?.offer === "released" && (pairPhase === "open" || pairPhase === "bound")) pairPhase = "released";
-  if (serving?.offer === "delivered" && pairPhase !== "done") { endOfferState(null); pairPhase = "done"; } // missed the event
+  // a delivered offer the screen missed; never while a new offer is being pushed (the core keeps the delivered one
+  // until the push replaces it — review 7b-2 S1)
+  if (serving?.offer === "delivered" && (pairPhase === "open" || pairPhase === "bound" || pairPhase === "released" || (pairPhase === "idle" && !pairPushing))) {
+    endOfferState(null);
+    pairPhase = "done";
+  }
   if (!pairing) {
     pairEnding = null;
     if (pairPhase === "done") pairPhase = "idle";
@@ -701,10 +763,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     return select;
   };
   const listen = (): string | null => (addrs && chosenIp ? listenOf(chosenIp, debugListen && debugListen.ip === chosenIp ? debugListen.port : addrs.port) : null);
-  const fail = (e: unknown): void => {
-    syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
-    redraw();
-  };
+  const fail = syncFail;
 
   // ---- Sync now ----
   const runSync = async (): Promise<void> => {
@@ -749,7 +808,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       const reply = await core.call<OfferReply>("pair.offer", { listen: l });
       pairPushing = false;
       pairOffer = reply;
-      if (pairPhase === "pushing") pairPhase = "open";
+      pairPhase = "open"; // `bound` cannot arrive before the reply
       if (pairTimer) clearTimeout(pairTimer);
       pairTimer = setTimeout(() => { if (pairPhase === "open") { pairNoDevice = true; redraw(); } }, 60000);
       redraw();
@@ -777,57 +836,8 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     endOfferState({ text: "Offer cancelled.", error: false });
     redraw();
   };
-  const onPair = (payload: unknown): void => {
-    const p = payload as { state?: string; reason?: string };
-    if (p.state === "bound") {
-      if (pairPhase === "open" || pairPhase === "idle") pairPhase = "bound";
-      pairNoDevice = false;
-      if (debugPairDigits && !pairDigitsTried) {
-        pairDigitsTried = true;
-        void core.debugPairDigitsFromFile().then(() => { if (pairPhase === "bound") pairPhase = "released"; redraw(); }, fail);
-      }
-      redraw();
-    } else if (p.state === "delivered") {
-      endOfferState(null);
-      pairPhase = "done";
-      redraw();
-    } else if (p.state === "aborted") {
-      const text = p.reason === "codes_differ" ? "The codes differ. The offer is closed; start a new one."
-        : p.reason === "another_device" ? "Another device answered. Start over."
-        : "Offer cancelled.";
-      endOfferState({ text, error: p.reason !== "cancelled" });
-      redraw();
-    } else if (p.state === "expired") {
-      endOfferState({ text: "The offer expired after 15 minutes.", error: false });
-      redraw();
-    }
-  };
-  const onRelay = (payload: unknown): void => {
-    const p = payload as { state?: string };
-    if (p.state !== "stopped") return;
-    if (pairOffer || pairPhase !== "idle") endOfferState({ text: "This Mac's address changed; the relay stopped. Start over on the new address.", error: true });
-    else relayStoppedNote = true;
-    redraw();
-  };
-  const onProgress = (payload: unknown): void => {
-    const p = payload as { op?: string; phase?: string; state?: string; bundles?: number; records?: number; applied?: number; rejected?: number };
-    if (p.op === "sync") {
-      const key = p.phase === "pull" ? "pull" : "push";
-      syncRun[key] = p.state === "done" ? "done" : "now";
-      if (p.state === "done") {
-        syncRun[key === "push" ? "pushNote" : "pullNote"] = key === "push" ? `${p.bundles ?? 0} bundles, ${p.records ?? 0} records` : `${p.applied ?? 0} applied, ${p.rejected ?? 0} refused`;
-      }
-      redraw();
-    } else if (p.op === "pair") {
-      redraw();
-    }
-  };
   later(() => {
-    dropSyncListeners();
-    for (const [name, fn] of [["progress", onProgress], ["pair", onPair], ["relay", onRelay]] as const) {
-      void core.onCoreEvent(name, fn).then((un) => { syncUnlisten.push(un); });
-    }
-    if (pairing && debugPairDigits && serving?.offer === "bound" && !pairDigitsTried) onPair({ state: "bound" });
+    if (pairing && debugPairDigits && serving?.offer === "bound" && !pairDigitsTried) onPairEvent({ state: "bound" });
   });
 
   // ---- drawing ----
@@ -921,7 +931,14 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     const actions = el("div", "actions");
     actions.append(input, pair, cancel);
     right.append(actions);
-    if (pairPhase === "done") right.append(el("p", "caption muted", "The relay keeps serving until the offer expires (15 minutes) so the new device can make its first pull; turn the switch on to keep serving."));
+    if (pairPhase === "done") {
+      right.append(el("p", "caption muted", "The relay keeps serving until the offer expires (15 minutes) so the new device can make its first pull; turn the switch on the Sync screen on to keep serving."));
+      if (serving && !serving.keep) {
+        const stop = el("button", "secondary", "Stop serving now") as HTMLButtonElement;
+        stop.onclick = () => { stop.disabled = true; void setServing(false); };
+        right.append(stop);
+      }
+    }
     grid.append(left, right);
     out.append(grid);
     return;
@@ -948,11 +965,19 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     box.onchange = () => { box.disabled = true; void setServing(box.checked); };
     sw.append(box);
     card.append(sw, addressSelect());
-    if (serving) card.append(el("p", "body", `Serving at ${serving.url}`));
-    card.append(el("p", "caption muted", "Other devices on this network can reach the relay while it serves. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
   } else if (status && addrErr) {
     card.append(el("p", "caption muted", `${addrErr.code}: ${addrErr.message}`));
   }
+  // a running listener is always shown and always stoppable, whatever relay.addresses answered (review 7b-2 S4, S5)
+  if (serving) {
+    card.append(el("p", "body", `Serving at ${serving.url}`));
+    if (!serving.keep) {
+      const stop = el("button", "secondary", "Stop serving now") as HTMLButtonElement;
+      stop.onclick = () => { stop.disabled = true; void setServing(false); };
+      card.append(stop);
+    }
+  }
+  if (status && addrs) card.append(el("p", "caption muted", "Other devices on this network can reach the relay while it serves. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
   out.append(card);
   if (!status) return;
 
@@ -1795,6 +1820,7 @@ void core.onCoreEvent("restarted", () => {
     await route();
   })();
 });
+armSyncListeners();
 void core.onCoreEvent("exited", () => { if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core restarted; the offer is gone.", error: true }); banner = "The core stopped and could not be restarted. Quit and reopen the app."; void route(); });
 void (async () => {
   await refreshKey();
