@@ -211,6 +211,10 @@ fn a_write_open_marks_a_dead_writers_running_run_interrupted() {
     drop(ro);
     let second = store::open_for_write(&db, "test", 5.0, PassphraseSource::Env).unwrap();
     assert_eq!(statuses(&second), vec![("interrupted".to_string(), None, None)]);
+    // committed before the store is handed out: a reader opened meanwhile sees it
+    let peek = store::open_read_only(&db, PassphraseSource::Env).unwrap();
+    assert_eq!(statuses(&peek), vec![("interrupted".to_string(), None, None)]);
+    drop(peek);
     second
         .conn()
         .execute("INSERT INTO import_runs(started_at, transport, status) VALUES('2026-01-02T00:00:00Z','export','running')", [])

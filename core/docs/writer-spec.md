@@ -132,6 +132,11 @@ files_imported, files_duplicate, files_failed, records_written, error`; status =
 error, else `failed` when files_failed and no files_imported, `partial` when any failed, else
 `ok`. The CLI prints `ok: N imported, M duplicate, K failed, R rows written` and per-stream
 lines; counts only.
+A fifth status, `interrupted`, is set by `open_for_write` / `open_for_write_with` (both cores, after
+the migration, before the connection is handed out, under the OS write lock) on every row still `running`:
+no other writer is alive then, so that row belongs to a dead process. `finished_at`, `error` and the counts
+stay as they are; a read-only open never changes a row; the words stay out of the DDL comment, which SQLite
+keeps in `sqlite_master` and the fixture tests compare byte for byte (7b-10).
 
 ## Batch driver (`sources._import_fit_batch`)
 `Writer(conn, ClockOffsets.load(conn), transport)` — offsets pre-loaded from the store's
