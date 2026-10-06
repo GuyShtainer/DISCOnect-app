@@ -42,6 +42,8 @@ enum SlotState {
     Open,
     Bound(Box<Bound>),
     Aborted,
+    /// Seen past `exp`: the keys are dropped, only what a `410` needs stays.
+    Expired,
 }
 
 /// What a caller may observe of the slot.
@@ -57,8 +59,30 @@ pub enum PairState {
 /// The offer, the offerer's ephemeral secret and the state machine.
 pub struct OfferSlot {
     offer: Offer,
-    secret: StaticSecret,
+    /// Dropped (`None`) once the offer ended, aborted or expired.
+    secret: Option<StaticSecret>,
     state: SlotState,
+    /// Set by the payload route on the first `200`.
+    delivered: bool,
+}
+
+impl OfferSlot {
+    /// The offer ended: drop the offerer's ephemeral secret and every derived key.
+    fn end(&mut self, state: SlotState) {
+        self.secret = None;
+        self.state = state;
+    }
+
+    /// Past `exp`: drop the keys of an offer that did not end by itself.
+    fn retire_if_expired(&mut self, now: u64) -> bool {
+        if now <= self.offer.exp {
+            return false;
+        }
+        if !matches!(self.state, SlotState::Aborted | SlotState::Expired) {
+            self.end(SlotState::Expired);
+        }
+        true
+    }
 }
 
 /// The slot with its condition variable (shared by the server threads and the [`PairHandle`]).
@@ -103,8 +127,9 @@ impl PairOffer {
         let shared = Arc::new(PairShared {
             slot: Mutex::new(OfferSlot {
                 offer,
-                secret,
+                secret: Some(secret),
                 state: SlotState::Open,
+                delivered: false,
             }),
             changed: Condvar::new(),
         });
@@ -133,6 +158,7 @@ impl PairHandle {
         let slot = self.shared.lock();
         match &slot.state {
             SlotState::Aborted => PairState::Aborted,
+            SlotState::Expired => PairState::Expired,
             _ if wall_clock() > slot.offer.exp => PairState::Expired,
             SlotState::Open => PairState::Open,
             SlotState::Bound(b) if b.sealed.is_some() => PairState::Released,
@@ -148,10 +174,10 @@ impl PairHandle {
         loop {
             match &slot.state {
                 SlotState::Bound(b) => return Some(b.sas),
-                SlotState::Aborted => return None,
+                SlotState::Aborted | SlotState::Expired => return None,
                 SlotState::Open => {}
             }
-            if wall_clock() > slot.offer.exp {
+            if slot.retire_if_expired(wall_clock()) {
                 return None;
             }
             let left = deadline.checked_duration_since(Instant::now())?;
@@ -175,9 +201,10 @@ impl PairHandle {
         key_file_bytes: &[u8],
     ) -> Result<(), PairError> {
         let mut slot = self.shared.lock();
-        let expired = wall_clock() > slot.offer.exp;
+        let expired = slot.retire_if_expired(wall_clock());
         let result = match &mut slot.state {
             SlotState::Aborted => Err(PairError::OfferEnded),
+            SlotState::Expired => Err(PairError::Expired),
             _ if expired => Err(PairError::Expired),
             SlotState::Open => Err(PairError::NotBound),
             SlotState::Bound(b) if b.sealed.is_some() => Ok(()),
@@ -191,7 +218,7 @@ impl PairHandle {
             }
         };
         if matches!(result, Err(PairError::CodesDiffer)) {
-            slot.state = SlotState::Aborted;
+            slot.end(SlotState::Aborted);
         }
         drop(slot);
         self.shared.changed.notify_all();
@@ -200,8 +227,32 @@ impl PairHandle {
 
     /// End the offer: every pair route answers `410` from now on.
     pub fn abort(&self) {
-        self.shared.lock().state = SlotState::Aborted;
+        self.shared.lock().end(SlotState::Aborted);
         self.shared.changed.notify_all();
+    }
+
+    /// Block until the payload was served with a `200` once (`true`), or `timeout` passes, or the
+    /// offer ended without delivery (`false`).
+    pub fn wait_delivered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut slot = self.shared.lock();
+        loop {
+            if slot.delivered {
+                return true;
+            }
+            if matches!(slot.state, SlotState::Aborted | SlotState::Expired) {
+                return false;
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            slot = self
+                .shared
+                .changed
+                .wait_timeout(slot, left.min(Duration::from_secs(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 }
 
@@ -259,8 +310,8 @@ fn join(shared: &PairShared, declared_len: Option<usize>, body: &mut dyn Read, n
         return bare(400);
     }
     {
-        let slot = shared.lock();
-        if matches!(slot.state, SlotState::Aborted) || now > slot.offer.exp {
+        let mut slot = shared.lock();
+        if slot.retire_if_expired(now) || matches!(slot.state, SlotState::Aborted | SlotState::Expired) {
             return bare(410);
         }
     }
@@ -272,10 +323,13 @@ fn join(shared: &PairShared, declared_len: Option<usize>, body: &mut dyn Read, n
     let joiner_pub: [u8; 32] = joiner_pub.try_into().unwrap_or([0u8; 32]);
     let mut slot = shared.lock();
     // the state may have moved while the body arrived
-    if matches!(slot.state, SlotState::Aborted) || now > slot.offer.exp {
+    if slot.retire_if_expired(now) || matches!(slot.state, SlotState::Aborted | SlotState::Expired) {
         return bare(410);
     }
-    let Ok(shared_secret) = pair::dh(&slot.secret, &joiner_pub) else {
+    let Some(secret) = slot.secret.as_ref() else {
+        return bare(410);
+    };
+    let Ok(shared_secret) = pair::dh(secret, &joiner_pub) else {
         return bare(401); // a low-order key is a wrong tag
     };
     let transcript = pair::transcript(&slot.offer.pub_key, &joiner_pub, &slot.offer.id, slot.offer.exp);
@@ -288,7 +342,7 @@ fn join(shared: &PairShared, declared_len: Option<usize>, body: &mut dyn Read, n
             return bytes(202, bound.offerer_tag.to_vec());
         }
         SlotState::Bound(_) => {
-            slot.state = SlotState::Aborted;
+            slot.end(SlotState::Aborted);
             drop(slot);
             shared.changed.notify_all();
             return bare(410);
@@ -314,12 +368,19 @@ fn payload(shared: &PairShared, declared_len: Option<usize>, now: u64) -> Reply 
     if declared_len.is_some_and(|len| len != 0) {
         return bare(400);
     }
-    let slot = shared.lock();
-    if matches!(slot.state, SlotState::Aborted) || now > slot.offer.exp {
+    let mut slot = shared.lock();
+    if slot.retire_if_expired(now) || matches!(slot.state, SlotState::Aborted | SlotState::Expired) {
         return bare(410);
     }
-    match &slot.state {
-        SlotState::Bound(b) => b.sealed.as_ref().map_or_else(|| bare(202), |sealed| bytes(200, sealed.clone())),
-        _ => bare(202),
-    }
+    let sealed = match &slot.state {
+        SlotState::Bound(b) => b.sealed.clone(),
+        _ => None,
+    };
+    let Some(sealed) = sealed else {
+        return bare(202);
+    };
+    slot.delivered = true;
+    drop(slot);
+    shared.changed.notify_all();
+    bytes(200, sealed)
 }

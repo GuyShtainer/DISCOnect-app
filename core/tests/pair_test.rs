@@ -118,7 +118,8 @@ fn spawn_join(
             &text,
             &mut |code| {
                 if let Some(h) = &handle {
-                    // structural: the callback runs only after the offerer bound this joiner
+                    // a cheap sanity check only: the forged-202 test carries the proof that the code
+                    // is shown after the offerer's tag verified, not this state read
                     assert_eq!(h.state(), PairState::Bound, "code shown before the offerer bound us");
                 }
                 tx.send(code.to_string()).expect("send");
@@ -167,8 +168,10 @@ fn pairing_over_loopback_hands_over_the_key_and_the_pulled_store_converges() {
 
     // land: relay file, key file, store, first pull
     let dir = tempfile::tempdir().expect("dir");
-    let db = dir.path().join("joined.hbdb");
-    let relay_file = dir.path().join("joined.relay.json");
+    let site = dir.path().join("site");
+    fs::create_dir_all(&site).expect("site"); // exists before the landing, with the umask's mode
+    let db = site.join("joined.hbdb");
+    let relay_file = site.join("relay.json");
     check_landing_site(&db, &relay_file, &joined.url).expect("free site");
     let pulled = pair_client::land(&joined, &db, &relay_file).expect("land");
     assert_eq!(pulled.status, "ok");
@@ -183,6 +186,8 @@ fn pairing_over_loopback_hands_over_the_key_and_the_pulled_store_converges() {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(keys::key_path_for(&db)).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = fs::metadata(&site).expect("meta").permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "the key file's directory is 0700 even if it existed");
     }
     let secret = keys::unlock(&keys::key_path_for(&db), PassphraseSource::Explicit(PASSPHRASE)).expect("unlock");
     let opened = store::open_for_write_with(&db, "test", 5.0, Some(&secret)).expect("open joined");
@@ -365,6 +370,8 @@ enum Fake {
     BadAad,
     /// A real tag and payload, but a master that is not the key file's.
     WrongMaster,
+    /// The first POST connection is closed unanswered; then everything is honest.
+    GoodAfterDrop,
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -406,10 +413,15 @@ fn fake_offerer(mode: Fake) -> String {
     let text = offer.encode();
     std::thread::spawn(move || {
         let mut keys_t: Option<(Keys, [u8; pair::TRANSCRIPT_LEN])> = None;
+        let mut dropped = false;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let Some((line, body)) = read_request(&mut stream) else { continue };
             if line.starts_with("POST") && body.len() == 64 {
+                if matches!(mode, Fake::GoodAfterDrop) && !dropped {
+                    dropped = true;
+                    continue; // the stream drops here: accepted, read, closed
+                }
                 let joiner_pub: [u8; 32] = body[..32].try_into().expect("32");
                 let shared = pair::dh(&secret, &joiner_pub).expect("dh");
                 let t = pair::transcript(&offer.pub_key, &joiner_pub, &offer.id, offer.exp);
@@ -424,6 +436,7 @@ fn fake_offerer(mode: Fake) -> String {
                 let sealed = keys_t.as_ref().map(|(keys, t)| match mode {
                     Fake::BadAad => pair::seal_payload(keys, b"another transcript", &master(), &key_file_bytes()),
                     Fake::WrongMaster => pair::seal_payload(keys, t, &[7u8; 32], &key_file_bytes()),
+                    Fake::GoodAfterDrop => pair::seal_payload(keys, t, &master(), &key_file_bytes()),
                     _ => Vec::new(),
                 });
                 match sealed {
@@ -455,14 +468,87 @@ fn a_forged_202_shows_no_code_and_a_bad_payload_returns_nothing() {
 }
 
 #[test]
+fn a_joiner_whose_first_post_is_dropped_retries_the_same_body_and_succeeds() {
+    let text = fake_offerer(Fake::GoodAfterDrop);
+    let started = Instant::now();
+    let joined = join(&text, &mut |_| {}, &AtomicBool::new(false)).expect("the retry succeeds");
+    assert_eq!(*joined.master, master());
+    assert!(started.elapsed() >= Duration::from_millis(400), "the retry waited");
+}
+
+#[test]
 fn a_joiner_that_fails_writes_nothing() {
-    let dir = tempfile::tempdir().expect("dir");
-    let db = dir.path().join("j.hbdb");
+    let tmp = tempfile::tempdir().expect("tmp");
+    let db = tmp.path().join("fresh").join("j.hbdb");
     let text = fake_offerer(Fake::BadAad);
-    let result = join(&text, &mut |_| {}, &AtomicBool::new(false));
-    assert!(result.is_err());
-    assert_eq!(fs::read_dir(dir.path()).expect("ls").count(), 0);
-    assert!(!db.exists());
+    let mut joiner = cli(tmp.path())
+        .arg("--db").arg(&db)
+        .args(["pair", "join"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn join");
+    joiner.stdin.take().expect("stdin").write_all(format!("{text}\n").as_bytes()).expect("offer");
+    let out = joiner.wait_with_output().expect("output");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "no summary");
+    let site = db.parent().expect("parent");
+    assert!(!db.exists() && !keys::key_path_for(&db).exists());
+    assert!(!site.join("relay.json").exists() && !site.exists(), "not even the directory");
+}
+
+#[test]
+fn offer_debug_does_not_show_the_secret() {
+    let offer = Offer { pub_key: [1; 32], s: [0xab; 16], id: [2; 16], exp: 5, url: "http://x:1".into() };
+    let shown = format!("{offer:?}");
+    assert!(shown.contains("<redacted>"));
+    assert!(!shown.contains("171") && !shown.contains(&hex::encode(offer.s)) && !shown.contains("ab, ab"), "{shown}");
+}
+
+#[test]
+fn write_atomic_leaves_no_half_file_when_the_write_fails_and_makes_the_parent_0700() {
+    let dir = tempfile::tempdir().expect("dir");
+    // the target is a non-empty directory: the rename fails after the temp file was written
+    let target = dir.path().join("relay.json");
+    fs::create_dir_all(target.join("inner")).expect("blocker");
+    assert!(pair_client::write_atomic(&target, b"{}").is_err());
+    let names: Vec<_> = fs::read_dir(dir.path()).expect("ls").map(|e| e.expect("e").file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("relay.json")], "no temp file left: {names:?}");
+    assert!(target.is_dir(), "the target is untouched");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let loose = dir.path().join("loose");
+        fs::create_dir_all(&loose).expect("loose");
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).expect("chmod");
+        pair_client::write_atomic(&loose.join("f"), b"x").expect("write");
+        assert_eq!(fs::metadata(&loose).expect("meta").permissions().mode() & 0o777, 0o700);
+    }
+}
+
+#[test]
+fn wait_delivered_turns_true_only_after_the_first_200_of_the_payload() {
+    let o = Offerer::start();
+    let (worker, rx) = spawn_join(o.text.clone(), None);
+    let sas = o.handle.wait_joined(Duration::from_secs(10)).expect("joined");
+    let _ = rx.recv_timeout(Duration::from_secs(10)).expect("code");
+    o.handle.release(&sas_text(sas), &master(), &key_file_bytes()).expect("release");
+    // released, but nobody has fetched yet (the joiner polls every 500 ms; a short wait may race it,
+    // so assert the order the other way round below)
+    let delivered = o.handle.wait_delivered(Duration::from_secs(10));
+    assert!(delivered, "the joiner's fetch was a 200");
+    worker.join().expect("thread").expect("joined");
+    assert!(o.handle.wait_delivered(Duration::from_millis(1)), "stays true");
+    o.server.stop();
+}
+
+#[test]
+fn wait_delivered_times_out_when_nobody_fetches() {
+    let (_text, handle) = PairOffer::new("http://127.0.0.1:1").expect("offer");
+    assert!(!handle.wait_delivered(Duration::from_millis(100)));
+    handle.abort();
+    assert!(!handle.wait_delivered(Duration::from_secs(5)), "an ended offer answers false at once");
 }
 
 // ---- the landing ----
@@ -592,24 +678,36 @@ fn cli(home: &Path) -> Command {
     command
 }
 
+/// Spawns `pair offer` on a free port. The port is found by bind-and-release (the CLI refuses port 0),
+/// so another process could take it in between: when the offerer cannot listen, spawn once more.
 fn start_offer_process(tmp: &Path, db: &Path) -> (Kill, BufReader<std::process::ChildStderr>, String) {
     let pass = tmp.join("pass.txt");
     fs::write(&pass, format!("{PASSPHRASE}\n")).expect("pass");
     let drops = fit_drop(tmp, "fits", &MONITORING);
     assert!(cli(tmp).arg("--db").arg(db).arg("--passphrase-file").arg(&pass).arg("import").arg(&drops).output().expect("import").status.success());
-    let mut child = cli(tmp)
-        .arg("--db").arg(db)
-        .arg("--passphrase-file").arg(&pass)
-        .arg("--relay").arg(tmp.join("relay"))
-        .arg("--listen").arg(format!("127.0.0.1:{}", free_port()))
-        .args(["pair", "offer"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn offer");
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout")).read_line(&mut line).expect("offer line");
+    let spawn = || {
+        cli(tmp)
+            .arg("--db").arg(db)
+            .arg("--passphrase-file").arg(&pass)
+            .arg("--relay").arg(tmp.join("relay"))
+            .arg("--listen").arg(format!("127.0.0.1:{}", free_port()))
+            .args(["pair", "offer"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn offer")
+    };
+    let (mut child, mut line) = (spawn(), String::new());
+    for attempt in 0..2 {
+        line.clear();
+        BufReader::new(child.stdout.take().expect("stdout")).read_line(&mut line).expect("offer line");
+        if !line.is_empty() || attempt == 1 {
+            break;
+        }
+        let _ = child.wait(); // no offer line: the bind lost the race
+        child = spawn();
+    }
     assert!(line.starts_with("disconect-pair:v1."), "the offer text is the one stdout line");
     let stderr = BufReader::new(child.stderr.take().expect("stderr"));
     (Kill(child), stderr, line.trim().to_string())
@@ -639,6 +737,8 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     let joiner_home = tmp.path().join("joiner-home");
     fs::create_dir_all(&joiner_home).expect("home");
     let joined_db = tmp.path().join("joiner").join("j.hbdb");
+    // the default relay file is the one the app and the CLI read: relay.json in the db's folder
+    let relay_file = tmp.path().join("joiner").join("relay.json");
     let mut joiner = cli(&joiner_home)
         .arg("--db").arg(&joined_db)
         .args(["pair", "join"])
@@ -655,6 +755,7 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     assert_eq!(joiner_code, mac_code);
     line_with(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
+    line_with(&mut offer_err, "released");
     line_with(&mut offer_err, "Pairing done");
 
     let mut summary = String::new();
@@ -671,6 +772,15 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     let opened = store::open_read_only(&joined_db, PassphraseSource::Explicit(PASSPHRASE)).expect("open joined");
     assert!(store::table_counts(opened.conn()).expect("counts").iter().any(|(_, n)| *n > 0));
     assert_eq!(fs::read(keys::key_path_for(&joined_db)).expect("key file"), key_file_bytes());
+    assert!(relay_file.is_file(), "relay.json beside the db");
+    assert!(!tmp.path().join("joiner").join("j.hbdb.relay.json").exists());
+    assert!(fs::read_to_string(&relay_file).expect("relay file").contains("\"lan\""));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(tmp.path().join("joiner")).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the key file's directory");
+    }
     drop((dir, offerer));
 }
 
@@ -693,10 +803,13 @@ fn pair_offer_with_the_wrong_digits_aborts_and_the_joiner_ends_without_a_store()
     let wrong = format!("{:06}", (mac.parse::<u32>().expect("digits") + 1) % 1_000_000);
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{wrong}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "the codes differ");
-    assert_eq!(offerer.0.wait().expect("wait").code(), Some(1));
+    line_with(&mut offer_err, "offer ended; serving the relay");
+    // the server stays up, so the joiner's poll reads 410 and it ends without writing anything
     let out = joiner.wait_with_output().expect("join output");
     assert_eq!(out.status.code(), Some(1));
     assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists());
+    assert!(offerer.0.try_wait().expect("try_wait").is_none(), "the offerer keeps serving");
+    drop(offerer); // Kill
 }
 
 #[test]
@@ -718,5 +831,10 @@ fn pair_offer_refuses_port_zero_and_a_missing_listen() {
     };
     assert_eq!(run(&["--listen", "127.0.0.1:0"]).status.code(), Some(2));
     assert_eq!(run(&[]).status.code(), Some(2));
+    for any in ["0.0.0.0:8123", "[::]:8123"] {
+        let out = run(&["--listen", any]);
+        assert_eq!(out.status.code(), Some(2), "{any}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("needs a concrete address"), "{any}");
+    }
     assert!(!tmp.path().join("relay").exists(), "refused before the push");
 }

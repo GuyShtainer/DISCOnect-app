@@ -28,6 +28,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_EVERY: Duration = Duration::from_millis(500);
 /// A sealed payload is a master and a key file: far below this.
 const MAX_PAYLOAD: u64 = 1024 * 1024;
+/// Total tries of the joiner's POST (a reset is retried with the identical body, 500 ms apart).
+const POST_ATTEMPTS: u32 = 3;
+const POST_RETRY_EVERY: Duration = Duration::from_millis(500);
 /// Consecutive failed polls before giving up (a reset between two polls is not the end).
 const POLL_FAILURES: u32 = 5;
 
@@ -100,12 +103,25 @@ pub fn join(
 
     let agent = agent();
     let route = format!("{}{PAIR}/{}", offer.url, hex::encode(offer.id));
-    let response = agent
-        .post(&route)
-        .header("Content-Type", "application/octet-stream")
-        .send(&body[..])
-        .map_err(|_| PairError::Network)?;
-    let (status, tag) = finish(response, OFFERER_TAG_LEN as u64 + 1)?;
+    // the same 64 bytes again after a network error: the offerer answers the same key with the same 202
+    let mut attempt = 1;
+    let (status, tag) = loop {
+        let sent = agent
+            .post(&route)
+            .header("Content-Type", "application/octet-stream")
+            .send(&body[..])
+            .map_err(|_| PairError::Network)
+            .and_then(|r| finish(r, OFFERER_TAG_LEN as u64 + 1));
+        match sent {
+            Err(PairError::Network) if attempt < POST_ATTEMPTS => {
+                attempt += 1;
+                if pause(POST_RETRY_EVERY, cancel) {
+                    return Err(PairError::Cancelled);
+                }
+            }
+            other => break other?,
+        }
+    };
     match status {
         202 => {}
         410 => return Err(PairError::OfferEnded),
@@ -209,10 +225,7 @@ pub fn land_with(
     let io = |what: &'static str| move |_: std::io::Error| PairError::Landing(format!("cannot write the {what}"));
 
     // (1) the relay file
-    if let Some(parent) = relay_file.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(io("relay file"))?;
-    }
-    std::fs::write(relay_file, relay_file_text(&joined.url)).map_err(io("relay file"))?;
+    write_atomic(relay_file, relay_file_text(&joined.url).as_bytes()).map_err(io("relay file"))?;
     hook(LandStep::RelayFile)?;
 
     // (2) the key file, verbatim and atomic: the commit point
@@ -222,7 +235,7 @@ pub fn land_with(
     // from here on a failure leaves a key file: a `sync pull` with the passphrase finishes the job
     let left = |what: &str| {
         PairError::Landing(format!(
-            "{what}; the key file is in place: finish with 'sync pull' using the passphrase"
+            "{what}; the key file is in place: finish with `sync pull --relay <the http://host:port in relay.json>` using the passphrase"
         ))
     };
     // (3) the encrypted store, created with the in-memory master
@@ -244,19 +257,18 @@ pub fn land(joined: &Joined, db: &Path, relay_file: &Path) -> Result<PullResult,
     land_with(joined, db, relay_file, &mut |_| Ok(()))
 }
 
-/// Temp file beside `path` (0600), fsync, rename, fsync the directory; a missing parent is created 0700.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Temp file beside `path` (0600), fsync, rename, fsync the directory; the parent is created if missing
+/// and set to 0700 either way (a failed write leaves no temp file and no half `path`).
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    if !parent.exists() {
-        std::fs::create_dir_all(&parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
-        }
+    std::fs::create_dir_all(&parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let temp = parent.join(format!(".{name}.tmp{}", std::process::id()));

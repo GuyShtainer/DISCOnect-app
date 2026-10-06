@@ -965,10 +965,7 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
 /// `relay.json` beside the store this session serves (the CLI reads the one beside the *default*
 /// store; a session serves the store it was started on).
 fn relay_json_path(db_path: &Path) -> PathBuf {
-    db_path
-        .parent()
-        .map_or_else(PathBuf::new, Path::to_path_buf)
-        .join(home::RELAY_CONFIG_NAME)
+    home::relay_config_beside(db_path)
 }
 
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay

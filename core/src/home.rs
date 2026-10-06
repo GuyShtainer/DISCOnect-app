@@ -106,6 +106,11 @@ pub fn moved_legacy_home(path: &Path) -> Option<HomeMoved> {
         .map(|folder| HomeMoved { folder })
 }
 
+/// The `relay.json` beside the store `db`: the file the app (`serve`) and the CLI read for it.
+pub fn relay_config_beside(db: &Path) -> PathBuf {
+    db.parent().map_or_else(PathBuf::new, Path::to_path_buf).join(RELAY_CONFIG_NAME)
+}
+
 /// `relay.json` lives in the folder of the resolved database file.
 pub fn relay_config_path() -> Option<PathBuf> {
     default_db_path().map(|db| {

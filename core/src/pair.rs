@@ -78,13 +78,26 @@ pub enum PairError {
 }
 
 /// The offer: what the offerer shows (QR / pasted text) and the joiner parses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Offer {
     pub pub_key: [u8; 32],
     pub s: [u8; 16],
     pub id: [u8; 16],
     pub exp: u64,
     pub url: String,
+}
+
+/// `s` is the offer's secret: it never reaches a log or a panic message.
+impl std::fmt::Debug for Offer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Offer")
+            .field("pub_key", &self.pub_key)
+            .field("s", &"<redacted>")
+            .field("id", &self.id)
+            .field("exp", &self.exp)
+            .field("url", &self.url)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
