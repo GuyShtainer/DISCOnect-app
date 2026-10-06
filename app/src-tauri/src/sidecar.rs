@@ -34,8 +34,10 @@ use crate::inproc::{self, InProcCore, LineSink, Runner};
 #[cfg(desktop)]
 const ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "DISCONECT_DB", "DISCONECT_KEYS", "TMPDIR", "LANG"];
 /// The live link's child reads the watch, never the store: no store or key path reaches it.
+#[cfg(desktop)]
 const LIVE_ENV_ALLOWLIST: &[&str] = &["HOME", "PATH", "TMPDIR", "LANG"];
 /// How long `LiveLink::stop` waits for the child to unsubscribe and close the link on its own.
+#[cfg(desktop)]
 const LIVE_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 const STDERR_LINES_KEPT: usize = 200;
 const MAX_RESTARTS: u32 = 1;
@@ -840,6 +842,7 @@ mod tests {
         }
     }
 
+    #[cfg(desktop)]
     #[test]
     fn passphrase_env_is_not_in_the_allowlist() {
         assert!(!ENV_ALLOWLIST.contains(&"DISCONECT_PASSPHRASE"));

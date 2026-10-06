@@ -76,12 +76,14 @@ fn disabled() -> bool {
     std::env::var(BACKEND_ENV).is_ok_and(|v| v == "fail")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn account(key_id: &[u8; 16]) -> String {
     hex::encode(key_id)
 }
 
 /// What a quiet (no dialog) attempt to read the secret came to.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Secret/Unreadable are built by the macOS backend only (12-D adds iOS)
 enum Quiet {
     Secret(Vec<u8>),
     NotFound,

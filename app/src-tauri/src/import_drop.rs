@@ -160,7 +160,7 @@ mod tests {
         let zip = dir.join("export.ZIP");
         tiny_zip(&zip, &format!("{}/a.json", disconect_core::sources::EXPORT_ROOT));
         assert_eq!(classify(std::slice::from_ref(&zip)).map(|(k, _)| k), Ok(Kind::Export));
-        assert_eq!(classify(&[dir.clone()]).map(|(k, _)| k), Ok(Kind::Usb));
+        assert_eq!(classify(std::slice::from_ref(&dir)).map(|(k, _)| k), Ok(Kind::Usb));
         let unzipped = dir.join("unzipped");
         std::fs::create_dir_all(unzipped.join(disconect_core::sources::EXPORT_ROOT)).expect("mkdir");
         assert_eq!(classify(&[unzipped]).map(|(k, _)| k), Ok(Kind::Export));
