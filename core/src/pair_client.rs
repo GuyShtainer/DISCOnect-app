@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Bet 12-E slice 2: the joiner. [`join`] runs the client side of the pairing dance against an offerer
-//! (ADR 0011); [`land`] puts what it returned on disk in a crash-safe order; [`check_landing_site`] is
-//! the refusal that runs before any request. The offerer is `relay::pair_routes`.
+//! Bet 12-E slice 2: the joiner. A [`Joiner`] holds one ephemeral key for one offer and [`Joiner::join`]
+//! runs the client side of the pairing dance against the offerer (ADR 0011, v2 since 12-G); [`join`] is
+//! the one-shot wrapper; [`land`] puts what it returned on disk in a crash-safe order; [`check_landing_site`]
+//! is the refusal that runs before any request. The offerer is `relay::pair_routes`.
 //!
-//! The joiner shows the short code only after the offerer's tag verified (the offerer proved it bound
-//! *this* joiner's key). Nothing here prints; the caller shows the code through a callback.
+//! The joiner shows the short code only after the offerer's `202` opened: the right length, a reveal that
+//! matches the commitment in the offer, a tag that verifies (the offerer proved it bound *this* joiner's
+//! key). A joiner key is drawn once per [`Joiner`], after the offer is in hand, and is never used with any
+//! other offer: a retry re-sends the identical body. Nothing here prints; the caller shows the code
+//! through a callback.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,9 +17,7 @@ use std::time::Duration;
 
 use crate::canon;
 use crate::keys::{self, Secret32};
-use crate::pair::{
-    self, JOIN_BODY_LEN, Keys, OFFERER_TAG_LEN, Offer, PairError, TRANSCRIPT_LEN, sas, sas_text,
-};
+use crate::pair::{self, JOIN_BODY_LEN, Keys, OFFERER_REPLY_LEN, Offer, PairError, TRANSCRIPT_LEN, sas, sas_text};
 use crate::relay::config::{self as relay_cfg, RelayConfig};
 use crate::relay::lan::{LanRelay, wall_clock};
 use crate::relay::pair_routes::PAIR;
@@ -80,38 +82,87 @@ fn pause(total: Duration, cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::SeqCst)
 }
 
-/// Join `offer_text`: POST the joiner key and tag, verify the offerer's tag, call `on_sas` with the six
-/// digits (only then), wait for the release, open the payload and check the key file against the master.
-/// `cancel` ends the wait. Nothing is written anywhere.
+/// One joiner key for one offer. Made once per offer text (the key is drawn after the offer, and so its
+/// commitment, is in hand); every [`Joiner::join`] on it sends the identical body, so a retry after a lost
+/// `202` gets the same `202` back instead of aborting the offerer's slot. The derived keys are zeroized on
+/// drop; nothing exports or imports the private key (it is dropped as soon as `K` exists).
+pub struct Joiner {
+    offer: Offer,
+    joiner_pub: [u8; 32],
+    keys: Keys,
+    transcript: [u8; TRANSCRIPT_LEN],
+    body: [u8; JOIN_BODY_LEN],
+}
+
+impl Joiner {
+    /// Parse `offer_text` (trimmed), refuse an expired offer, draw the key, derive the keys and the body.
+    pub fn new(offer_text: &str) -> Result<Joiner, PairError> {
+        let offer = Offer::parse(offer_text.trim())?;
+        if wall_clock() > offer.exp {
+            return Err(PairError::Expired);
+        }
+        let (secret, joiner_pub) = pair::ephemeral()?;
+        let shared = pair::dh(&secret, &offer.pub_key)?;
+        drop(secret); // zeroized; only the derived keys are needed from here
+        let transcript: [u8; TRANSCRIPT_LEN] =
+            pair::transcript(&offer.pub_key, &joiner_pub, &offer.id, offer.exp, &offer.c);
+        let keys = Keys::derive(&shared, &offer.s, &transcript);
+        let mut body = [0u8; JOIN_BODY_LEN];
+        body[..32].copy_from_slice(&joiner_pub);
+        body[32..].copy_from_slice(&pair::joiner_tag(&keys));
+        Ok(Joiner { offer, joiner_pub, keys, transcript, body })
+    }
+
+    /// The offer this joiner was made for.
+    pub fn offer(&self) -> &Offer {
+        &self.offer
+    }
+
+    /// The joiner's public key (the one the offerer binds).
+    pub fn joiner_pub(&self) -> [u8; 32] {
+        self.joiner_pub
+    }
+
+    /// POST the joiner key and tag, open the offerer's reply (length, commitment, tag), call `on_sas` with
+    /// the six digits (only then), wait for the release, open the payload and check the key file against
+    /// the master. `cancel` ends the wait. Nothing is written anywhere. Calling it again re-sends the same
+    /// body.
+    pub fn join(&self, on_sas: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<Joined, PairError> {
+        join_with(&self.offer, &self.keys, &self.transcript, &self.body, on_sas, cancel)
+    }
+}
+
+/// One-shot: a fresh [`Joiner`] for `offer_text`, joined once (the CLI).
 pub fn join(
     offer_text: &str,
     on_sas: &mut dyn FnMut(&str),
     cancel: &AtomicBool,
 ) -> Result<Joined, PairError> {
-    let offer = Offer::parse(offer_text.trim())?;
+    Joiner::new(offer_text)?.join(on_sas, cancel)
+}
+
+fn join_with(
+    offer: &Offer,
+    keys: &Keys,
+    transcript: &[u8; TRANSCRIPT_LEN],
+    body: &[u8; JOIN_BODY_LEN],
+    on_sas: &mut dyn FnMut(&str),
+    cancel: &AtomicBool,
+) -> Result<Joined, PairError> {
     if wall_clock() > offer.exp {
         return Err(PairError::Expired);
     }
-    let (secret, joiner_pub) = pair::ephemeral()?;
-    let shared = pair::dh(&secret, &offer.pub_key)?;
-    let transcript: [u8; TRANSCRIPT_LEN] =
-        pair::transcript(&offer.pub_key, &joiner_pub, &offer.id, offer.exp);
-    let keys = Keys::derive(&shared, &offer.s, &transcript);
-    let mut body = [0u8; JOIN_BODY_LEN];
-    body[..32].copy_from_slice(&joiner_pub);
-    body[32..].copy_from_slice(&pair::joiner_tag(&keys));
-
     let agent = agent();
     let route = format!("{}{PAIR}/{}", offer.url, hex::encode(offer.id));
     // the same 64 bytes again after a network error: the offerer answers the same key with the same 202
     let mut attempt = 1;
-    let (status, tag) = loop {
+    let (status, reply) = loop {
         let sent = agent
             .post(&route)
             .header("Content-Type", "application/octet-stream")
             .send(&body[..])
             .map_err(|_| PairError::Network)
-            .and_then(|r| finish(r, OFFERER_TAG_LEN as u64 + 1));
+            .and_then(|r| finish(r, OFFERER_REPLY_LEN as u64 + 1));
         match sent {
             Err(PairError::Network) if attempt < POST_ATTEMPTS => {
                 attempt += 1;
@@ -127,12 +178,9 @@ pub fn join(
         410 => return Err(PairError::OfferEnded),
         other => return Err(PairError::Refused(other)),
     }
-    // a forged or empty 202 shows no code
-    if tag.len() != OFFERER_TAG_LEN {
-        return Err(PairError::BadTag);
-    }
-    pair::verify_offerer_tag(&keys, &tag)?;
-    on_sas(&sas_text(sas(&keys)));
+    // a forged, short or empty 202 shows no code: length, commitment, tag, in that order
+    let n_o = pair::open_offerer_reply(keys, &offer.c, &reply)?;
+    on_sas(&sas_text(sas(keys, &n_o)));
 
     let payload_url = format!("{route}/payload");
     let mut failures = 0u32;
@@ -159,7 +207,7 @@ pub fn join(
             return Err(PairError::Cancelled);
         }
     };
-    let (master, key_file_bytes) = pair::open_payload(&keys, &transcript, &sealed)?;
+    let (master, key_file_bytes) = pair::open_payload(keys, transcript, &sealed)?;
     let parsed = keys::parse_key_file(&key_file_bytes)
         .map_err(|_| PairError::KeyFile("not a usable key file"))?;
     if keys::key_id_for(&master) != parsed.key_id {
@@ -168,7 +216,7 @@ pub fn join(
     Ok(Joined {
         master,
         key_file_bytes,
-        url: offer.url,
+        url: offer.url.clone(),
     })
 }
 

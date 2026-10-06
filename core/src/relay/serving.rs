@@ -14,7 +14,7 @@
 //! * **Locks.** `RelayState` before the server's offer slot before `PairShared`; the `Events` lock of an
 //!   offer is taken before `PairShared` and never while `RelayState` is held for a wait.
 //!   [`LanServer::stop`] (up to 5 s) always runs outside the `RelayState` lock, behind `stopping`.
-//! * **Privacy.** Nothing here emits a SAS, a joiner key, a tag or a peer address; the server's logger
+//! * **Privacy.** Nothing here emits a SAS, the offer's SAS nonce `N_o`, a joiner key, a tag or a peer address; the server's logger
 //!   is a no-op.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

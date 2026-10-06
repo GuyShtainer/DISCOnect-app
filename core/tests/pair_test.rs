@@ -19,7 +19,7 @@ use common::convergence::{MONITORING, daily_rows, fingerprint, fit_drop};
 use common::{PASSPHRASE, encrypted_copy, fixtures};
 use disconect_core::keys::{self, PassphraseSource};
 use disconect_core::pair::{self, Keys, Offer, PairError, sas_text};
-use disconect_core::pair_client::{self, Joined, LandStep, check_landing_site, join, land_with};
+use disconect_core::pair_client::{self, Joined, Joiner, LandStep, check_landing_site, join, land_with};
 use disconect_core::relay::folder::FolderRelay;
 use disconect_core::relay::lan::{LanRelay, wall_clock};
 use disconect_core::relay::lan_server::{Ctx, LanServer, Limits, Logger, handle};
@@ -142,7 +142,7 @@ fn pair_once(o: &Offerer) -> (Joined, String) {
 
 fn join_body(offer: &Offer, s: &[u8; 16], secret: &StaticSecret, joiner_pub: &[u8; 32]) -> [u8; 64] {
     let shared = pair::dh(secret, &offer.pub_key).expect("dh");
-    let t = pair::transcript(&offer.pub_key, joiner_pub, &offer.id, offer.exp);
+    let t = pair::transcript(&offer.pub_key, joiner_pub, &offer.id, offer.exp, &offer.c);
     let keys = Keys::derive(&shared, s, &t);
     let mut body = [0u8; 64];
     body[..32].copy_from_slice(joiner_pub);
@@ -231,8 +231,9 @@ fn the_same_key_again_is_the_same_202_and_another_key_aborts_the_offer() {
     let first = post(&o.route(), &body);
     let again = post(&o.route(), &body);
     assert_eq!(first.0, 202);
-    assert_eq!(first.1.len(), 32);
-    assert_eq!(first, again, "idempotent: the same status and the same offerer tag");
+    assert_eq!(first.1.len(), 64, "N_o || tag");
+    assert_eq!(pair::commit(first.1[..32].try_into().expect("32")), offer.c, "the reveal is the committed nonce");
+    assert_eq!(first, again, "idempotent: the same status and the same reply");
     assert_eq!(o.handle.state(), PairState::Bound);
 
     // a different key with a valid tag: 410, and the first joiner is cut off too
@@ -249,6 +250,30 @@ fn the_same_key_again_is_the_same_202_and_another_key_aborts_the_offer() {
     );
     assert_eq!(get(&format!("{}/payload", o.route())).0, 410);
     o.server.stop();
+}
+
+#[test]
+fn a_join_tagged_under_another_commitment_is_401_and_binds_nothing() {
+    // 12-G N8: `c` is in the transcript, so a joiner that parsed a different commitment derives another K
+    let o = Offerer::start();
+    let mut other = o.offer();
+    other.c[0] ^= 1;
+    let (secret, joiner_pub) = pair::ephemeral().expect("ephemeral");
+    let body = join_body(&other, &other.s, &secret, &joiner_pub);
+    assert_eq!(post(&o.route(), &body).0, 401);
+    assert_eq!(o.handle.state(), PairState::Open);
+    o.server.stop();
+}
+
+#[test]
+fn two_offers_commit_to_two_nonces_and_two_joiners_draw_two_keys() {
+    let (a, _) = PairOffer::new("http://127.0.0.1:1").expect("offer");
+    let (b, _) = PairOffer::new("http://127.0.0.1:1").expect("offer");
+    assert_ne!(Offer::parse(&a).expect("a").c, Offer::parse(&b).expect("b").c);
+    // the same text twice is two joiners with two keys: a key is never reused across offers by construction
+    let (j1, j2) = (Joiner::new(&a).expect("joiner"), Joiner::new(&a).expect("joiner"));
+    assert_ne!(j1.joiner_pub(), j2.joiner_pub());
+    assert_eq!(j1.offer().c, Offer::parse(&a).expect("a").c);
 }
 
 #[test]
@@ -364,12 +389,16 @@ fn a_joiner_refuses_an_offer_that_is_already_expired() {
 enum Fake {
     /// `202` with an empty body.
     NoTag,
-    /// `202` with 32 wrong bytes.
+    /// `202` with the right reveal and 32 wrong tag bytes.
     WrongTag,
+    /// `202` with a reveal that is not the committed nonce, and a real tag over that reveal.
+    WrongReveal,
     /// A real tag, a payload sealed under another AAD.
     BadAad,
     /// A real tag and payload, but a master that is not the key file's.
     WrongMaster,
+    /// The first POST gets an empty `202`; the second (which must carry the identical body) gets a real one.
+    NoTagThenGood,
     /// The first POST connection is closed unanswered; then everything is honest.
     GoodAfterDrop,
 }
@@ -409,11 +438,13 @@ fn fake_offerer(mode: Fake) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (secret, pub_key) = pair::ephemeral().expect("ephemeral");
-    let offer = Offer { pub_key, s: [3; 16], id: [4; 16], exp: wall_clock() + 600, url: format!("http://{addr}") };
+    let n_o = [0x42u8; 32];
+    let offer = Offer { pub_key, c: pair::commit(&n_o), s: [3; 16], id: [4; 16], exp: wall_clock() + 600, url: format!("http://{addr}") };
     let text = offer.encode();
     std::thread::spawn(move || {
         let mut keys_t: Option<(Keys, [u8; pair::TRANSCRIPT_LEN])> = None;
         let mut dropped = false;
+        let mut first_body: Option<Vec<u8>> = None;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let Some((line, body)) = read_request(&mut stream) else { continue };
@@ -424,19 +455,29 @@ fn fake_offerer(mode: Fake) -> String {
                 }
                 let joiner_pub: [u8; 32] = body[..32].try_into().expect("32");
                 let shared = pair::dh(&secret, &joiner_pub).expect("dh");
-                let t = pair::transcript(&offer.pub_key, &joiner_pub, &offer.id, offer.exp);
+                let t = pair::transcript(&offer.pub_key, &joiner_pub, &offer.id, offer.exp, &offer.c);
                 let keys = Keys::derive(&shared, &offer.s, &t);
                 match mode {
+                    Fake::NoTagThenGood if first_body.is_none() => {
+                        first_body = Some(body.clone());
+                        answer(&mut stream, 202, b"");
+                        continue;
+                    }
+                    Fake::NoTagThenGood => {
+                        assert_eq!(first_body.as_deref(), Some(&body[..]), "the retry re-sends the identical body");
+                        answer(&mut stream, 202, &pair::offerer_reply(&keys, &n_o));
+                    }
                     Fake::NoTag => answer(&mut stream, 202, b""),
-                    Fake::WrongTag => answer(&mut stream, 202, &[9u8; 32]),
-                    _ => answer(&mut stream, 202, &pair::offerer_tag(&keys)),
+                    Fake::WrongTag => answer(&mut stream, 202, &[n_o.to_vec(), vec![9u8; 32]].concat()),
+                    Fake::WrongReveal => answer(&mut stream, 202, &pair::offerer_reply(&keys, &[0x43u8; 32])),
+                    _ => answer(&mut stream, 202, &pair::offerer_reply(&keys, &n_o)),
                 }
                 keys_t = Some((keys, t));
             } else if line.starts_with("GET") {
                 let sealed = keys_t.as_ref().map(|(keys, t)| match mode {
                     Fake::BadAad => pair::seal_payload(keys, b"another transcript", &master(), &key_file_bytes()),
                     Fake::WrongMaster => pair::seal_payload(keys, t, &[7u8; 32], &key_file_bytes()),
-                    Fake::GoodAfterDrop => pair::seal_payload(keys, t, &master(), &key_file_bytes()),
+                    Fake::GoodAfterDrop | Fake::NoTagThenGood => pair::seal_payload(keys, t, &master(), &key_file_bytes()),
                     _ => Vec::new(),
                 });
                 match sealed {
@@ -454,6 +495,7 @@ fn a_forged_202_shows_no_code_and_a_bad_payload_returns_nothing() {
     for (mode, want) in [
         (Fake::NoTag, PairError::BadTag),
         (Fake::WrongTag, PairError::BadTag),
+        (Fake::WrongReveal, PairError::BadTag),
         (Fake::BadAad, PairError::BadPayload),
         (Fake::WrongMaster, PairError::KeyFile("its key id is not the master's")),
     ] {
@@ -465,6 +507,20 @@ fn a_forged_202_shows_no_code_and_a_bad_payload_returns_nothing() {
         let expect_code = matches!(mode, Fake::BadAad | Fake::WrongMaster);
         assert_eq!(shown, expect_code, "the code is shown only after a verified tag");
     }
+}
+
+#[test]
+fn a_joiner_joined_again_after_a_failed_202_sends_the_same_body_and_succeeds() {
+    // 12-F's "Try again": one Joiner per offer, the same key and body on every join
+    let text = fake_offerer(Fake::NoTagThenGood);
+    let joiner = Joiner::new(&text).expect("joiner");
+    let mut codes = Vec::new();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(joiner.join(&mut |c| codes.push(c.to_string()), &cancel).err(), Some(PairError::BadTag));
+    assert!(codes.is_empty(), "no code on an empty 202");
+    let joined = joiner.join(&mut |c| codes.push(c.to_string()), &cancel).expect("second join");
+    assert_eq!(codes.len(), 1);
+    assert_eq!(*joined.master, master());
 }
 
 #[test]
@@ -500,7 +556,7 @@ fn a_joiner_that_fails_writes_nothing() {
 
 #[test]
 fn offer_debug_does_not_show_the_secret() {
-    let offer = Offer { pub_key: [1; 32], s: [0xab; 16], id: [2; 16], exp: 5, url: "http://x:1".into() };
+    let offer = Offer { pub_key: [1; 32], c: [6; 32], s: [0xab; 16], id: [2; 16], exp: 5, url: "http://x:1".into() };
     let shown = format!("{offer:?}");
     assert!(shown.contains("<redacted>"));
     assert!(!shown.contains("171") && !shown.contains(&hex::encode(offer.s)) && !shown.contains("ab, ab"), "{shown}");
@@ -708,7 +764,7 @@ fn start_offer_process(tmp: &Path, db: &Path) -> (Kill, BufReader<std::process::
         let _ = child.wait(); // no offer line: the bind lost the race
         child = spawn();
     }
-    assert!(line.starts_with("disconect-pair:v1."), "the offer text is the one stdout line");
+    assert!(line.starts_with("disconect-pair:v2."), "the offer text is the one stdout line");
     let stderr = BufReader::new(child.stderr.take().expect("stderr"));
     (Kill(child), stderr, line.trim().to_string())
 }
@@ -751,8 +807,9 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
     let join_out = joiner.stdout.take().expect("stdout");
     let joiner_code = code_in(&line_with(&mut join_err, "Code on this device"));
-    let mac_code = code_in(&line_with(&mut offer_err, "Code on the Mac"));
-    assert_eq!(joiner_code, mac_code);
+    // the offerer never prints its own code (ADR 0011 v2)
+    let answered = line_with(&mut offer_err, "A device answered");
+    assert!(!answered.chars().any(|c| c.is_ascii_digit()), "{answered}");
     line_with(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "released");
@@ -799,8 +856,10 @@ fn pair_offer_with_the_wrong_digits_aborts_and_the_joiner_ends_without_a_store()
         .spawn()
         .expect("spawn join");
     joiner.stdin.take().expect("stdin").write_all(format!("{offer}\n").as_bytes()).expect("offer");
-    let mac = code_in(&line_with(&mut offer_err, "Code on the Mac"));
-    let wrong = format!("{:06}", (mac.parse::<u32>().expect("digits") + 1) % 1_000_000);
+    let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
+    let code = code_in(&line_with(&mut join_err, "Code on this device"));
+    line_with(&mut offer_err, "A device answered");
+    let wrong = format!("{:06}", (code.parse::<u32>().expect("digits") + 1) % 1_000_000);
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{wrong}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "the codes differ");
     line_with(&mut offer_err, "offer ended; serving the relay");

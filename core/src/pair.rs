@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Bet 12-E slice 1: the pure pairing protocol (ADR 0011). No network, no filesystem.
+//! Bet 12-E slice 1, protocol v2 since 12-G: the pure pairing protocol (ADR 0011 as amended). No network,
+//! no filesystem.
 //!
-//! Offer text, transcript, key schedule, both confirmation tags, the short authentication string and
-//! the payload seal/open. The labels and layouts are frozen in `docs/kb/24-wire-constants.md`
-//! ("Pairing vectors (Bet 12-E)"); changing one breaks every paired device.
+//! Offer text (with the offerer's commitment to its SAS nonce), transcript, key schedule, both confirmation
+//! tags, the offerer's reveal, the short authentication string and the payload seal/open. The labels and
+//! layouts are frozen in `docs/kb/24-wire-constants.md` ("Pairing vectors (Bet 12-E, v2)"); changing one
+//! breaks every paired device.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,21 +14,24 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::keys::Secret32;
 
 /// Prefix of the offer text (what the QR carries).
-pub const OFFER_PREFIX: &str = "disconect-pair:v1.";
+pub const OFFER_PREFIX: &str = "disconect-pair:v2.";
 /// Transcript label and HKDF domain of the pairing protocol.
-pub const LABEL: &str = "disconect/pair/v1";
-pub const LABEL_CONFIRM: &str = "disconect/pair/v1/confirm";
-pub const LABEL_OFFERER: &str = "disconect/pair/v1/offerer";
-pub const LABEL_SAS: &str = "disconect/pair/v1/sas";
-pub const LABEL_PAYLOAD: &str = "disconect/pair/v1/payload";
-/// HMAC messages (each under its own subkey).
+pub const LABEL: &str = "disconect/pair/v2";
+pub const LABEL_CONFIRM: &str = "disconect/pair/v2/confirm";
+pub const LABEL_OFFERER: &str = "disconect/pair/v2/offerer";
+pub const LABEL_SAS: &str = "disconect/pair/v2/sas";
+pub const LABEL_PAYLOAD: &str = "disconect/pair/v2/payload";
+/// The commitment's domain: `c = SHA-256(LABEL_COMMIT || N_o)` (12-G).
+pub const LABEL_COMMIT: &str = "disconect/pair/v2/commit";
+/// HMAC messages (each under its own subkey; the offerer's and the SAS's are followed by `N_o`).
 pub const MSG_CONFIRM: &[u8] = b"confirm";
 pub const MSG_OFFERER: &[u8] = b"offerer";
 pub const MSG_SAS: &[u8] = b"sas";
@@ -34,10 +39,12 @@ pub const MSG_SAS: &[u8] = b"sas";
 pub const EXPIRY_S: u64 = 900;
 /// The joiner's POST body: `joiner_pub (32) || joiner_tag (32)`.
 pub const JOIN_BODY_LEN: usize = 64;
-/// The offerer's `202` body: its tag.
+/// The offerer's tag inside its `202` body.
 pub const OFFERER_TAG_LEN: usize = 32;
-/// `LABEL (17) || 0x00 || offer_pub || joiner_pub || id || exp (8 B BE)`.
-pub const TRANSCRIPT_LEN: usize = LABEL.len() + 1 + 32 + 32 + 16 + 8;
+/// The offerer's `202` body: `N_o (32) || HMAC(K_offerer, "offerer" || N_o) (32)`.
+pub const OFFERER_REPLY_LEN: usize = 32 + OFFERER_TAG_LEN;
+/// `LABEL (17) || 0x00 || offer_pub || joiner_pub || id || exp (8 B BE) || c (32)`: 138 bytes, `c` last.
+pub const TRANSCRIPT_LEN: usize = LABEL.len() + 1 + 32 + 32 + 16 + 8 + 32;
 
 /// Why a pairing step was refused. Never carries the offer text or any secret.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -46,7 +53,7 @@ pub enum PairError {
     BadOffer(&'static str),
     #[error("the shared secret is not contributory (low-order public key)")]
     NonContributory,
-    #[error("bad confirmation tag")]
+    #[error("the offerer did not confirm")]
     BadTag,
     #[error("bad payload")]
     BadPayload,
@@ -80,6 +87,8 @@ pub enum PairError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Offer {
     pub pub_key: [u8; 32],
+    /// The offerer's commitment to its SAS nonce, [`commit`] of the `N_o` it reveals in the `202`.
+    pub c: [u8; 32],
     pub s: [u8; 16],
     pub id: [u8; 16],
     pub exp: u64,
@@ -91,6 +100,7 @@ impl std::fmt::Debug for Offer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Offer")
             .field("pub_key", &self.pub_key)
+            .field("c", &self.c)
             .field("s", &"<redacted>")
             .field("id", &self.id)
             .field("exp", &self.exp)
@@ -105,6 +115,7 @@ struct RawOffer {
     v: u64,
     #[serde(rename = "pub")]
     pub_hex: String,
+    c: String,
     s: String,
     id: String,
     exp: u64,
@@ -205,13 +216,14 @@ fn label_ok(label: &str) -> bool {
 }
 
 impl Offer {
-    /// `disconect-pair:v1.` + base64url (no padding) of the compact JSON, keys in the order
-    /// v, pub, s, id, exp, url.
+    /// `disconect-pair:v2.` + base64url (no padding) of the compact JSON, keys in the order
+    /// v, pub, c, s, id, exp, url.
     pub fn encode(&self) -> String {
         let url = serde_json::to_string(&self.url).unwrap_or_default();
         let json = format!(
-            "{{\"v\":1,\"pub\":\"{}\",\"s\":\"{}\",\"id\":\"{}\",\"exp\":{},\"url\":{}}}",
+            "{{\"v\":2,\"pub\":\"{}\",\"c\":\"{}\",\"s\":\"{}\",\"id\":\"{}\",\"exp\":{},\"url\":{}}}",
             hex::encode(self.pub_key),
+            hex::encode(self.c),
             hex::encode(self.s),
             hex::encode(self.id),
             self.exp,
@@ -220,8 +232,8 @@ impl Offer {
         format!("{OFFER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json.as_bytes()))
     }
 
-    /// Strict parse: prefix, unpadded canonical base64url, exactly the six keys (a duplicate or unknown
-    /// key is refused by serde), `v == 1`, lowercase hex of exact lengths, integer `exp`, a
+    /// Strict parse: prefix, unpadded canonical base64url, exactly the seven keys (a duplicate or unknown
+    /// key is refused by serde), `v == 2`, lowercase hex of exact lengths, integer `exp`, a
     /// `http://host:port` URL in the kb/24 grammar (see [`check_offer_url`]).
     pub fn parse(text: &str) -> Result<Offer, PairError> {
         let body = text
@@ -234,13 +246,14 @@ impl Offer {
             .decode(body)
             .map_err(|_| PairError::BadOffer("not base64url"))?;
         let raw: RawOffer = serde_json::from_slice(&json)
-            .map_err(|_| PairError::BadOffer("not the six-key offer object"))?;
-        if raw.v != 1 {
+            .map_err(|_| PairError::BadOffer("not the seven-key offer object"))?;
+        if raw.v != 2 {
             return Err(PairError::BadOffer("unsupported version"));
         }
         check_offer_url(&raw.url)?;
         Ok(Offer {
             pub_key: hex_exact::<32>(&raw.pub_hex)?,
+            c: hex_exact::<32>(&raw.c)?,
             s: hex_exact::<16>(&raw.s)?,
             id: hex_exact::<16>(&raw.id)?,
             exp: raw.exp,
@@ -249,12 +262,14 @@ impl Offer {
     }
 }
 
-/// `LABEL || 0x00 || offer_pub || joiner_pub || id || exp (8 B big-endian)`.
+/// `LABEL || 0x00 || offer_pub || joiner_pub || id || exp (8 B big-endian) || c` (`c` last, although it
+/// follows `pub` in the offer JSON).
 pub fn transcript(
     offer_pub: &[u8; 32],
     joiner_pub: &[u8; 32],
     id: &[u8; 16],
     exp: u64,
+    c: &[u8; 32],
 ) -> [u8; TRANSCRIPT_LEN] {
     let mut out = [0u8; TRANSCRIPT_LEN];
     let mut at = 0;
@@ -265,11 +280,28 @@ pub fn transcript(
         joiner_pub,
         id,
         &exp.to_be_bytes(),
+        c,
     ] {
         out[at..at + part.len()].copy_from_slice(part);
         at += part.len();
     }
     out
+}
+
+/// `c = SHA-256("disconect/pair/v2/commit" || N_o)`: the offerer's commitment to its 32-byte SAS nonce,
+/// published in the offer; `N_o` itself is a secret until the join is bound.
+pub fn commit(n_o: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(LABEL_COMMIT.as_bytes());
+    h.update(n_o);
+    h.finalize().into()
+}
+
+/// A fresh 32-byte SAS nonce for an offer.
+pub fn fresh_nonce() -> Result<Zeroizing<[u8; 32]>, PairError> {
+    let mut n_o = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *n_o).map_err(|_| PairError::Random)?;
+    Ok(n_o)
 }
 
 /// A fresh ephemeral X25519 key pair: the private half from `getrandom`.
@@ -342,9 +374,41 @@ pub fn joiner_tag(keys: &Keys) -> [u8; 32] {
     tag(&keys.confirm, MSG_CONFIRM)
 }
 
-/// `HMAC-SHA256(K_offerer, "offerer")`, sent by the offerer in its `202`.
-pub fn offerer_tag(keys: &Keys) -> [u8; 32] {
-    tag(&keys.offerer, MSG_OFFERER)
+fn offerer_msg(n_o: &[u8; 32]) -> [u8; MSG_OFFERER.len() + 32] {
+    let mut m = [0u8; MSG_OFFERER.len() + 32];
+    m[..MSG_OFFERER.len()].copy_from_slice(MSG_OFFERER);
+    m[MSG_OFFERER.len()..].copy_from_slice(n_o);
+    m
+}
+
+/// `HMAC-SHA256(K_offerer, "offerer" || N_o)` (a 39-byte message), the tag in the offerer's `202`.
+pub fn offerer_tag(keys: &Keys, n_o: &[u8; 32]) -> [u8; 32] {
+    tag(&keys.offerer, &offerer_msg(n_o))
+}
+
+/// The offerer's `202` body: `N_o || offerer_tag` (64 bytes).
+pub fn offerer_reply(keys: &Keys, n_o: &[u8; 32]) -> [u8; OFFERER_REPLY_LEN] {
+    let mut reply = [0u8; OFFERER_REPLY_LEN];
+    reply[..32].copy_from_slice(n_o);
+    reply[32..].copy_from_slice(&offerer_tag(keys, n_o));
+    reply
+}
+
+/// The joiner's check of the offerer's `202` body, returning `N_o`: exactly 64 bytes, then the reveal
+/// matches the offer's commitment `c`, then the tag verifies — in that order, each in constant time. The
+/// joiner shows no code unless all three pass. The commitment check is the critical one (it is what keeps
+/// the offerer's nonce unchangeable once the joiner's key is known) and is never dropped because the tag
+/// also covers `N_o`.
+pub fn open_offerer_reply(keys: &Keys, c: &[u8; 32], body: &[u8]) -> Result<[u8; 32], PairError> {
+    if body.len() != OFFERER_REPLY_LEN {
+        return Err(PairError::BadTag);
+    }
+    let n_o: [u8; 32] = body[..32].try_into().map_err(|_| PairError::BadTag)?;
+    if !bool::from(commit(&n_o).ct_eq(c)) {
+        return Err(PairError::BadTag);
+    }
+    verify_offerer_tag(keys, &n_o, &body[32..])?;
+    Ok(n_o)
 }
 
 /// Constant-time check of the joiner's tag.
@@ -354,16 +418,19 @@ pub fn verify_joiner_tag(keys: &Keys, got: &[u8]) -> Result<(), PairError> {
         .map_err(|_| PairError::BadTag)
 }
 
-/// Constant-time check of the offerer's tag.
-pub fn verify_offerer_tag(keys: &Keys, got: &[u8]) -> Result<(), PairError> {
-    mac(&keys.offerer, MSG_OFFERER)
+/// Constant-time check of the offerer's tag over `N_o` (callers go through [`open_offerer_reply`]).
+pub fn verify_offerer_tag(keys: &Keys, n_o: &[u8; 32], got: &[u8]) -> Result<(), PairError> {
+    mac(&keys.offerer, &offerer_msg(n_o))
         .verify_slice(got)
         .map_err(|_| PairError::BadTag)
 }
 
-/// The raw SAS: first 4 bytes of `HMAC-SHA256(K_sas, "sas")` big-endian, mod 10^6.
-pub fn sas(keys: &Keys) -> u32 {
-    let t = tag(&keys.sas, MSG_SAS);
+/// The raw SAS: first 4 bytes of `HMAC-SHA256(K_sas, "sas" || N_o)` (a 35-byte message) big-endian, mod 10^6.
+pub fn sas(keys: &Keys, n_o: &[u8; 32]) -> u32 {
+    let mut m = [0u8; MSG_SAS.len() + 32];
+    m[..MSG_SAS.len()].copy_from_slice(MSG_SAS);
+    m[MSG_SAS.len()..].copy_from_slice(n_o);
+    let t = tag(&keys.sas, &m);
     u32::from_be_bytes([t[0], t[1], t[2], t[3]]) % 1_000_000
 }
 
@@ -413,10 +480,9 @@ pub fn open_payload(
 
 #[cfg(test)]
 mod wire_constants {
-    //! Known-answer vectors (docs/kb/24-wire-constants.md "Pairing vectors (Bet 12-E)"); the Python
+    //! Known-answer vectors (docs/kb/24-wire-constants.md "Pairing vectors (Bet 12-E, v2)"); the Python
     //! oracle is written from ADR 0011's text, not from this file.
     use super::*;
-    use sha2::Digest;
     use std::path::Path;
 
     const ALICE_PRIV: &str = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
@@ -426,23 +492,24 @@ mod wire_constants {
     const DH_HEX: &str = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
     const EXP: u64 = 1_700_000_900;
     const URL: &str = "http://127.0.0.1:8321";
-    const OFFER_TEXT: &str = "disconect-pair:v1.eyJ2IjoxLCJwdWIiOiI4NTIwZjAwOTg5MzBhNzU0NzQ4YjdkZGNiNDNlZjc1YTBkYmYzYTBkMjYzODFhZjRlYmE0YTk4ZWFhOWI0ZTZhIiwicyI6IjAwMDEwMjAzMDQwNTA2MDcwODA5MGEwYjBjMGQwZTBmIiwiaWQiOiIxMDExMTIxMzE0MTUxNjE3MTgxOTFhMWIxYzFkMWUxZiIsImV4cCI6MTcwMDAwMDkwMCwidXJsIjoiaHR0cDovLzEyNy4wLjAuMTo4MzIxIn0";
-    const TRANSCRIPT_HEX: &str = "646973636f6e6563742f706169722f7631008520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6ade9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f101112131415161718191a1b1c1d1e1f000000006553f484";
-    const K_HEX: &str = "ced06a2f9929a397d15f1eed614939527cbf65a1b87ead87d92bf714d083a96d";
-    const K_CONFIRM: &str = "43bc5e1b2ddf975af5927e7391ce2d818820340955e5ca9149502b5114b4e288";
-    const K_OFFERER: &str = "280ec7743588865a0236e5c91676b85e97f32f5c729ac4588c018c718681ee59";
-    const K_SAS: &str = "fb7bf7c18b7584b942d3a33e4a792be0f0ae57e64ab5bf06c255508f381ee41f";
-    const K_PAYLOAD: &str = "fed979831974c36409bc0eb9bffcd486aa43cb5c8e0c39fd970311d9a2a14dc5";
-    const JOINER_TAG: &str = "c01f965e6760e8a34c78782384e65b8a03d759347479c0872c161e39bc10eb50";
-    const OFFERER_TAG: &str = "19052201486a1adea5232cae76e49ae810cabfd4910646a1d5545a29431bfffc";
-    const SAS_RAW: u32 = 686_008;
-    const SAS_TEXT: &str = "686008";
+    const C_HEX: &str = "2c08e0bd71af02fba14734f4b59043959d66c04a2e1a12defb09dbd127697930";
+    const OFFER_TEXT: &str = "disconect-pair:v2.eyJ2IjoyLCJwdWIiOiI4NTIwZjAwOTg5MzBhNzU0NzQ4YjdkZGNiNDNlZjc1YTBkYmYzYTBkMjYzODFhZjRlYmE0YTk4ZWFhOWI0ZTZhIiwiYyI6IjJjMDhlMGJkNzFhZjAyZmJhMTQ3MzRmNGI1OTA0Mzk1OWQ2NmMwNGEyZTFhMTJkZWZiMDlkYmQxMjc2OTc5MzAiLCJzIjoiMDAwMTAyMDMwNDA1MDYwNzA4MDkwYTBiMGMwZDBlMGYiLCJpZCI6IjEwMTExMjEzMTQxNTE2MTcxODE5MWExYjFjMWQxZTFmIiwiZXhwIjoxNzAwMDAwOTAwLCJ1cmwiOiJodHRwOi8vMTI3LjAuMC4xOjgzMjEifQ";
+    const TRANSCRIPT_HEX: &str = "646973636f6e6563742f706169722f7632008520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6ade9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f101112131415161718191a1b1c1d1e1f000000006553f4842c08e0bd71af02fba14734f4b59043959d66c04a2e1a12defb09dbd127697930";
+    const K_HEX: &str = "042ab2cd8fdd674d708af0e38242bca48e3d8223d769240fa5236596df173cae";
+    const K_CONFIRM: &str = "ade5e5ac831e2c078ac5ff75e8f29fabaaf4b85b97ede4d782de3e7a014d1bd1";
+    const K_OFFERER: &str = "5879aadcb2e23ffeab104838fa5324e5f3ae7183ca924fab9c433e6fa1ec1a26";
+    const K_SAS: &str = "35dd953a91fbacfbfcf705fa7195101bbc84f949093fa6ff0e45d5a03eee4a14";
+    const K_PAYLOAD: &str = "cf3239ae77e6b39c37128c877751f47f2bea3ca7190d50d0eddfdf9b710507f4";
+    const JOINER_TAG: &str = "f75be896e432534bae6eaf9d00c55ea4b4a33deb5a9de7cbb38daad14aba009f";
+    const OFFERER_TAG: &str = "5410268e5d3b5b62d787ef89c94d374e1b143bd57ff5b498f10e614b72f66d74";
+    const SAS_RAW: u32 = 658_698;
+    const SAS_TEXT: &str = "658698";
     const KEY_FILE_SHA: &str = "cd538c0cddf607a878a8424c3dcbbd58f9e2ba54529b550f18f813f446b01190";
     const SEALED_LEN: usize = 683;
-    const SEALED_SHA: &str = "6c682055dea98d3a4c341f35f2022d54bb7b7d9488ffdc4d97efacb92f8ba8ba";
-    const LEAD_ID: &str = "202122232425262728292a2b2c2d2e2f";
-    const LEAD_SAS: u32 = 6182;
-    const LEAD_TEXT: &str = "006182";
+    const SEALED_SHA: &str = "aabbdb81b8207c224001bd2906c4e98eca196c7f65adc52b54d797e36e7b754b";
+    const LEAD_ID: &str = "2a2122232425262728292a2b2c2d2e2f";
+    const LEAD_SAS: u32 = 47_069;
+    const LEAD_TEXT: &str = "047069";
 
     fn h<const N: usize>(x: &str) -> [u8; N] {
         hex::decode(x).expect("hex").try_into().expect("length")
@@ -453,13 +520,16 @@ mod wire_constants {
     fn id() -> [u8; 16] {
         std::array::from_fn(|i| 0x10 + i as u8)
     }
+    fn n_o() -> [u8; 32] {
+        std::array::from_fn(|i| 0x30 + i as u8)
+    }
     fn offer() -> Offer {
-        Offer { pub_key: h(ALICE_PUB), s: s(), id: id(), exp: EXP, url: URL.into() }
+        Offer { pub_key: h(ALICE_PUB), c: h(C_HEX), s: s(), id: id(), exp: EXP, url: URL.into() }
     }
     fn keys_for(id: &[u8; 16]) -> (Keys, [u8; TRANSCRIPT_LEN]) {
         let a = StaticSecret::from(h::<32>(ALICE_PRIV));
         let d = dh(&a, &h(BOB_PUB)).expect("dh");
-        let t = transcript(&h(ALICE_PUB), &h(BOB_PUB), id, EXP);
+        let t = transcript(&h(ALICE_PUB), &h(BOB_PUB), id, EXP, &h(C_HEX));
         (Keys::derive(&d, &s(), &t), t)
     }
     fn key_file() -> Vec<u8> {
@@ -472,19 +542,20 @@ mod wire_constants {
     fn offer_text_of(json: &str) -> String {
         format!("{OFFER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
     }
-    const GOOD_FIELDS: &str = r#""pub":"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a","s":"000102030405060708090a0b0c0d0e0f","id":"101112131415161718191a1b1c1d1e1f","exp":1700000900,"url":"http://127.0.0.1:8321""#;
+    const GOOD_FIELDS: &str = r#""pub":"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a","c":"2c08e0bd71af02fba14734f4b59043959d66c04a2e1a12defb09dbd127697930","s":"000102030405060708090a0b0c0d0e0f","id":"101112131415161718191a1b1c1d1e1f","exp":1700000900,"url":"http://127.0.0.1:8321""#;
 
     #[test]
     fn labels_are_frozen_verbatim() {
-        assert_eq!(OFFER_PREFIX, "disconect-pair:v1.");
-        assert_eq!(LABEL, "disconect/pair/v1");
-        assert_eq!(LABEL_CONFIRM, "disconect/pair/v1/confirm");
-        assert_eq!(LABEL_OFFERER, "disconect/pair/v1/offerer");
-        assert_eq!(LABEL_SAS, "disconect/pair/v1/sas");
-        assert_eq!(LABEL_PAYLOAD, "disconect/pair/v1/payload");
+        assert_eq!(OFFER_PREFIX, "disconect-pair:v2.");
+        assert_eq!(LABEL, "disconect/pair/v2");
+        assert_eq!(LABEL_CONFIRM, "disconect/pair/v2/confirm");
+        assert_eq!(LABEL_OFFERER, "disconect/pair/v2/offerer");
+        assert_eq!(LABEL_SAS, "disconect/pair/v2/sas");
+        assert_eq!(LABEL_PAYLOAD, "disconect/pair/v2/payload");
+        assert_eq!(LABEL_COMMIT, "disconect/pair/v2/commit");
         assert_eq!((MSG_CONFIRM, MSG_OFFERER, MSG_SAS), (&b"confirm"[..], &b"offerer"[..], &b"sas"[..]));
         assert_eq!(EXPIRY_S, 900);
-        assert_eq!((JOIN_BODY_LEN, OFFERER_TAG_LEN, TRANSCRIPT_LEN), (64, 32, 106));
+        assert_eq!((JOIN_BODY_LEN, OFFERER_TAG_LEN, OFFERER_REPLY_LEN, TRANSCRIPT_LEN), (64, 32, 64, 138));
     }
 
     #[test]
@@ -502,8 +573,45 @@ mod wire_constants {
         assert_eq!(offer().encode(), OFFER_TEXT);
         assert_eq!(Offer::parse(OFFER_TEXT).expect("parse"), offer());
         let (_, public) = ephemeral().expect("ephemeral");
-        let o = Offer { pub_key: public, s: [7; 16], id: [9; 16], exp: 5, url: "http://[::1]:1".into() };
+        let o = Offer { pub_key: public, c: [8; 32], s: [7; 16], id: [9; 16], exp: 5, url: "http://[::1]:1".into() };
         assert_eq!(Offer::parse(&o.encode()).expect("round trip"), o);
+        assert_eq!(OFFER_TEXT.len(), 388);
+    }
+
+    #[test]
+    fn commitment_vector_and_fresh_nonces() {
+        assert_eq!(hex::encode(commit(&n_o())), C_HEX);
+        assert_eq!(commit(&n_o()), <[u8; 32]>::from(Sha256::digest([LABEL_COMMIT.as_bytes(), &n_o()[..]].concat())));
+        let (a, b) = (fresh_nonce().expect("nonce"), fresh_nonce().expect("nonce"));
+        assert_ne!(*a, *b);
+        assert_ne!(commit(&a), commit(&b));
+    }
+
+    #[test]
+    fn the_offerer_reply_opens_to_the_nonce_and_every_forgery_is_refused() {
+        let (k, _) = keys_for(&id());
+        let good = offerer_reply(&k, &n_o());
+        assert_eq!(hex::encode(&good[32..]), OFFERER_TAG);
+        assert_eq!(open_offerer_reply(&k, &h(C_HEX), &good), Ok(n_o()));
+        let other: [u8; 32] = std::array::from_fn(|i| 0x50 + i as u8);
+        let (k2, _) = keys_for(&h(LEAD_ID));
+        let mut wrong_tag = good;
+        wrong_tag[32] ^= 1;
+        let mut wrong_reveal_right_tag = good;
+        wrong_reveal_right_tag[..32].copy_from_slice(&other);
+        for (name, body) in [
+            ("32 bytes", good[..32].to_vec()),
+            ("96 bytes", [good.to_vec(), vec![0u8; 32]].concat()),
+            ("empty", Vec::new()),
+            ("wrong reveal, tag over it", offerer_reply(&k, &other).to_vec()),
+            ("wrong reveal, right tag", wrong_reveal_right_tag.to_vec()),
+            ("right reveal, wrong tag", wrong_tag.to_vec()),
+            ("another session's reply", offerer_reply(&k2, &n_o()).to_vec()),
+        ] {
+            assert_eq!(open_offerer_reply(&k, &h(C_HEX), &body), Err(PairError::BadTag), "{name}");
+        }
+        // the offer promised another nonce
+        assert_eq!(open_offerer_reply(&k, &commit(&other), &good), Err(PairError::BadTag));
     }
 
     #[test]
@@ -516,21 +624,22 @@ mod wire_constants {
         assert_eq!(hex::encode(*k.sas), K_SAS);
         assert_eq!(hex::encode(*k.payload), K_PAYLOAD);
         assert_eq!(hex::encode(joiner_tag(&k)), JOINER_TAG);
-        assert_eq!(hex::encode(offerer_tag(&k)), OFFERER_TAG);
-        assert_eq!(sas(&k), SAS_RAW);
-        assert_eq!(sas_text(sas(&k)), SAS_TEXT);
+        assert_eq!(hex::encode(offerer_tag(&k, &n_o())), OFFERER_TAG);
+        assert_eq!(sas(&k, &n_o()), SAS_RAW);
+        assert_eq!(sas_text(sas(&k, &n_o())), SAS_TEXT);
         assert!(verify_joiner_tag(&k, &h::<32>(JOINER_TAG)).is_ok());
-        assert!(verify_offerer_tag(&k, &h::<32>(OFFERER_TAG)).is_ok());
+        assert!(verify_offerer_tag(&k, &n_o(), &h::<32>(OFFERER_TAG)).is_ok());
         assert_eq!(verify_joiner_tag(&k, &h::<32>(OFFERER_TAG)), Err(PairError::BadTag));
-        assert_eq!(verify_offerer_tag(&k, &h::<32>(JOINER_TAG)), Err(PairError::BadTag));
+        assert_eq!(verify_offerer_tag(&k, &n_o(), &h::<32>(JOINER_TAG)), Err(PairError::BadTag));
+        assert_eq!(verify_offerer_tag(&k, &[0u8; 32], &h::<32>(OFFERER_TAG)), Err(PairError::BadTag));
         assert_eq!(verify_joiner_tag(&k, &[0u8; 31]), Err(PairError::BadTag));
     }
 
     #[test]
     fn leading_zero_sas() {
         let (k, _) = keys_for(&h(LEAD_ID));
-        assert_eq!(sas(&k), LEAD_SAS);
-        assert_eq!(sas_text(sas(&k)), LEAD_TEXT);
+        assert_eq!(sas(&k, &n_o()), LEAD_SAS);
+        assert_eq!(sas_text(sas(&k, &n_o())), LEAD_TEXT);
         assert_eq!(sas_text(0), "000000");
     }
 
@@ -584,7 +693,7 @@ mod wire_constants {
         let vectors: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).expect("fixture")).expect("json");
         let fields = |url: &str| GOOD_FIELDS.replace("http://127.0.0.1:8321", url);
-        let obj = |fields: &str| format!("{{\"v\":1,{fields}}}");
+        let obj = |fields: &str| format!("{{\"v\":2,{fields}}}");
         let accepted = vectors["accepted"].as_array().expect("accepted");
         assert!(accepted.len() >= 12);
         for url in accepted {
@@ -618,13 +727,17 @@ mod wire_constants {
     #[test]
     fn negative_offers_are_refused() {
         let bad = |json: String| assert!(matches!(Offer::parse(&offer_text_of(&json)), Err(PairError::BadOffer(_))), "{json}");
-        let obj = |fields: &str| format!("{{\"v\":1,{fields}}}");
+        let obj = |fields: &str| format!("{{\"v\":2,{fields}}}");
         // the good object parses (guards the helper)
         assert!(Offer::parse(&offer_text_of(&obj(GOOD_FIELDS))).is_ok());
         bad(obj(&GOOD_FIELDS.replace("8520f0098930", "8520F0098930")));
         bad(obj(&format!("{GOOD_FIELDS},\"pub\":\"{}\"", ALICE_PUB)));
         bad(obj(&format!("{GOOD_FIELDS},\"extra\":1")));
-        bad(format!("{{\"v\":2,{GOOD_FIELDS}}}"));
+        bad(format!("{{\"v\":1,{GOOD_FIELDS}}}"));
+        // the commitment: upper case, short, missing
+        bad(obj(&GOOD_FIELDS.replace("2c08e0bd71af", "2C08E0BD71AF")));
+        bad(obj(&GOOD_FIELDS.replace("2c08e0bd71af", "2c08e0bd71")));
+        bad(obj(&GOOD_FIELDS.replace(",\"c\":\"2c08e0bd71af02fba14734f4b59043959d66c04a2e1a12defb09dbd127697930\"", "")));
         bad(obj(&GOOD_FIELDS.replace("8321", "0")));
         bad(obj(&GOOD_FIELDS.replace(":8321", "")));
         bad(obj(&GOOD_FIELDS.replace("http://", "https://")));
@@ -640,7 +753,7 @@ mod wire_constants {
             padded_len.push('=');
         }
         assert!(matches!(Offer::parse(&padded_len), Err(PairError::BadOffer(_))));
-        assert!(Offer::parse(&OFFER_TEXT.replace("v1", "v2")).is_err());
+        assert!(Offer::parse(&OFFER_TEXT.replace("v2", "v1")).is_err());
         assert!(Offer::parse("").is_err());
     }
 }

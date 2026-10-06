@@ -37,6 +37,8 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ryu = "1.0.23"
 getrandom = "0.4"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+# constant-time compare of the pairing commitment (already in the tree through the dalek crates)
+subtle = "2"
 ureq = { version = "3", default-features = false }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 if-addrs = "0.15.0"

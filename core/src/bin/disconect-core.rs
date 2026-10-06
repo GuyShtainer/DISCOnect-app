@@ -557,7 +557,10 @@ fn offer_session(handle: &PairHandle, master: &[u8; 32], key_file_bytes: &[u8]) 
             _ => "the offer expired".to_string(),
         });
     };
-    eprintln!("Code on the Mac: {sas:06}");
+    // the offerer never shows its own code (ADR 0011 v2): a user who typed a visible offerer code into a
+    // planted offer's victim would release the key with no guess at all
+    let _ = sas;
+    eprintln!("A device answered.");
     eprintln!("Type the code shown on the other device:");
     let mut line = Zeroizing::new(String::new());
     let _ = std::io::stdin().read_line(&mut line);

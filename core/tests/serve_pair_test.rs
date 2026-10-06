@@ -308,7 +308,7 @@ fn the_first_pull_succeeds_with_keep_off_and_the_server_stops_at_expiry() {
     let reply = live.call("pair.offer", json!({"listen": listen}));
     let result = reply["result"].clone();
     assert_eq!(result["url"], format!("http://{listen}"));
-    assert!(result["offer"].as_str().expect("offer").starts_with("disconect-pair:v1."));
+    assert!(result["offer"].as_str().expect("offer").starts_with("disconect-pair:v2."));
     assert!(result["expires_at"].as_u64().expect("expires_at") > 0);
     // the push's two progress events came before the answer
     let position = |state: &str| {

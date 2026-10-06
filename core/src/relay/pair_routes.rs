@@ -4,8 +4,8 @@
 //!
 //! * `POST /v1/pair/<id>`: the joiner's 64-byte body. The declared length is checked before any body
 //!   byte is read (anything but exactly 64 is `400`, nothing read). Wrong tag `401` (the slot is
-//!   untouched), the first valid join binds and answers `202` with the offerer's 32-byte tag, the same
-//!   public key again gets the identical `202`, a different one aborts the slot (`410`).
+//!   untouched), the first valid join binds and answers `202` with the offerer's 64-byte reply (its revealed
+//!   SAS nonce and its tag), the same public key again gets the identical `202`, a different one aborts the slot (`410`).
 //! * `GET /v1/pair/<id>/payload`: `202` until the offerer released, then `200` + the cached sealed
 //!   payload on every request; `410` once aborted or expired.
 //!
@@ -21,8 +21,9 @@ use x25519_dalek::StaticSecret;
 use super::lan::wall_clock;
 use super::lan_server::Reply;
 use crate::pair::{
-    self, EXPIRY_S, JOIN_BODY_LEN, Keys, Offer, PairError, TRANSCRIPT_LEN, sas_text,
+    self, EXPIRY_S, JOIN_BODY_LEN, Keys, OFFERER_REPLY_LEN, Offer, PairError, TRANSCRIPT_LEN, sas_text,
 };
+use zeroize::Zeroizing;
 
 /// The route prefix of the pairing API.
 pub const PAIR: &str = "/v1/pair";
@@ -33,7 +34,8 @@ struct Bound {
     transcript: [u8; TRANSCRIPT_LEN],
     keys: Keys,
     sas: u32,
-    offerer_tag: [u8; 32],
+    /// The `202` body (`N_o || tag`), answered again to the same joiner key.
+    reply: [u8; OFFERER_REPLY_LEN],
     /// Sealed exactly once, on release; served on every later GET.
     sealed: Option<Vec<u8>>,
 }
@@ -61,6 +63,9 @@ pub struct OfferSlot {
     offer: Offer,
     /// Dropped (`None`) once the offer ended, aborted or expired.
     secret: Option<StaticSecret>,
+    /// The SAS nonce the offer committed to: a secret until the bind reveals it in the `202`; wiped with
+    /// the ephemeral secret when the offer ends. Never in an event, a log or a status answer.
+    n_o: Zeroizing<[u8; 32]>,
     state: SlotState,
     /// Set by the payload route on the first `200`.
     delivered: bool,
@@ -70,6 +75,7 @@ impl OfferSlot {
     /// The offer ended: drop the offerer's ephemeral secret and every derived key.
     fn end(&mut self, state: SlotState) {
         self.secret = None;
+        *self.n_o = [0u8; 32];
         self.state = state;
     }
 
@@ -111,11 +117,13 @@ impl PairOffer {
     /// [`PairOffer::new`] with an explicit clock (tests).
     pub fn new_at(listen_url: &str, now: u64) -> Result<(String, PairHandle), PairError> {
         let (secret, pub_key) = pair::ephemeral()?;
+        let n_o = pair::fresh_nonce()?;
         let (mut s, mut id) = ([0u8; 16], [0u8; 16]);
         getrandom::fill(&mut s).map_err(|_| PairError::Random)?;
         getrandom::fill(&mut id).map_err(|_| PairError::Random)?;
         let offer = Offer {
             pub_key,
+            c: pair::commit(&n_o),
             s,
             id,
             exp: now + EXPIRY_S,
@@ -128,6 +136,7 @@ impl PairOffer {
             slot: Mutex::new(OfferSlot {
                 offer,
                 secret: Some(secret),
+                n_o,
                 state: SlotState::Open,
                 delivered: false,
             }),
@@ -334,14 +343,14 @@ fn join(shared: &PairShared, declared_len: Option<usize>, body: &mut dyn Read, n
     let Ok(shared_secret) = pair::dh(secret, &joiner_pub) else {
         return bare(401); // a low-order key is a wrong tag
     };
-    let transcript = pair::transcript(&slot.offer.pub_key, &joiner_pub, &slot.offer.id, slot.offer.exp);
+    let transcript = pair::transcript(&slot.offer.pub_key, &joiner_pub, &slot.offer.id, slot.offer.exp, &slot.offer.c);
     let keys = Keys::derive(&shared_secret, &slot.offer.s, &transcript);
     if pair::verify_joiner_tag(&keys, tag).is_err() {
         return bare(401); // the slot is untouched
     }
     match &slot.state {
         SlotState::Bound(bound) if bound.joiner_pub == joiner_pub => {
-            return bytes(202, bound.offerer_tag.to_vec());
+            return bytes(202, bound.reply.to_vec());
         }
         SlotState::Bound(_) => {
             slot.end(SlotState::Aborted);
@@ -351,19 +360,20 @@ fn join(shared: &PairShared, declared_len: Option<usize>, body: &mut dyn Read, n
         }
         _ => {}
     }
-    let offerer_tag = pair::offerer_tag(&keys);
-    let sas = pair::sas(&keys);
+    // the bind reveals N_o: from here it is in the reply, not a secret
+    let reply = pair::offerer_reply(&keys, &slot.n_o);
+    let sas = pair::sas(&keys, &slot.n_o);
     slot.state = SlotState::Bound(Box::new(Bound {
         joiner_pub,
         transcript,
         keys,
         sas,
-        offerer_tag,
+        reply,
         sealed: None,
     }));
     drop(slot);
     shared.changed.notify_all();
-    bytes(202, offerer_tag.to_vec())
+    bytes(202, reply.to_vec())
 }
 
 fn payload(shared: &PairShared, declared_len: Option<usize>, now: u64) -> Reply {
