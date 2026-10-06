@@ -1,0 +1,3 @@
+# read only when cargo runs from this directory (kit KB 03)
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "18.1"
