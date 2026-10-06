@@ -1038,6 +1038,11 @@ pub struct StatusReport {
     pub conflicts: i64,
     pub superseded: i64,
     pub gaps: Vec<Gap>,
+    /// `noted_at` of the newest applied pushed bundle: a push that moved nothing books no bundle,
+    /// so this is "last data sent", not "last attempt". `None` until the first.
+    pub last_pushed_at: Option<String>,
+    /// The same for pulled bundles: "last data received".
+    pub last_pulled_at: Option<String>,
 }
 
 pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
@@ -1073,7 +1078,18 @@ pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
             "SELECT count(*) FROM (SELECT DISTINCT stream, source_key, payload_hash FROM raw_superseded)",
         )?,
         gaps: gaps(conn)?,
+        last_pushed_at: last_applied(conn, "pushed")?,
+        last_pulled_at: last_applied(conn, "pulled")?,
     })
+}
+
+/// `max(noted_at)` of the applied bundles in one direction, `None` when there is none.
+fn last_applied(conn: &Connection, direction: &str) -> Result<Option<String>, SyncError> {
+    Ok(conn.query_row(
+        "SELECT max(noted_at) FROM relay_bundles WHERE status='applied' AND direction=?",
+        [direction],
+        |r| r.get::<_, Option<String>>(0),
+    )?)
 }
 
 /// `status` for a store that may predate the relay tables (schema 1 or 2, never synced): the same
@@ -1094,6 +1110,8 @@ pub fn status_or_fresh(conn: &Connection) -> Result<StatusReport, SyncError> {
         conflicts: 0,
         superseded: 0,
         gaps: Vec::new(),
+        last_pushed_at: None,
+        last_pulled_at: None,
     })
 }
 
@@ -1116,6 +1134,8 @@ pub fn status_value(report: &StatusReport) -> serde_json::Value {
         "conflicts": report.conflicts,
         "superseded": report.superseded,
         "gaps": gaps,
+        "last_pushed_at": report.last_pushed_at,
+        "last_pulled_at": report.last_pulled_at,
     })
 }
 

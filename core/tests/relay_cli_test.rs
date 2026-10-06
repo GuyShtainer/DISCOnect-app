@@ -113,10 +113,11 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
 
     let status = cli.run(&b, &["sync", "status"]);
     assert_eq!(code(&status), 0);
-    assert_eq!(
-        stdout(&status).trim(),
-        "relay: pushed 0, pulled 1, rejected 0; records unsent 0, seen 2; conflicts 0; gaps 0"
-    );
+    let line = stdout(&status).trim().to_string();
+    assert!(line.starts_with(
+        "relay: pushed 0, pulled 1, rejected 0; records unsent 0, seen 2; conflicts 0; gaps 0; last push never, last pull 20"
+    ));
+    assert!(line.ends_with('Z'));
     let report: Value =
         serde_json::from_str(&stdout(&cli.run(&b, &["--json", "sync", "status"]))).expect("json");
     assert_eq!(report["bundles"]["pulled_applied"], 1);
