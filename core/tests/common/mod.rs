@@ -27,3 +27,21 @@ pub fn encrypted_copy() -> (tempfile::TempDir, PathBuf) {
 
 pub mod convergence;
 pub mod decoded_cmp;
+
+/// Put back, after `Command::env_clear()`, the three variables a child needs to start inside the iOS
+/// simulator. Measured 2026-10-06 (12-C, bisected on `cli_import_into_a_moved_legacy_folder...`):
+/// `DYLD_ROOT_PATH` alone is not enough (without it dyld aborts: "DYLD_ROOT_PATH not set for simulator
+/// program"; with it alone the child still dies with SIGTRAP in `libsystem_featureflags`), and that library
+/// also needs `SIMULATOR_ROOT` and `SIMULATOR_SHARED_RESOURCES_DIRECTORY`. Every other `DYLD_*`,
+/// `SIMULATOR_*`, `TMPDIR` and `__CF_*` name stayed cleared and was not needed. Only on `target_os = "ios"`;
+/// elsewhere a no-op, so the desktop tests are unchanged.
+pub fn simulator_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    if cfg!(target_os = "ios") {
+        for name in ["DYLD_ROOT_PATH", "SIMULATOR_ROOT", "SIMULATOR_SHARED_RESOURCES_DIRECTORY"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
+    cmd
+}

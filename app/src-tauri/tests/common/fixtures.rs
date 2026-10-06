@@ -32,7 +32,9 @@ pub fn answers(store: &'static str) -> Vec<Answer> {
     let script: Value =
         serde_json::from_slice(&std::fs::read(fixtures().join("script.json")).expect("script.json")).expect("json");
     let entries = script["entries"].as_array().expect("entries");
-    let out = Command::new("gunzip")
+    // The simulator's PATH has no gunzip; the Mac's `/usr/bin/gunzip` is reachable by absolute path.
+    let gunzip = if cfg!(target_os = "ios") { "/usr/bin/gunzip" } else { "gunzip" };
+    let out = Command::new(gunzip)
         .arg("-c")
         .arg(fixtures().join(format!("oracle-{store}.jsonl.gz")))
         .output()

@@ -3,6 +3,10 @@
 //! the passphrase env never reaches the child, and `key.unlock` is refused on the plain path.
 //! The real core is covered by `real_core.rs` (ignored by default; needs a scratch DB).
 
+// The child-process bridge (`Sidecar::start`) exists on desktop only; a phone runs the core in-process
+// (see `inproc.rs`), so on iOS this file compiles to nothing (12-C, structural).
+#![cfg(desktop)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

@@ -288,6 +288,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(target_os = "ios", ignore = "the BLE lab is a desktop checkout feature: it needs projects/ble-lab/.venv, which this worktree does not carry and a phone never has")]
     fn the_lab_is_found_next_to_the_app_in_a_debug_build_and_never_in_release() {
         let found = lab_program();
         if cfg!(debug_assertions) {
@@ -367,8 +368,10 @@ mod tests {
         }
     }
 
+    #[cfg(desktop)]
     struct NoSink;
 
+    #[cfg(desktop)]
     impl EventSink for NoSink {
         fn emit(&self, _name: &str, _payload: Value) {}
     }

@@ -12,7 +12,25 @@
 //! test imports that folder through the bridge on copy A and through the CLI on an identical copy
 //! B, and the counts must agree (acceptance item 3).
 
+// The child-process bridge (`Sidecar::start`) exists on desktop only; a phone runs the core in-process
+// (see `inproc.rs`), so on iOS this file compiles to nothing (12-C, structural).
+#![cfg(desktop)]
+
 use std::path::PathBuf;
+/// After `Command::env_clear()`: put back the three variables a child needs to start inside the iOS
+/// simulator (bisected 2026-10-06, 12-C: `DYLD_ROOT_PATH`, `SIMULATOR_ROOT`, `SIMULATOR_SHARED_RESOURCES_DIRECTORY`;
+/// see `disconect-core/tests/common/mod.rs`). A no-op off iOS.
+fn simulator_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    if cfg!(target_os = "ios") {
+        for name in ["DYLD_ROOT_PATH", "SIMULATOR_ROOT", "SIMULATOR_SHARED_RESOURCES_DIRECTORY"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
+    cmd
+}
+
 use std::sync::{Arc, Mutex};
 
 use disconect_app_lib::sidecar::{EventSink, Launch, Sidecar};
@@ -122,9 +140,10 @@ async fn import_through_the_bridge_matches_the_cli() {
 
     // The CLI on an identical copy, unlocked through the tests-only env path (never in the app).
     let pass_text = Zeroizing::new(std::fs::read_to_string(&pass_file).unwrap().trim_end().to_string());
-    let out = std::process::Command::new(&program)
-        .args(["cli", "--db", &b, "import", &source])
-        .env_clear()
+    let mut cli = std::process::Command::new(&program);
+    cli.args(["cli", "--db", &b, "import", &source]).env_clear();
+    simulator_env(&mut cli);
+    let out = cli
         .env("HOME", std::env::var("HOME").unwrap())
         .env("PATH", "/usr/bin:/bin")
         .env("PYTHON_KEYRING_BACKEND", "keyring.backends.null.Keyring")

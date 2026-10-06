@@ -106,7 +106,9 @@ fn inproc_lines(db: &Path, input: &str) -> Vec<String> {
 }
 
 fn core_binary() -> PathBuf {
-    let bin = repo().join("projects/disconect-core/target/debug/disconect-core");
+    // On iOS the comparison binary is the simulator build of the core (a macOS one cannot run there).
+    let triple = if cfg!(target_os = "ios") { "aarch64-apple-ios-sim/" } else { "" };
+    let bin = repo().join(format!("projects/disconect-core/target/{triple}debug/disconect-core"));
     assert!(
         bin.is_file(),
         "build the sidecar to compare with: cargo build in projects/disconect-core"
@@ -114,13 +116,27 @@ fn core_binary() -> PathBuf {
     bin
 }
 
+/// After `Command::env_clear()`: put back the three variables a child needs to start inside the iOS
+/// simulator (bisected 2026-10-06, 12-C: `DYLD_ROOT_PATH`, `SIMULATOR_ROOT`, `SIMULATOR_SHARED_RESOURCES_DIRECTORY`;
+/// see `disconect-core/tests/common/mod.rs`). A no-op off iOS.
+fn simulator_env(cmd: &mut Command) -> &mut Command {
+    if cfg!(target_os = "ios") {
+        for name in ["DYLD_ROOT_PATH", "SIMULATOR_ROOT", "SIMULATOR_SHARED_RESOURCES_DIRECTORY"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
+    cmd
+}
+
 /// `disconect-core --db DB` (serve), the way `serve_diff.py` runs it: controlled environment.
 fn sidecar_lines(db: &Path, input: &str) -> Vec<String> {
     let home = std::env::temp_dir().join(format!("disconect-inproc-home-{}", std::process::id()));
-    let mut child = Command::new(core_binary())
-        .arg("--db")
-        .arg(db)
-        .env_clear()
+    let mut command = Command::new(core_binary());
+    command.arg("--db").arg(db).env_clear();
+    simulator_env(&mut command);
+    let mut child = command
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
         .env("DISCONECT_NOW", NOW)

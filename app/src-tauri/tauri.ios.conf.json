@@ -3,6 +3,9 @@
   "productName": "DISCOnect",
   "identifier": "org.disconect.app.dev",
   "bundle": {
-    "resources": []
+    "resources": [],
+    "iOS": {
+      "minimumSystemVersion": "18.1"
+    }
   }
 }

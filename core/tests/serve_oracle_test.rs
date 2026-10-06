@@ -10,6 +10,8 @@
 //! more (the last named allowance, `kb23-fromisoformat-permissive`, was retired on 2026-10-03: both cores
 //! take `last_day` as strict `YYYY-MM-DD`), so every other entry must match the oracle exactly.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -172,8 +174,10 @@ fn replay(store_file: &str, oracle_file: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("store.db");
     std::fs::copy(fixtures().join(store_file), &db).expect("copy store");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_disconect-core"))
-        .env_clear()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_disconect-core"));
+    command.env_clear();
+    common::simulator_env(&mut command);
+    let mut child = command
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", dir.path())
         .env("TZ", "Pacific/Chatham")
