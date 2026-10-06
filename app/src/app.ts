@@ -3,7 +3,7 @@
 // computes health facts itself; colours come from tokens only (see app.css / charts.ts).
 import * as core from "./core";
 import qrcode from "qrcode-generator";
-import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord } from "./identity";
+import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord, metricHue } from "./identity";
 import { disposeCharts, drawTrend, hatchedDays, showTipOn, type Series } from "./charts";
 
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
@@ -430,9 +430,21 @@ async function screenToday(out: ParentNode): Promise<void> {
   }
 }
 
+/** The metric's hue class (decision 13): sets --hue on a card or a dot; "" when the metric has no group. */
+function hueClass(metric: string): string {
+  const g = metricHue(metric);
+  return g ? ` hue-${g}` : "";
+}
+/** A dot in the metric's hue, before its name. */
+function hueDot(metric: string): HTMLElement {
+  const d = el("span", `huedot${hueClass(metric)}`);
+  d.setAttribute("aria-hidden", "true");
+  return d;
+}
+
 /** One Today value card: label and scope on top, the value (muted when it is from an earlier day), then the day. */
 function todayCard(row: TodayRow, todayDay: string): HTMLElement {
-  const card = el("div", "card vcard");
+  const card = el("div", `card vcard${hueClass(row.metric)}`);
   const top = el("span", "caption muted top");
   top.append(document.createTextNode(metricLabel(row.metric)), scopeTag(row.scope));
   card.append(top);
@@ -620,7 +632,7 @@ async function screenWatch(out: ParentNode, later: Later): Promise<void> {
   liveNodes.values.clear();
   liveNodes.since.clear();
   for (const metric of LIVE_ORDER) {
-    const tile = el("div", "card vcard");
+    const tile = el("div", `card vcard${hueClass(metric)}`);
     const top = el("span", "caption top");
     top.append(el("span", "muted", metricLabel(metric)), el("span", "scope-live", scopeWord("live")));
     tile.append(top);
@@ -1165,7 +1177,7 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   }
   range.onchange = () => { trendDays = Number(range.value); void route(); };
   header(out, trendLabel(trendMetric), "");
-  controls.append(select, range);
+  controls.append(hueDot(trendMetric), select, range);
   out.append(controls);
 
   // The window ends on the latest day any metric has data, so an archive still draws.
@@ -1902,7 +1914,7 @@ async function screenHealth(out: ParentNode): Promise<void> {
     const block = el("div");
     const top = el("div", "row body");
     const name = el("span");
-    name.append(document.createTextNode(`${metricLabel(r.metric)} `), scopeTag(r.source_scope));
+    name.append(hueDot(r.metric), document.createTextNode(`${metricLabel(r.metric)} `), scopeTag(r.source_scope));
     if (r.sparse) name.append(el("span", "caption muted", " sparse"));
     top.append(name);
     const words: string[] = [];
@@ -2596,7 +2608,7 @@ void (async () => {
   const h = args.indexOf("--health-days");
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
   const th = args.indexOf("--theme"); // evidence runs and trials: force a palette (pastel follows the system scheme)
-  if (th >= 0 && ["pastel", "light", "dark", "pastel-light", "pastel-dark"].includes(args[th + 1])) document.documentElement.dataset.theme = args[th + 1];
+  if (th >= 0 && ["pastel", "light", "dark", "pastel-light", "pastel-dark", "classic", "classic-light", "classic-dark"].includes(args[th + 1])) document.documentElement.dataset.theme = args[th + 1];
   const sc = args.indexOf("--scroll"); // evidence runs: scroll the drawn screen
   if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric

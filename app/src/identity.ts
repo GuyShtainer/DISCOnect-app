@@ -189,3 +189,20 @@ export function neutralText(text: string): string {
   for (const [key, words] of SCORE_NAMES) out = plain(out, key, words, "g");
   return out;
 }
+
+/** The metric hue group of a metric id (tokens --hue-<group>): a mark on cards and before names, never a series colour.
+ * Vendor readiness and training figures are "fitness" before any other word in their id can claim them. */
+const HUE_RULES: [string, RegExp][] = [
+  ["fitness", /vo2|training|readiness|endurance|fitness|recovery/],
+  ["sleep", /sleep|nap/],
+  ["heart", /heart|resting_hr|hrv/],
+  ["energy", /energy|body_battery/],
+  ["stress", /stress/],
+  ["breath", /respiration|spo2|pulse_ox/],
+  ["activity", /step|distance|floor|calor|metabolic|active|intensity/],
+  ["body", /weight|hydration|sweat/],
+];
+export function metricHue(id: string): string | null {
+  for (const [group, re] of HUE_RULES) if (re.test(id)) return group;
+  return null;
+}

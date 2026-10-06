@@ -131,6 +131,11 @@ label.choice input { width: 20px; height: 20px; margin: 0; }
 .livemark { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--live); font-size: 12px; line-height: 16px; font-weight: 600; }
 .unit { font-family: var(--font-sans); font-size: 12px; line-height: 16px; font-weight: 400; color: var(--ink-muted); }
 .vcard .caption.top { display: flex; justify-content: space-between; gap: var(--space-2); }
+/* metric hues (decision 13): a class sets --hue, the card edge and the name dot read it; text never does */
+.hue-activity { --hue: var(--hue-activity); } .hue-heart { --hue: var(--hue-heart); } .hue-energy { --hue: var(--hue-energy); } .hue-stress { --hue: var(--hue-stress); }
+.hue-breath { --hue: var(--hue-breath); } .hue-sleep { --hue: var(--hue-sleep); } .hue-fitness { --hue: var(--hue-fitness); } .hue-body { --hue: var(--hue-body); }
+.vcard { border-left: 4px solid var(--hue, var(--hairline)); }
+.huedot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--hue, var(--ink-muted)); flex: none; margin-right: var(--space-2); vertical-align: middle; }
 .notlist { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-1) var(--space-6); }
 .notlist > span { display: flex; justify-content: space-between; gap: var(--space-2); min-height: 28px; align-items: center; border-bottom: 1px solid var(--hairline); font-size: 14px; line-height: 20px; }
 .notlist > span > .caption { flex: 0 1 auto; text-align: right; }
