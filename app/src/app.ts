@@ -141,10 +141,11 @@ function drawerOpen(): boolean {
   return nav.hasAttribute("data-open");
 }
 function setDrawer(open: boolean, returnFocus = true): void {
-  if (open === drawerOpen()) return;
+  if (open === drawerOpen() || (open && !narrow.matches)) return;
   if (open) nav.setAttribute("data-open", ""); else nav.removeAttribute("data-open");
   scrim.hidden = !open;
   main.inert = open;
+  topbar.inert = open;
   menuButton.setAttribute("aria-expanded", String(open));
   if (open) focusDrawer();
   else if (returnFocus) menuButton.focus();
@@ -157,7 +158,10 @@ menuButton.addEventListener("click", () => setDrawer(!drawerOpen()));
 scrim.addEventListener("click", () => setDrawer(false));
 nav.addEventListener("click", (e) => { if ((e.target as HTMLElement).closest("a")) setDrawer(false); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && drawerOpen()) { e.preventDefault(); setDrawer(false); } });
-narrow.addEventListener("change", () => { if (!narrow.matches) setDrawer(false, false); });
+narrow.addEventListener("change", () => {
+  if (!narrow.matches) setDrawer(false, false);
+  else if (nav.contains(document.activeElement)) menuButton.focus();
+});
 
 function renderNav(): void {
   nav.replaceChildren();
@@ -165,8 +169,10 @@ function renderNav(): void {
   for (const g of GROUPS) {
     const box = el("div", "navgroup");
     box.setAttribute("role", "group");
-    box.setAttribute("aria-label", g);
-    box.append(el("div", "group muted", g));
+    const cap = el("div", "group caption muted", g);
+    cap.id = `group-${g.toLowerCase().replace(/[^a-z]+/g, "-")}`;
+    box.setAttribute("aria-labelledby", cap.id);
+    box.append(cap);
     for (const s of SCREENS) {
       if (s.group !== g || (s.id === "support" && !supportShown)) continue;
       const a = el("a", "", s.title) as HTMLAnchorElement;
@@ -2439,7 +2445,10 @@ async function screenSupport(out: ParentNode): Promise<void> {
 }
 
 // ---- Boot -------------------------------------------------------------------------------
-window.addEventListener("hashchange", () => void route());
+window.addEventListener("hashchange", () => {
+  if (drawerOpen()) setDrawer(false);
+  void route();
+});
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 void core.onCoreEvent("restarted", () => {
   if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core stopped; the offer is gone.", error: true });

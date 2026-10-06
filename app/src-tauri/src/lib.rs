@@ -94,6 +94,36 @@ fn mcp_command(app: tauri::AppHandle) -> String {
     }
 }
 
+/// Release filter: drop every `--debug-*` flag and, unless it is one of the flags that take no operand,
+/// the operand after it (so `--debug-window 390x844` leaves nothing behind).
+fn release_args(args: Vec<String>) -> Vec<String> {
+    const NO_OPERAND: [&str; 3] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open"];
+    let mut out = Vec::new();
+    let mut it = args.into_iter().peekable();
+    while let Some(a) = it.next() {
+        if !a.starts_with("--debug-") {
+            out.push(a);
+        } else if !NO_OPERAND.contains(&a.as_str()) && it.peek().is_some_and(|n| !n.starts_with("--")) {
+            it.next();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod release_args_tests {
+    use super::release_args;
+
+    #[test]
+    fn a_release_build_drops_debug_flags_with_their_operands() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let window = concat!("--debug-", "window");
+        assert_eq!(release_args(v(&[window, "390x844", "--screen", "today"])), v(&["--screen", "today"]));
+        assert_eq!(release_args(v(&["--screen", "today", "--debug-drawer-open", "--theme", "dark"])), v(&["--screen", "today", "--theme", "dark"]));
+        assert_eq!(release_args(v(&["--debug-listen", "127.0.0.1:9", "--debug-drop-over"])), v(&[]));
+    }
+}
+
 /// The app's own argv (after the executable), so the UI can honour `--screen <id>`.
 #[tauri::command]
 fn launch_args() -> Vec<String> {
@@ -101,7 +131,7 @@ fn launch_args() -> Vec<String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // a release build ignores the debug flags even when they are typed on the command line
     if !cfg!(debug_assertions) {
-        args.retain(|a| !a.starts_with("--debug-"));
+        args = release_args(args);
     }
     // Evidence runs, debug builds only: `DISCONECT_DEBUG_DROP_OVER=1` reaches the page as `--debug-drop-over`
     // (the Import screen draws its drop cards in the hovered state).
@@ -258,7 +288,7 @@ fn drag_over(app: &tauri::AppHandle, over: bool) {
     let _ = app.emit("core://drag", serde_json::json!({ "over": over }));
 }
 
-/// `--debug-window <W>x<H>` from argv: both sides whole numbers of 1 to 4 digits, 300 to 4000 px; anything else is ignored.
+/// `--debug-window <W>x<H>` from argv: both sides whole numbers of 1 to 4 digits, width 390 to 4000 px and height 600 to 4000 px (the window's minimums); anything else is ignored.
 #[cfg(debug_assertions)]
 fn debug_window_size(args: &[String]) -> Option<(f64, f64)> {
     let at = args.iter().position(|a| a == "--debug-window")?;
@@ -268,7 +298,7 @@ fn debug_window_size(args: &[String]) -> Option<(f64, f64)> {
         return None;
     }
     let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
-    ((300..=4000).contains(&w) && (300..=4000).contains(&h)).then_some((f64::from(w), f64::from(h)))
+    ((390..=4000).contains(&w) && (600..=4000).contains(&h)).then_some((f64::from(w), f64::from(h)))
 }
 
 /// The main window is declared in `tauri.conf.json` with `"create": false` and built here, after the core

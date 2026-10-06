@@ -593,7 +593,7 @@ fn the_page_hears_a_drag_only_as_a_bare_over_flag_and_a_release_build_drops_debu
     }
     // a release build ignores `--debug-*` typed on the command line
     let args = lib.split("fn launch_args()").nth(1).expect("launch_args").split("\n}\n").next().expect("body");
-    let at = args.find("args.retain(|a| !a.starts_with(\"--debug-\"))").expect("the filter");
+    let at = args.find("args = release_args(args)").expect("the filter");
     assert!(args[..at].trim_end().ends_with("if !cfg!(debug_assertions) {"), "the filter is release-only");
     // 7b-5: `--debug-window` sets the window size only inside a debug-only item, and only in the window build
     let door = "--debug-window";
