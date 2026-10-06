@@ -17,7 +17,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::keys::Secret32;
-use crate::relay::lan::parse_base_url;
 
 /// Prefix of the offer text (what the QR carries).
 pub const OFFER_PREFIX: &str = "disconect-pair:v1.";
@@ -122,21 +121,87 @@ fn hex_exact<const N: usize>(text: &str) -> Result<[u8; N], PairError> {
     Ok(out)
 }
 
-/// `http://host:port` exactly as `parse_base_url` returns it, with an explicit non-zero port.
+/// kb/24 § offer URL grammar: exactly `http://` host `:` port — host an IPv4 address (four octets
+/// 0..=255 without a leading zero), a bracketed IPv6 address (lowercase hex groups, one `::` at most,
+/// no zone id) or a lowercase hostname (labels of `[a-z0-9-]`, no leading or trailing `-`, no trailing
+/// dot); port `1..=65535` without a leading zero; no userinfo, path, slash, query, fragment or space.
+/// The same grammar is `pair._check_url` in the Python oracle; the vectors are
+/// `tests/fixtures/pair-offer-urls.json` (both cores, and the phone's parser when it comes).
 fn check_offer_url(url: &str) -> Result<(), PairError> {
-    match parse_base_url(url) {
-        Ok(canon) if canon == url => {}
-        _ => return Err(PairError::BadOffer("the relay URL is not a canonical http://host:port")),
-    }
-    let rest = &url["http://".len()..];
-    let port = rest
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or(PairError::BadOffer("the relay URL is not http://host:port"))?;
+    let (host, port) = rest
         .rsplit_once(':')
-        .map(|(_, p)| p)
-        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.len() <= 5);
-    match port.and_then(|p| p.parse::<u32>().ok()) {
-        Some(1..=65535) => Ok(()),
-        _ => Err(PairError::BadOffer("the relay URL needs an explicit port in 1..=65535")),
+        .ok_or(PairError::BadOffer("the relay URL needs an explicit port"))?;
+    if !port_ok(port) {
+        return Err(PairError::BadOffer(
+            "the relay URL needs an explicit port in 1..=65535 without a leading zero",
+        ));
     }
+    if !host_ok(host) {
+        return Err(PairError::BadOffer(
+            "the relay URL host is not an IPv4 address, a bracketed IPv6 address or a lowercase hostname",
+        ));
+    }
+    Ok(())
+}
+
+fn port_ok(port: &str) -> bool {
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && !port.starts_with('0')
+        && port.parse::<u32>().is_ok_and(|n| n <= 65535)
+}
+
+fn host_ok(host: &str) -> bool {
+    if let Some(inner) = host.strip_prefix('[') {
+        return inner.strip_suffix(']').is_some_and(ipv6_ok);
+    }
+    if !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return ipv4_ok(host);
+    }
+    (1..=253).contains(&host.len()) && host.split('.').all(label_ok)
+}
+
+fn ipv4_ok(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|octet| {
+            !octet.is_empty()
+                && octet.bytes().all(|b| b.is_ascii_digit())
+                && (*octet == "0" || !octet.starts_with('0'))
+                && octet.parse::<u32>().is_ok_and(|n| n <= 255)
+        })
+}
+
+fn ipv6_ok(text: &str) -> bool {
+    if text.contains(":::") {
+        return false;
+    }
+    let halves: Vec<&str> = text.split("::").collect();
+    if halves.len() > 2 {
+        return false;
+    }
+    let groups: Vec<&str> = halves
+        .iter()
+        .filter(|half| !half.is_empty())
+        .flat_map(|half| half.split(':'))
+        .collect();
+    let group_ok = |g: &&str| {
+        (1..=4).contains(&g.len()) && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !groups.iter().all(group_ok) {
+        return false;
+    }
+    if halves.len() == 2 { groups.len() <= 7 } else { groups.len() == 8 }
+}
+
+fn label_ok(label: &str) -> bool {
+    (1..=63).contains(&label.len())
+        && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !label.starts_with('-')
+        && !label.ends_with('-')
 }
 
 impl Offer {
@@ -155,9 +220,9 @@ impl Offer {
         format!("{OFFER_PREFIX}{}", URL_SAFE_NO_PAD.encode(json.as_bytes()))
     }
 
-    /// Strict parse: prefix, unpadded base64url, exactly the six keys (a duplicate or unknown key is
-    /// refused by serde), `v == 1`, lowercase hex of exact lengths, integer `exp`, a canonical
-    /// `http://host:port` URL with a non-zero port.
+    /// Strict parse: prefix, unpadded canonical base64url, exactly the six keys (a duplicate or unknown
+    /// key is refused by serde), `v == 1`, lowercase hex of exact lengths, integer `exp`, a
+    /// `http://host:port` URL in the kb/24 grammar (see [`check_offer_url`]).
     pub fn parse(text: &str) -> Result<Offer, PairError> {
         let body = text
             .strip_prefix(OFFER_PREFIX)
@@ -508,6 +573,46 @@ mod wire_constants {
         assert_eq!(dh(&a, &[0u8; 32]).err(), Some(PairError::NonContributory));
         let order8 = h::<32>("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800");
         assert_eq!(dh(&a, &order8).err(), Some(PairError::NonContributory));
+    }
+
+    /// kb/24 § offer URL grammar: the vectors every parser of the offer text shares
+    /// (`projects/disconect/tests/fixtures/pair-offer-urls.json`).
+    #[test]
+    fn offer_url_vectors_are_shared_with_the_python_oracle() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../disconect/tests/fixtures/pair-offer-urls.json");
+        let vectors: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("fixture")).expect("json");
+        let fields = |url: &str| GOOD_FIELDS.replace("http://127.0.0.1:8321", url);
+        let obj = |fields: &str| format!("{{\"v\":1,{fields}}}");
+        let accepted = vectors["accepted"].as_array().expect("accepted");
+        assert!(accepted.len() >= 12);
+        for url in accepted {
+            let url = url.as_str().expect("url");
+            let offer = Offer::parse(&offer_text_of(&obj(&fields(url)))).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(offer.url, url);
+        }
+        let refused = vectors["refused"].as_object().expect("refused");
+        assert!(refused.len() >= 44);
+        for (name, url) in refused {
+            let url = url.as_str().expect("url");
+            assert!(
+                matches!(Offer::parse(&offer_text_of(&obj(&fields(url)))), Err(PairError::BadOffer(_))),
+                "{name} ({url}) must be refused"
+            );
+        }
+    }
+
+    /// Python's `urlsafe_b64decode` once accepted non-zero trailing bits; both cores refuse them now.
+    #[test]
+    fn non_canonical_base64url_trailing_bits_are_refused() {
+        let body_len = OFFER_TEXT.len() - OFFER_PREFIX.len();
+        assert!(!body_len.is_multiple_of(4), "the frozen vector ends in a partial group");
+        let mut text = OFFER_TEXT.to_string();
+        let last = text.pop().expect("last");
+        // index 1 or 2: non-zero low bits in a partial group
+        text.push(if last == 'B' { 'C' } else { 'B' });
+        assert!(matches!(Offer::parse(&text), Err(PairError::BadOffer(m)) if m.contains("base64url")));
     }
 
     #[test]
