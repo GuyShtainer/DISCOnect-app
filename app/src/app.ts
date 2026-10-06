@@ -227,20 +227,14 @@ function header(out: ParentNode, title: string, sub: string): void {
 }
 
 // ---- Today -----------------------------------------------------------------------------
-/** The live-link card: the day's sessions and, per folded metric, the median of the link's minutes, apart from
- *  every other scope. Nothing when no link was ever stored. Today's sessions when there are any, else the
- *  latest day with one (the health block's last day is a UTC date, so its local neighbour is tried too). */
-async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
-  const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
+/** The live-link card: today's sessions and, per folded metric, the median of the link's minutes, apart from
+ *  every other scope. Only on a day with a session (design decision 3): nothing when no link was ever stored
+ *  and nothing on a day without one — Data health counts every session. */
+async function liveCard(out: ParentNode, todayDay: string, health: Health | null): Promise<void> {
   const live = health?.live;
   if (!live || !live.records || !live.last_day) return;
-  let day: LiveDay | null = null;
-  for (const candidate of [todayDay, live.last_day, dayAfter(live.last_day)]) {
-    const found = await core.call<LiveDay>("data.live", { day: candidate }).catch(() => null);
-    if (found && found.sessions.length) { day = found; break; }
-    if (!day && found) day = found;
-  }
-  if (!day) return;
+  const day = await core.call<LiveDay>("data.live", { day: todayDay }).catch(() => null);
+  if (!day || !day.sessions.length) return;
   const card = el("section", "card");
   card.setAttribute("aria-label", "Live link");
   const row = el("div", "row");
@@ -252,10 +246,7 @@ async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
   const n = day.sessions.length;
   const spans = day.sessions.map((x) => `${clock(x.start_local)}–${clock(x.end_local, x.start_local)}`).join(", ");
   const minutes = day.sessions.reduce((acc, x) => acc + x.minutes, 0);
-  const when = day.day === todayDay ? "today" : `latest ${day.day}`;
-  card.append(el("span", "caption muted", n
-    ? `${n} ${n === 1 ? "session" : "sessions"} · ${spans} · ${minutes} min · ${when}`
-    : `No session ${when === "today" ? "today" : `on ${day.day}`} · ${live.records} session records stored`));
+  card.append(el("span", "caption muted", `${n} ${n === 1 ? "session" : "sessions"} today · ${spans} · ${minutes} min`));
   const grid = el("div", "grid3 body live-grid");
   for (const m of day.metrics) {
     if (!m.minutes || m.median === null) continue;
@@ -266,7 +257,7 @@ async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
     grid.append(el("span", "muted caption", `median over ${m.minutes} min`));
   }
   card.append(grid);
-  card.append(el("span", "caption muted", "Medians of the minutes the watch sent while the link ran. Kept apart from the device's own figures and never combined with them. Data health lists every session."));
+  card.append(el("span", "caption muted", "Medians of the minutes the watch sent while the link ran. Kept apart from the device's own figures and never combined with them. Data health counts every session."));
   out.append(card);
 }
 
@@ -276,16 +267,19 @@ function clock(local: string, sameDayAs?: string): string {
   return sameDayAs && local.slice(0, 10) !== sameDayAs.slice(0, 10) ? `${local.slice(0, 10)} ${time}` : time;
 }
 
-function dayAfter(day: string): string {
-  const d = new Date(`${day}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString().slice(0, 10);
-}
-
 async function screenToday(out: ParentNode): Promise<void> {
-  const [today, facts] = await Promise.all([core.call<Today>("data.today"), core.call<Facts>("data.facts", { days: 7, baseline_days: 28 })]);
+  const [today, facts, health] = await Promise.all([
+    core.call<Today>("data.today"),
+    core.call<Facts>("data.facts", { days: 7, baseline_days: 28 }),
+    core.call<Health>("data.health", { window_days: 7 }).catch(() => null),
+  ]);
   header(out, "Today", today.day);
-  await liveCard(out, today.day);
+  if (health?.never_imported) {
+    // design pass 2026-10-06, states: a banner, not the empty value list (review N15)
+    out.append(bannerEl("Nothing imported yet", "Import with the command line for now: disconect import <export zip | watch folder>. Every screen fills from the first import."));
+    return;
+  }
+  await liveCard(out, today.day, health);
   // Design pass 2026-10-06 (decision 2): the device and local figures first, a value from an earlier day
   // muted with its date; the vendor cloud's figures in a closed drawer; pairs never stored as a list.
   const fresh = today.metrics.filter((r) => r.value !== null && r.scope !== "vendor_cloud");
@@ -377,6 +371,7 @@ let liveRunning = false;
 let liveSeq = 0; // the current link's number: a stored event of another link is ignored
 let liveStored: string | null = null; // what the sweep of the readings folder said after the last link ended
 let liveReadings = 0; // reading lines since this link started
+let liveReached = 0; // furthest step done while this link ran (review N3: a failed connect never shows "connected" as done)
 let liveClock: number | null = null; // ms epoch of the first "connected" status or first reading of this link
 let liveStopAt: number | null = null; // when this link was first drawn as stopped: the clock freezes there
 let liveNavShown = false;
@@ -402,11 +397,13 @@ const LIVE_UNITS: Record<string, string> = { heart_rate: "bpm", steps: "steps", 
 
 /** Which of the four steps is done / current, from the existing state. */
 function liveStep(): { done: number; now: number } {
-  if (liveStatus === "stopped") return { done: 3, now: 4 };
-  if (liveReadings > 0) return { done: 2, now: 3 };
-  if (liveStatus === "connected") return { done: 1, now: 2 };
-  if (liveStatus === "starting" || liveStatus === "scanning" || liveStatus === "connecting") return { done: 0, now: 1 };
-  return { done: 0, now: 0 };
+  if (liveStatus === "stopped") return liveReached >= 2 ? { done: 3, now: 4 } : { done: liveReached, now: 0 };
+  const step = liveReadings > 0 ? { done: 2, now: 3 }
+    : liveStatus === "connected" ? { done: 1, now: 2 }
+    : liveStatus === "starting" || liveStatus === "scanning" || liveStatus === "connecting" ? { done: 0, now: 1 }
+    : { done: 0, now: 0 };
+  liveReached = Math.max(liveReached, step.done);
+  return step;
 }
 
 function liveStepText(n: number): string {
@@ -471,6 +468,7 @@ async function toggleLive(): Promise<void> {
     } else {
       liveLatest.clear();
       liveReadings = 0;
+      liveReached = 0;
       liveClock = null;
       liveStop = null;
       liveStored = null;
@@ -628,10 +626,14 @@ function onPairEvent(payload: unknown): void {
   }
 }
 function onRelayEvent(payload: unknown): void {
-  const p = payload as { state?: string };
+  const p = payload as { state?: string; reason?: string };
   if (p.state !== "stopped") return;
-  if (pairOffer || pairPhase !== "idle") endOfferState({ text: "This Mac's address changed; the relay stopped. Start over on the new address.", error: true });
-  else relayStoppedNote = true;
+  // "offer_ended": the server followed the offer's lifetime rule (expiry or the linger after an end) — the pair
+  // event already told the story, so only the "Serving at" line goes (review N4); "address_gone": the watcher
+  if (p.reason === "address_gone") {
+    if (pairOffer || pairPhase !== "idle") endOfferState({ text: "This Mac's address changed; the relay stopped. Start over on the new address.", error: true });
+    else relayStoppedNote = true;
+  }
   syncRedraw();
 }
 function onSyncProgress(payload: unknown): void {
@@ -747,7 +749,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   if (hostOfUrl) chosenIp = hostOfUrl;
   else if (debugListen && chosenIp === null && addrs?.addresses.some((a) => a.ip === debugListen?.ip)) chosenIp = debugListen.ip;
   if (addrs && !addrs.addresses.some((a) => a.ip === chosenIp)) chosenIp = addrs.addresses[0]?.ip ?? null;
-  const redraw = (): void => { void route(); };
+  const redraw = syncRedraw; // re-routes only while the Sync screen is on (review S3)
 
   const addressSelect = (): HTMLSelectElement => {
     const select = el("select") as HTMLSelectElement;
@@ -869,7 +871,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     back.href = "#/sync";
     out.append(back);
     if (pairEnding) out.append(bannerEl(pairEnding.text, "", pairEnding.error));
-    if (pairNoDevice) out.append(bannerEl("Nothing yet", "No device has reached this Mac yet. If macOS asked about incoming connections, allow them; both devices must be on the same network."));
+    if (pairNoDevice) out.append(bannerEl("Nothing yet", "No device has reached this Mac yet. If the system asked about incoming connections, allow them; both devices must be on the same network."));
     if (addrErr) out.append(bannerEl(addrErr.code, addrErr.message, true));
     const grid = el("div", "card pair");
     const left = el("div", "field");
@@ -897,7 +899,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       start.disabled = !listen() || syncRun.running;
       start.onclick = () => void startOffer();
       left.append(start);
-      left.append(el("p", "caption muted", "Other devices on this network can reach the relay while the offer is open. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
+      left.append(el("p", "caption muted", "Other devices on this network can reach the relay while the offer is open. Use it only on a network you trust. The system may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
     }
     const right = el("div", "field");
     const reached = pairPhase === "bound" || pairPhase === "released" || pairPhase === "done" || serving?.offer === "bound";
@@ -949,23 +951,23 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   const card = el("section", "card");
   card.append(el("h2", "heading", "Relay"));
   const kv = el("dl", "kv");
-  kv.append(el("dt", "", "Kind"), el("dd", "", statusErr?.code === "not_found" ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
+  // sync.status answers on a store with no relay; only relay.addresses says not_found (review S1)
+  const noRelay = addrErr?.code === "not_found";
+  kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
   card.append(kv);
-  if (statusErr?.code === "not_found") {
-    card.append(el("p", "caption muted", "Set with the command line: disconect sync push --relay <folder> --remember"));
-  } else if (statusErr) {
-    out.append(bannerEl(statusErr.code, statusErr.message, true));
-  }
+  if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync push --relay <folder> --remember"));
+  if (statusErr) out.append(bannerEl(statusErr.code, statusErr.message, true));
   if (status && addrs) {
     const sw = el("label", "switch");
-    sw.append(el("span", "", "Serve the relay on this network"));
+    sw.append(el("span", "", "Keep serving while the app runs"));
     const box = el("input") as HTMLInputElement;
     box.type = "checkbox";
     box.checked = serving?.keep === true;
     box.onchange = () => { box.disabled = true; void setServing(box.checked); };
     sw.append(box);
     card.append(sw, addressSelect());
-  } else if (status && addrErr) {
+    card.append(el("p", "caption muted", "Off, the relay serves only while an offer is open. The switch resets when the app quits."));
+  } else if (status && addrErr && !noRelay) {
     card.append(el("p", "caption muted", `${addrErr.code}: ${addrErr.message}`));
   }
   // a running listener is always shown and always stoppable, whatever relay.addresses answered (review 7b-2 S4, S5)
@@ -977,7 +979,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       card.append(stop);
     }
   }
-  if (status && addrs) card.append(el("p", "caption muted", "Other devices on this network can reach the relay while it serves. Use it only on a network you trust. macOS may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
+  if (status && addrs) card.append(el("p", "caption muted", "Other devices on this network can reach the relay while it serves. Use it only on a network you trust. The system may ask whether to allow incoming connections for this app: allow them, or no device can reach it."));
   out.append(card);
   if (!status) return;
 
@@ -1015,6 +1017,13 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   }
   if (syncRun.result) stat.append(el("p", "body", syncRun.result));
   out.append(stat);
+
+  // design decision 7: no device list, the honest card
+  const devices = el("section", "card");
+  devices.append(el("h2", "heading", "Devices that hold your key"));
+  devices.append(el("p", "body", "Every paired device holds the same key, so this Mac cannot tell them apart and keeps no list."));
+  devices.append(el("p", "caption muted", "To shut one device out: rotate the key with the command line (disconect key rotate-recovery), then pair the devices you keep again."));
+  out.append(devices);
 }
 
 // ---- Trend ------------------------------------------------------------------------------
@@ -1101,7 +1110,7 @@ function healthLiveCard(out: ParentNode, live: LiveBlock | undefined): void {
   row.append(tag);
   card.append(row);
   const days = live.first_day && live.last_day ? (live.first_day === live.last_day ? live.first_day : `${live.first_day} → ${live.last_day}`) : "no day";
-  card.append(el("span", "value-small", `${live.records} session records · ${live.samples} minute samples · ${days}`));
+  card.append(el("span", "value-small", `${live.records} session record${live.records === 1 ? "" : "s"} · ${live.samples} minute sample${live.samples === 1 ? "" : "s"} · ${days}`));
   card.append(el("span", "caption muted", "Session days count as present or not covered only; the link's minutes are kept apart from the device's own figures and never compared with them."));
   out.append(card);
 }
@@ -1118,9 +1127,10 @@ function healthFailedCard(out: ParentNode, health: Health): void {
   card.append(el("h2", "heading", "Failed to decode"));
   if (failedDays) card.append(el("span", "value-small", `${failedDays} failed day${failedDays === 1 ? "" : "s"} across ${rows.length} metric row${rows.length === 1 ? "" : "s"} in this window`));
   for (const run of runs) {
-    const when = run.started_at ? run.started_at.slice(0, 16).replace("T", " ") : "unknown time";
+    const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
     const line = el("span", "caption");
-    line.append(document.createTextNode(`${when} · ${TRANSPORT_WORD[run.transport] ?? run.transport} · ${run.files_failed} of ${run.files_seen} file${run.files_seen === 1 ? "" : "s"} failed`));
+    const what = run.files_seen ? `${run.files_failed} of ${run.files_seen} file${run.files_seen === 1 ? "" : "s"} failed` : "the import failed";
+    line.append(document.createTextNode(`${when} · ${TRANSPORT_WORD[run.transport] ?? run.transport} · ${what}`));
     if (run.error) line.append(el("span", "muted", ` · ${run.error}`));
     card.append(line);
   }
@@ -1270,7 +1280,7 @@ async function screenKey(out: ParentNode): Promise<void> {
   wrap.append(right, box);
   label.append(wrap);
   card.append(label, note);
-  if (keyStatus.keychain === "stale") card.append(el("p", "caption", "A key saved by another program or an earlier build of this app is in the keychain, and this build cannot read it without asking. Turn the switch on to replace it with one this build can read; macOS may ask you once to allow that."));
+  if (keyStatus.keychain === "stale") card.append(el("p", "caption", "A key saved by another program or an earlier build of this app is in the keychain, and this build cannot read it without asking. Turn the switch on to replace it with one this build can read; the system may ask you once to allow that."));
   card.append(el("p", "caption muted", "Off by default: you are asked for your passphrase each time the app starts. On, it is convenient, but programs you approve can then read the key. The app and the terminal each keep their own copy, and an update of the app forgets its copy: cache again afterwards."));
   out.append(card);
   const about = el("div", "card body");
@@ -1812,7 +1822,7 @@ async function screenSupport(out: ParentNode): Promise<void> {
 window.addEventListener("hashchange", () => void route());
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 void core.onCoreEvent("restarted", () => {
-  if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core restarted; the offer is gone.", error: true });
+  if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core stopped; the offer is gone.", error: true });
   banner = "The core restarted after an error; the last request was lost.";
   void (async () => {
     await refreshKey();
