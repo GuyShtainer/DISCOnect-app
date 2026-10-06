@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
 
-use crate::canon::{self, Value};
+use crate::canon::{self, CanonError, Value};
 use crate::export::{Decode, DecodeError, Keyed, Obj, epoch_s_to_utc};
 use crate::model::Decoded;
 
@@ -90,6 +90,24 @@ pub fn parse_live_file(data: &[u8]) -> Option<Vec<Vec<Value>>> {
         }
     }
     Some(readings)
+}
+
+/// `(readings, cut_off)` of a live file, or `None` when `data` is not one (the oracle's
+/// `read_live_file`). A file whose last non-empty line is not JSON (the lab killed mid-write) is
+/// still live when at least one line precedes it and those lines pass the live rule: the readings
+/// are theirs and `cut_off` is true. Only a syntax error counts as cut off: a last line this port
+/// refuses as `Unsupported` (NaN, an integer past i64) keeps the file not live, as the note on
+/// [`parse_live_file`] says.
+pub fn read_live_file(data: &[u8]) -> Option<(Vec<Vec<Value>>, bool)> {
+    if let Some(readings) = parse_live_file(data) {
+        return Some((readings, false));
+    }
+    let lines = non_empty_lines(std::str::from_utf8(data).ok()?);
+    let (last, head) = lines.split_last()?;
+    if head.is_empty() || !matches!(canon::parse(last.as_bytes()), Err(CanonError::Syntax(_))) {
+        return None;
+    }
+    parse_live_file(head.join("\n").as_bytes()).map(|readings| (readings, true))
 }
 
 fn number(value: &Value) -> f64 {

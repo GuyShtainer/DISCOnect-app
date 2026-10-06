@@ -30,6 +30,8 @@ pub const TRANSPORTS: [&str; 6] = ["connect_export", "usb", "gadgetbridge", "ciq
 pub const TRANSPORT_BLE: &str = "ble";
 /// The `dropped` reason for a live file that holds no readings.
 pub const DROPPED_LIVE_EMPTY: &str = "live_file_without_readings";
+/// The drop reason of a live file cut off mid-line (its whole lines are imported).
+pub const DROPPED_LIVE_CUT_OFF: &str = "live_file_cut_off";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -228,12 +230,14 @@ pub fn iter_fit_files(path: &Path) -> Result<Vec<(String, Vec<u8>)>, SourceError
     Ok(out)
 }
 
-/// A live file as the import sees it: its masked name and its readings `[t, metric, value]`.
-pub type LiveFile = (String, Vec<Vec<Value>>);
+/// A live file as the import sees it: its masked name, its readings `[t, metric, value]` and
+/// whether its last line was cut off.
+pub type LiveFile = (String, Vec<Vec<Value>>, bool);
 
-/// `(label, readings)` for every live-link `.jsonl` under `path` (a file or a folder), in the Python
-/// order; a status-only file yields no readings. Files that fail the live rule are not yielded.
-/// A zip is not scanned. Labels are masked file names.
+/// `(label, readings, cut_off)` for every live-link `.jsonl` under `path` (a file or a folder), in the
+/// Python order; a status-only file yields no readings, a file cut off mid-line yields the readings of
+/// its whole lines. Files that fail the live rule are not yielded. A zip is not scanned. Labels are
+/// masked file names.
 pub fn iter_live_files(path: &Path) -> Result<Vec<LiveFile>, SourceError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if path.is_file() {
@@ -250,23 +254,27 @@ pub fn iter_live_files(path: &Path) -> Result<Vec<LiveFile>, SourceError> {
     }
     let mut out = Vec::new();
     for candidate in candidates {
-        if let Some(readings) = live::parse_live_file(&fs::read(&candidate)?) {
+        if let Some((readings, cut_off)) = live::read_live_file(&fs::read(&candidate)?) {
             let name = candidate.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            out.push((mask_label(&name), readings));
+            out.push((mask_label(&name), readings, cut_off));
         }
     }
     Ok(out)
 }
 
 /// `_import_live_batch`: one `json:live` raw record per file; a file without readings is counted
-/// under [`DROPPED_LIVE_EMPTY`] and skipped.
+/// under [`DROPPED_LIVE_EMPTY`] and skipped, a file cut off mid-line is counted under
+/// [`DROPPED_LIVE_CUT_OFF`] and its whole lines imported.
 fn import_live_batch(
     files: Vec<LiveFile>,
     writer: &mut Writer<'_>,
     mut progress: Option<Progress<'_>>,
 ) -> Result<(), SourceError> {
     let total = files.len() as u64;
-    for (done, (label, readings)) in (1u64..).zip(files) {
+    for (done, (label, readings, cut_off)) in (1u64..).zip(files) {
+        if cut_off {
+            *writer.stats.dropped.entry(DROPPED_LIVE_CUT_OFF.to_string()).or_insert(0) += 1;
+        }
         let outcome = if readings.is_empty() {
             *writer.stats.dropped.entry(DROPPED_LIVE_EMPTY.to_string()).or_insert(0) += 1;
             "skipped"

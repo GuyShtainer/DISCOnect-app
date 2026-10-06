@@ -10,10 +10,10 @@ use std::path::Path;
 
 use common::{PASSPHRASE, encrypted_copy};
 use disconect_core::keys::{self, PassphraseSource};
-use disconect_core::live::parse_live_file;
+use disconect_core::live::{parse_live_file, read_live_file};
 use disconect_core::relay::folder::FolderRelay;
 use disconect_core::relay::sync;
-use disconect_core::sources::{DROPPED_LIVE_EMPTY, import_path, iter_live_files, reparse_all};
+use disconect_core::sources::{DROPPED_LIVE_CUT_OFF, DROPPED_LIVE_EMPTY, import_path, iter_live_files, reparse_all};
 use disconect_core::store::{self, Store};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -133,6 +133,41 @@ fn status_only_file_is_skipped_with_a_counted_reason() {
     assert_eq!(stats.dropped.iter().collect::<Vec<_>>(), [(&DROPPED_LIVE_EMPTY.to_string(), &1)]);
     assert_eq!((stats.files_seen, stats.files_imported, stats.files_failed), (0, 0, 0));
     assert!(live_rows(store.conn()).is_empty());
+}
+
+#[test]
+fn a_file_cut_off_mid_line_keeps_its_whole_lines_and_is_counted() {
+    // the lab killed mid-write leaves a partial last line: the session before it is imported, once, as the
+    // same pinned record the whole file gives, and the loss is counted (9b-2 review O1)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let whole = dir.path().join("whole/live-x.jsonl");
+    fs::create_dir_all(whole.parent().expect("parent")).expect("mkdir");
+    write_lines(&whole, &live_lines());
+    let cut = dir.path().join("cut/live-x.jsonl");
+    fs::create_dir_all(cut.parent().expect("parent")).expect("mkdir");
+    let mut bytes = fs::read(&whole).expect("read");
+    bytes.extend_from_slice(br#"{"t": 1750000003.0, "metric": "heart_"#);
+    fs::write(&cut, &bytes).expect("write");
+    assert_eq!(read_live_file(&bytes), parse_live_file(&fs::read(&whole).expect("read")).map(|r| (r, true)));
+    assert!(parse_live_file(&bytes).is_none());
+    let store = open(&dir.path().join("a.db"));
+    let stats = import_path(store.conn(), &cut, None, None).expect("import");
+    assert_eq!((stats.files_seen, stats.files_imported, stats.files_failed), (1, 1, 0));
+    assert_eq!(stats.dropped.iter().collect::<Vec<_>>(), [(&DROPPED_LIVE_CUT_OFF.to_string(), &1)]);
+    let rows = live_rows(store.conn());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(inflate(&rows[0].7), PINNED);
+    let stats = import_path(store.conn(), &whole, None, None).expect("import");
+    assert_eq!(stats.files_duplicate, 1); // the whole file is the same record
+    // the whole lines must pass the live rule, and at least one must precede the partial line
+    assert!(read_live_file(b"{\"t\": 1, \"metric\": \"x\", \"value\": 1}\n{\"frame\": \"0a0b\"}\n{\"t\": 2, \"metr").is_none());
+    assert!(read_live_file(b"{\"t\": 2, \"metr").is_none());
+    assert!(read_live_file(b"{\"frame\": \"0a0b\"}\n").is_none()); // well-formed and not live stays not live
+    assert_eq!(read_live_file(b"{\"status\": \"scanning\"}\n{\"t\": 2, \"metr"), Some((vec![], true)));
+    let got = read_live_file(b"{\"status\": \"scanning\"}\n{\"t\": 1, \"metric\": \"x\", \"value\": 1}\r\n   \n{\"t\":");
+    assert_eq!(got.map(|(r, cut)| (r.len(), cut)), Some((1, true)));
+    // this port refuses NaN as unsupported, not as a cut: the file stays not live (the parse_live_file note)
+    assert!(read_live_file(b"{\"status\": \"scanning\"}\n{\"t\": NaN, \"metric\": \"x\", \"value\": 1}").is_none());
 }
 
 #[test]
