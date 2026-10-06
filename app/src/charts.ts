@@ -92,16 +92,20 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       splitLine: { lineStyle: { color: token("--hairline") } },
       scale: true,
     },
+    // the hatched bands follow the first non-live series: a live session claims no day
     series: series.map((s, i) => ({
       name: scopeWord(s.scope),
-      type: "line",
+      // live is a diamond per session day and never a line: a session is not a day of monitoring
+      type: s.scope === "live" ? "scatter" : "line",
+      symbol: s.scope === "live" ? "diamond" : "circle",
+      symbolSize: s.scope === "live" ? 9 : 4,
       showSymbol: false,
       connectNulls: false,
       // vendor cloud is dashed: when it agrees with device the two lines overlap exactly and both must stay visible
       lineStyle: { width: 1.5, type: s.scope === "vendor_cloud" ? "dashed" : "solid" },
       itemStyle: { color: token(SCOPE_TOKEN[s.scope] ?? "--ink") },
       data: s.days.map((d) => d.value),
-      markArea: i === 0
+      markArea: i === series.findIndex((t) => t.scope !== "live")
         ? {
             silent: true,
             itemStyle: { color: { image: hatchImage(hatch), repeat: "repeat" }, opacity: 0.6 },

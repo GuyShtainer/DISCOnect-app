@@ -36,7 +36,12 @@ const LIVE_FOLDED: { metric: string; unit: string | null }[] = [
   { metric: "spo2", unit: "%" }, { metric: "energy_reserve", unit: null },
 ];
 const SCOPES = ["device", "vendor_cloud", "local"];
-const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "steps", "sleep_score", "stress_avg", "hrv_last_night_average", "sleep_duration"];
+const TREND_METRICS = ["energy_reserve_high", "energy_reserve_low", "resting_heart_rate", "heart_rate", "steps", "sleep_score", "stress_avg", "stress", "hrv_last_night_average", "sleep_duration"];
+// Sample-cadence metrics: data.metric returns each day's mean of its stored minutes (every scope, live included).
+const DAILY_MEAN = new Set(["heart_rate", "stress"]);
+function trendLabel(metric: string): string {
+  return DAILY_MEAN.has(metric) ? `${metricLabel(metric)}, daily mean` : metricLabel(metric);
+}
 const SCREENS: { id: string; title: string }[] = [
   { id: "today", title: "Today" },
   { id: "watch", title: "Watch" },
@@ -538,7 +543,7 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
   const controls = el("div", "row");
   const select = el("select") as HTMLSelectElement;
   for (const m of TREND_METRICS) {
-    const o = el("option", "", metricLabel(m)) as HTMLOptionElement;
+    const o = el("option", "", trendLabel(m)) as HTMLOptionElement;
     o.value = m;
     o.selected = m === trendMetric;
     select.append(o);
@@ -552,14 +557,16 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
     range.append(o);
   }
   range.onchange = () => { trendDays = Number(range.value); void route(); };
-  header(out, metricLabel(trendMetric), "");
+  header(out, trendLabel(trendMetric), "");
   controls.append(select, range);
   out.append(controls);
 
   // The window ends on the latest day any metric has data, so an archive still draws.
   const today = await core.call<Today>("data.today");
   const lastDay = today.metrics.reduce<string>((acc, m) => (m.value !== null && m.day && m.day > acc ? m.day : acc), "") || today.day;
-  const results = await Promise.all(SCOPES.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays, last_day: lastDay })));
+  // the live scope only exists for the metrics the link folds (decision 8: diamonds, never a line)
+  const scopes = LIVE_FOLDED.some((m) => m.metric === trendMetric) ? [...SCOPES, "live"] : SCOPES;
+  const results = await Promise.all(scopes.map((scope) => core.call<Metric>("data.metric", { metric: trendMetric, scope, days: trendDays, last_day: lastDay })));
   const series: Series[] = results
     .filter((m) => m.days.some((d) => d.value !== null))
     .map((m) => ({ scope: m.scope, unit: m.unit, days: m.days }));
@@ -579,12 +586,17 @@ async function screenTrend(out: ParentNode, later: Later): Promise<void> {
     card.append(el("span", "muted body", "No source has values for this metric in the window."));
     return;
   }
-  const gapDays = series[0].days.filter((d) => d.status === "not_covered").length;
+  // the hatched bands follow the first non-live series: a live session claims no day, so its gaps mean nothing
+  const lead = series.find((s) => s.scope !== "live") ?? series[0];
+  const gapDays = lead.scope === "live" ? 0 : lead.days.filter((d) => d.status === "not_covered").length;
   const ends = lastDay !== today.day ? ` Window ends ${lastDay}, the latest day with data.` : "";
-  card.append(el("span", "caption muted", (gapDays
-    ? `Hatched bands: ${gapDays} days no import covered the ${scopeWord(series[0].scope)} source. Nothing is drawn there; a line never bridges a gap.`
-    : `Every day in the window was covered by an import of the ${scopeWord(series[0].scope)} source.`) + ends));
-  later(() => drawTrend(chart, series, metricLabel(trendMetric)));
+  const liveNote = series.some((s) => s.scope === "live") ? ` Diamonds: days with a live-link session, the mean of the minutes the link recorded; a session claims no day, so it draws no band.` : "";
+  card.append(el("span", "caption muted", (lead.scope === "live"
+    ? "Only live-link sessions have values for this metric in the window."
+    : gapDays
+      ? `Hatched bands: ${gapDays} days no import covered the ${scopeWord(lead.scope)} source. Nothing is drawn there; a line never bridges a gap.`
+      : `Every day in the window was covered by an import of the ${scopeWord(lead.scope)} source.`) + liveNote + ends));
+  later(() => drawTrend(chart, series, trendLabel(trendMetric)));
 }
 
 // ---- Data health ------------------------------------------------------------------------
@@ -1335,6 +1347,8 @@ void (async () => {
   const wanted = i >= 0 && SCREENS.some((s) => s.id === args[i + 1]) ? args[i + 1] : null;
   const h = args.indexOf("--health-days");
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
+  const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
+  if (t >= 0 && TREND_METRICS.includes(args[t + 1])) trendMetric = args[t + 1];
   if (wanted && current() !== wanted) {
     location.hash = `#/${wanted}`; // hashchange runs route()
   } else {
