@@ -6,6 +6,11 @@ import qrcode from "qrcode-generator";
 import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord, metricHue } from "./identity";
 import { disposeCharts, drawTrend, hatchedDays, showTipOn, type Series } from "./charts";
 
+// Build-time constant (vite.config.ts `define`): true only in the iOS build. Every `PHONE` branch below is the phone's.
+declare const __PHONE__: boolean;
+const PHONE = __PHONE__;
+if (PHONE) document.body.classList.add("phone");
+
 type KeyStatus = { key_file: boolean; encrypted: boolean; unlocked: boolean; keychain: "cached" | "absent" | "stale" };
 type AppInfo = { product: string; notice: string; core: string; db: string; encrypted: boolean; schema: number; contract: number };
 type Day = { day: string; value: number | null; status: string };
@@ -75,6 +80,16 @@ const SCREENS: { id: string; title: string; group: (typeof GROUPS)[number] }[] =
   { id: "support", title: "Support", group: "This app" },
 ];
 
+// The phone (12-F, shape C): the drawer is Today, Sleep, Trends, Data health, Sync, Settings, Support. Import, Watch, Coach
+// and Coach settings live on the Mac; Your key is folded into Settings (its id still answers the lock redirect).
+const PHONE_HIDDEN = new Set(["import", "watch", "coach", "coach-settings", "key"]);
+const PHONE_SETTINGS = { id: "settings", title: "Settings", group: "This app" } as const;
+const PHONE_MORE = "Import, the watch link and the coach live on your Mac. This phone reads the copy it pulls.";
+function visibleScreens(): { id: string; title: string; group: (typeof GROUPS)[number] }[] {
+  if (!PHONE) return SCREENS;
+  return SCREENS.filter((s) => !PHONE_HIDDEN.has(s.id)).flatMap((s) => (s.id === "support" ? [PHONE_SETTINGS, s] : [s]));
+}
+
 const nav = document.getElementById("nav") as HTMLElement;
 const main = document.getElementById("main") as HTMLElement;
 let keyStatus: KeyStatus | null = null;
@@ -134,6 +149,10 @@ function coachFlag(): HTMLElement {
 // Bet 17: the Support row is drawn only where the opener command exists (macOS; lib.rs's cfg). The probe
 // at boot flips this off when `support_sites` is absent, so the row is absent there, never present-and-broken.
 let supportShown = true;
+/** A phone that has never been paired: no store and no key file. Its only screen is Pair Start. */
+function unpaired(): boolean {
+  return PHONE && !!keyStatus && !keyStatus.key_file && !keyStatus.encrypted;
+}
 
 /** The Watch entry's indicator while the link runs: a diamond and the word "live". */
 function liveFlag(): HTMLElement {
@@ -193,14 +212,16 @@ function renderNav(): void {
   nav.replaceChildren();
   nav.append(el("div", "brand", productWords.product));
   for (const g of GROUPS) {
+    const here = visibleScreens().filter((s) => s.group === g);
+    if (!here.length) continue; // the phone has no Coach group
     const box = el("div", "navgroup");
     box.setAttribute("role", "group");
     const cap = el("div", "group caption muted", g);
     cap.id = `group-${g.toLowerCase().replace(/[^a-z]+/g, "-")}`;
     box.setAttribute("aria-labelledby", cap.id);
     box.append(cap);
-    for (const s of SCREENS) {
-      if (s.group !== g || (s.id === "support" && !supportShown)) continue;
+    for (const s of here) {
+      if (s.id === "support" && !supportShown && !PHONE) continue; // the phone's Support screen says what it cannot do
       const a = el("a", "", s.title) as HTMLAnchorElement;
       a.href = `#/${s.id}`;
       if (current().split("/")[0] === s.id) a.setAttribute("aria-current", "page");
@@ -212,14 +233,15 @@ function renderNav(): void {
   }
   nav.append(el("div", "spacer"));
   const status = el("div", "status caption muted");
-  status.textContent = keyStatus
+  status.textContent = unpaired() ? "" : PHONE && keyStatus?.key_file && !keyStatus.encrypted ? "Nothing pulled yet" : keyStatus
     ? keyStatus.encrypted
       ? keyStatus.unlocked ? `Encrypted · unlocked${keyStatus.keychain === "cached" ? " · key in keychain" : ""}` : "Encrypted · locked"
       : "Not encrypted"
     : "";
   nav.append(status);
+  if (PHONE) nav.append(el("p", "caption muted more", neutralText(PHONE_MORE))); // the board's More caption, as the drawer's footer
   nav.append(el("footer", "notice", productWords.notice));
-  (topbar.querySelector(".keyword") as HTMLElement).textContent = keyStatus
+  (topbar.querySelector(".keyword") as HTMLElement).textContent = unpaired() ? "" : PHONE && keyStatus?.key_file && !keyStatus.encrypted ? "Nothing pulled" : keyStatus
     ? keyStatus.encrypted ? (keyStatus.unlocked ? "Unlocked" : "Locked") : "Not encrypted"
     : "";
   if (drawerOpen() && !nav.contains(document.activeElement)) focusDrawer(); // a redraw must not strand the focus
@@ -240,6 +262,7 @@ function locked(): boolean {
 }
 
 async function refreshCoach(): Promise<void> {
+  if (PHONE) return; // the phone build registers no coach command
   try {
     coachSettings = await core.coachSettingsGet();
   } catch {
@@ -257,6 +280,7 @@ async function route(): Promise<void> {
   await refreshCoach();
   if (mine !== generation) return;
   renderNav();
+  menuButton.hidden = PHONE && (unpaired() || locked()); // Pair Start and Unlock are drawn with no drawer
   const [id, sub] = current().split("/");
   if (id !== "import") {
     importUi.error = null; // an import failure is shown on Import; leaving the screen ends it
@@ -276,7 +300,13 @@ async function route(): Promise<void> {
     banner = null; // shown once
   }
   try {
-    if (id === "today") await screenToday(out);
+    // an id the phone's drawer lacks (Your key's lock redirect, Import, Watch, Coach, a typo): Unlock when locked, else home
+    const phoneStray = PHONE && !visibleScreens().some((s) => s.id === id);
+    if (PHONE && unpaired()) screenPairStart(out);
+    else if (phoneStray) {
+      if (locked()) screenPhoneUnlock(out);
+      else { location.hash = "#/today"; return; }
+    } else if (id === "today") await screenToday(out);
     else if (id === "sleep") await screenSleep(out, later, sub);
     else if (id === "watch") await screenWatch(out, later);
     else if (id === "sync") await screenSync(out, later, sub === "pair");
@@ -286,13 +316,18 @@ async function route(): Promise<void> {
     else if (id === "coach") screenCoach(out, later);
     else if (id === "coach-settings") await screenCoachSettings(out);
     else if (id === "support") await screenSupport(out);
+    else if (PHONE && id === "settings") await screenPhoneSettings(out);
     else await screenKey(out);
   } catch (e) {
     if (core.isCoreError(e) && e.code === "locked") {
       location.hash = "#/key";
       return;
     }
-    if (core.isCoreError(e) && e.code === "not_found" && e.message.includes("database yet")) {
+    if (PHONE && core.isCoreError(e) && e.code === "not_found" && e.message.includes("database yet")) {
+      out.append(phoneEmptyBanner()); // paired (a key file), but no store has been made: the same state as an empty one
+    } else if (PHONE) {
+      out.append(pbanner("This screen could not be read", PHONE_READ_FAIL, true)); // never a raw code or the core's own text
+    } else if (core.isCoreError(e) && e.code === "not_found" && e.message.includes("database yet")) {
       // no store on disk yet: the first drop on Import creates it
       const banner = bannerEl("Nothing imported yet", "There is no data on this Mac yet. Drop an export zip or a copied watch folder on Import.");
       banner.append(importLink());
@@ -364,6 +399,10 @@ async function screenToday(out: ParentNode): Promise<void> {
     core.call<Health>("data.health", { window_days: 7 }).catch(() => null),
   ]);
   header(out, "Today", today.day);
+  if (PHONE && health?.never_imported) {
+    out.append(phoneEmptyBanner());
+    return;
+  }
   if (health?.never_imported) {
     // design pass 2026-10-06, states: a banner, not the empty value list (review N15)
     const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen. Every screen fills from the first import.");
@@ -451,6 +490,11 @@ function todayCard(row: TodayRow, todayDay: string): HTMLElement {
   const stale = !!row.day && row.day !== todayDay;
   const v = el("span", stale ? "value muted" : "value", fmtValue(row.value, row.unit));
   card.append(v);
+  if (PHONE) { // room for a short "±" caption under the value (nothing fills it yet), so the cards do not jump when it lands
+    const spread = el("span", "caption muted spread");
+    spread.setAttribute("aria-hidden", "true");
+    card.append(spread);
+  }
   card.append(el("span", "caption muted", stale ? `latest · ${row.day}` : "today"));
   return card;
 }
@@ -835,6 +879,23 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   } catch (e) {
     if (core.isCoreError(e) && e.code === "locked") throw e;
     statusErr = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+  }
+  if (PHONE) {
+    // the phone's Sync: a pull from the Mac's relay, no serving and no pairing offer (relay.addresses is not on its list)
+    const pull = async (): Promise<void> => {
+      phonePull.running = true; phonePull.failure = null; phonePull.result = "";
+      syncRedraw();
+      try {
+        const r = await core.call<{ pull: { applied: number; records_new: number; status: string } }>("sync.run");
+        phonePull.result = `Pulled ${r.pull.applied} ${r.pull.applied === 1 ? "bundle" : "bundles"}, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (not all of it yet)" : ""}.`;
+      } catch (e) {
+        phonePull.failure = phoneSyncFailure(e);
+      }
+      phonePull.running = false;
+      syncRedraw();
+    };
+    phoneSync(out, status, statusErr, pull);
+    return;
   }
   let addrs: RelayAddresses | null = null;
   let addrErr: core.CoreError | null = null;
@@ -1421,6 +1482,10 @@ function hypnogram(session: SleepSession): HTMLElement {
 async function screenSleep(out: ParentNode, later: Later, sub: string | undefined): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
   header(out, "Sleep", ""); // the subtitle is the night the core answers with, set below
+  if (PHONE && health?.never_imported) {
+    out.append(phoneEmptyBanner());
+    return;
+  }
   if (health?.never_imported) {
     const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen. Every screen fills from the first import.");
     nothing.append(importLink());
@@ -1901,6 +1966,10 @@ async function screenHealth(out: ParentNode): Promise<void> {
     legend.append(item);
   }
   out.append(legend);
+  if (PHONE && health.never_imported) {
+    out.append(phoneEmptyBanner());
+    return;
+  }
   if (health.never_imported) {
     const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen.");
     nothing.append(importLink());
@@ -2037,7 +2106,7 @@ async function screenKey(out: ParentNode): Promise<void> {
   const about = el("div", "card body");
   about.append(el("h2", "heading", "About"));
   about.append(el("span", "muted", `core ${info.core}`));
-  about.append(el("span", "muted", `database ${info.db}`));
+  about.append(el("span", "muted wrap", `database ${info.db}`)); // a long path wraps (it ran past the edge at 390)
   const mcp = await core.mcpCommand().catch(() => "");
   if (mcp) {
     about.append(el("span", "", "Your AI tools can use this app's core as their MCP server with this command:"));
@@ -2052,6 +2121,332 @@ async function screenKey(out: ParentNode): Promise<void> {
   }
   about.append(el("span", "caption muted", "If the system refuses to open a copy of this app: System Settings → Privacy & Security → Open Anyway. A locally built app opens directly."));
   out.append(about);
+}
+
+// ---- The phone's own screens (12-F shape C; built into every bundle, reached only when `PHONE`) ------------------
+// Copy is drawn through neutralText like the coach's text (no maker's name, plain score words). No screen here shows a
+// raw core code or the core's own message: a failure is one fixed sentence that says what to do.
+const PHONE_READ_FAIL = "Close and reopen the app. If this stays, your copy on the Mac is untouched.";
+const PHONE_SYNC_NOTE = "This phone talks only to your Mac, and only while both are on the same network. Nothing goes to any other server, and nothing is sent in the background.";
+
+function pbanner(lead: string, text: string, error = false): HTMLElement {
+  return bannerEl(neutralText(lead), neutralText(text), error);
+}
+function ptext<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text: string): HTMLElementTagNameMap[K] {
+  return el(tag, cls, neutralText(text));
+}
+function pcard(label: string): HTMLElement {
+  const card = el("section", "card");
+  card.setAttribute("aria-label", label);
+  return card;
+}
+function psteps(items: { text: string; state: Step }[]): HTMLElement {
+  const ol = el("ol", "steps");
+  items.forEach((it, i) => {
+    const li = el("li", it.state === "idle" ? "" : it.state);
+    if (it.state === "now") li.setAttribute("aria-current", "step");
+    li.append(el("span", "n", String(i + 1)), ptext("span", "", it.text));
+    ol.append(li);
+  });
+  return ol;
+}
+
+/** Paired, but no pull has filled the store (PhoneEmpty). */
+function phoneEmptyBanner(): HTMLElement {
+  const b = pbanner("Nothing pulled yet", "This phone is paired, but its first pull did not finish. Pull from your Mac on the same network.");
+  const actions = el("div", "actions");
+  const go = el("a", "button", "Go to Sync") as HTMLAnchorElement;
+  go.href = "#/sync";
+  actions.append(go);
+  b.append(actions);
+  return b;
+}
+
+/** Pair Start, the screen of a phone with no store and no key file. Pairing itself (the scan, the six digits, the
+ *  landing) is a later 12-F row on pair.join; until then this is a placeholder, so the Scan button is disabled. */
+function screenPairStart(out: ParentNode): void {
+  header(out, "Pair with your Mac", "This phone keeps a copy of your data and pulls what is new from your Mac.");
+  const how = pcard("How pairing works");
+  how.append(psteps([
+    { text: "On your Mac, open Sync and choose Pair another device.", state: "now" },
+    { text: "Scan the code your Mac shows.", state: "idle" },
+    { text: "Type the six digits this phone shows into your Mac.", state: "idle" },
+  ]));
+  out.append(how);
+  const scan = el("button", "wide", "Scan the code") as HTMLButtonElement;
+  scan.disabled = true;
+  out.append(scan);
+  out.append(ptext("p", "caption muted", "Scanning is not built into this version yet."));
+  out.append(ptext("p", "caption muted", "Pairing gives this phone your key. DISCOnect then asks for two permissions: the camera, to scan the code, and the local network, to reach your Mac. It reaches nothing else."));
+}
+
+// Forget this phone: the confirmation sheet. Its delete action is a stub (12-F part 2 adds the core's forget method
+// and wires it); nothing on this phone is deleted from here.
+let forgetSheet: HTMLElement | null = null;
+let forgetOpener: HTMLElement | null = null;
+function closeForgetSheet(): void {
+  if (!forgetSheet) return;
+  forgetSheet.remove();
+  forgetSheet = null;
+  main.inert = false;
+  topbar.inert = false;
+  forgetOpener?.focus();
+}
+function openForgetSheet(opener: HTMLElement): void {
+  closeForgetSheet();
+  forgetOpener = opener;
+  const shade = el("div", "sheet-shade");
+  const sheet = el("section", "card sheet");
+  sheet.setAttribute("role", "dialog");
+  sheet.setAttribute("aria-modal", "true");
+  sheet.setAttribute("aria-labelledby", "forget-title");
+  const title = ptext("h2", "heading", "Forget this phone?");
+  title.id = "forget-title";
+  sheet.append(title);
+  sheet.append(ptext("p", "body", "This deletes this phone's copy of your data, its key file and its keychain entry. Your Mac keeps everything. Pair again to use this phone again."));
+  // part 2: the core reports the records not yet sent here before it deletes; this phone sends nothing today
+  sheet.append(ptext("p", "body", "This phone sends nothing to your Mac, so nothing on it is missing from your Mac."));
+  sheet.append(ptext("p", "caption muted", "Forgetting does not shut this phone out of your account. Only a key rotation on your Mac does that."));
+  const actions = el("div", "actions");
+  const cancel = el("button", "secondary", "Cancel") as HTMLButtonElement;
+  const forget = el("button", "danger", "Forget this phone") as HTMLButtonElement;
+  forget.disabled = true; // part 2 wires this to the core's forget method
+  cancel.onclick = closeForgetSheet;
+  shade.onclick = closeForgetSheet;
+  sheet.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); closeForgetSheet(); } };
+  actions.append(cancel, forget);
+  sheet.append(actions);
+  sheet.append(ptext("p", "caption muted", "Deleting is not available in this version yet."));
+  document.body.append(shade, sheet);
+  forgetSheet = sheet;
+  main.inert = true;
+  topbar.inert = true;
+  cancel.focus();
+}
+/** The sheet is two siblings of the page in the body; leaving a screen takes both away. */
+window.addEventListener("hashchange", closeForgetSheet);
+
+/** The "Forget this phone…" entry (Unlock and Settings): a danger button that opens the sheet. */
+function forgetButton(): HTMLButtonElement {
+  const b = el("button", "danger wide", "Forget this phone…") as HTMLButtonElement;
+  b.onclick = () => openForgetSheet(b);
+  return b;
+}
+
+function screenPhoneUnlock(out: ParentNode): void {
+  header(out, "Unlock", "Your data on this phone is encrypted. Enter your passphrase to open it.");
+  const card = pcard("Unlock");
+  const form = el("form", "field");
+  const label = el("label", "caption muted", "Passphrase") as HTMLLabelElement;
+  label.htmlFor = "pp";
+  const input = el("input", "wide") as HTMLInputElement;
+  input.id = "pp";
+  input.type = "password"; input.autocomplete = "current-password";
+  const err = el("span", "caption error");
+  err.id = "pp-err";
+  err.setAttribute("role", "alert");
+  const go = el("button", "wide", "Unlock") as HTMLButtonElement;
+  go.type = "submit";
+  form.append(label, input, err, go);
+  const keep = el("label", "switch") as HTMLLabelElement;
+  keep.append(el("span", "", "Keep the key in this phone's keychain"));
+  const box = el("input") as HTMLInputElement;
+  box.type = "checkbox"; box.setAttribute("role", "switch"); box.setAttribute("aria-describedby", "kc-cap");
+  keep.append(box);
+  const cap = ptext("span", "caption muted", "Off by default. When on, DISCOnect opens without the passphrase whenever this phone itself is unlocked. The key stays on this phone; it is never moved to another phone, not even by a backup.");
+  cap.id = "kc-cap";
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    go.disabled = true; err.textContent = ""; input.classList.remove("invalid"); input.removeAttribute("aria-invalid");
+    try {
+      await core.unlock(input.value);
+      input.value = "";
+      if (box.checked) await core.call("key.cache", { enable: true }).catch(() => undefined); // the switch is on Settings too
+      location.hash = "#/today";
+      await route();
+    } catch (e) {
+      const wrong = core.isCoreError(e) && e.code === "wrong_passphrase";
+      err.textContent = neutralText(wrong ? "That passphrase does not open this database." : "This phone could not open its data. Try again.");
+      if (wrong) { input.classList.add("invalid"); input.setAttribute("aria-invalid", "true"); input.setAttribute("aria-describedby", "pp-err"); }
+    } finally {
+      go.disabled = false;
+    }
+  };
+  card.append(form, keep, cap);
+  out.append(card);
+  out.append(ptext("p", "caption muted", "The passphrase is the one your Mac used when this phone was paired."));
+  // recovery happens on the Mac: the phone never shows the recovery words or the command that uses them
+  out.append(ptext("p", "caption muted", "Lost it? Recover it on your Mac, not here. Then forget this phone and pair it again."));
+  const actions = el("div", "actions");
+  actions.append(forgetButton());
+  out.append(actions);
+  setTimeout(() => input.focus(), 0);
+}
+
+// Appearance: the palettes tokens.css has. "Match the system" is the default (pastel, following the system's side).
+const PHONE_THEMES: { id: string; word: string; theme: string | null }[] = [
+  { id: "system", word: "Match the system", theme: null },
+  { id: "light", word: "Light", theme: "light" },
+  { id: "dark", word: "Dark", theme: "dark" },
+  { id: "classic-light", word: "Classic light", theme: "classic-light" },
+  { id: "classic-dark", word: "Classic dark", theme: "classic-dark" },
+];
+const THEME_STORE = "disconect.theme"; // a per-viewer convenience in the webview's own storage; the page works without it
+function applyTheme(theme: string | null): void {
+  if (theme) document.documentElement.dataset.theme = theme; else delete document.documentElement.dataset.theme;
+}
+function savedTheme(): string | null {
+  try {
+    const t = localStorage.getItem(THEME_STORE);
+    return PHONE_THEMES.some((p) => p.theme === t) ? t : null;
+  } catch { return null; }
+}
+function saveTheme(theme: string | null): void {
+  try { if (theme) localStorage.setItem(THEME_STORE, theme); else localStorage.removeItem(THEME_STORE); } catch { /* storage is optional */ }
+}
+
+async function screenPhoneSettings(out: ParentNode): Promise<void> {
+  const info = await core.call<AppInfo>("app.info");
+  header(out, "Settings", "");
+
+  const look = pcard("Appearance");
+  look.append(el("h2", "heading", "Appearance"));
+  const group = el("div", "field");
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", "Theme");
+  const pinned = document.documentElement.dataset.theme ?? null;
+  const now = PHONE_THEMES.find((p) => p.theme === pinned)?.id ?? "system";
+  for (const p of PHONE_THEMES) {
+    const choice = el("label", "choice") as HTMLLabelElement;
+    const radio = el("input") as HTMLInputElement;
+    radio.type = "radio"; radio.name = "theme"; radio.checked = p.id === now;
+    radio.onchange = () => { applyTheme(p.theme); saveTheme(p.theme); };
+    choice.append(radio, el("span", "", p.word));
+    group.append(choice);
+  }
+  look.append(group);
+  out.append(look);
+
+  const key = pcard("Your key");
+  key.append(el("h2", "heading", "Your key"));
+  const kv = el("dl", "kv");
+  const store = !keyStatus ? "not read" : !keyStatus.encrypted ? "no store yet" : `encrypted · ${keyStatus.unlocked ? "unlocked" : "locked"}`;
+  const kept = keyStatus?.keychain === "cached" ? "kept" : keyStatus?.keychain === "stale" ? "needs renewing" : "not kept";
+  kv.append(el("dt", "", "Store"), el("dd", "", store), el("dt", "", "Keychain"), el("dd", "", kept));
+  key.append(kv);
+  const keep = el("label", "switch") as HTMLLabelElement;
+  keep.append(el("span", "", "Keep the key in this phone's keychain"));
+  const box = el("input") as HTMLInputElement;
+  box.type = "checkbox"; box.setAttribute("role", "switch"); box.setAttribute("aria-describedby", "kc2");
+  box.checked = keyStatus?.keychain === "cached";
+  box.disabled = !keyStatus?.encrypted || !keyStatus.unlocked;
+  const note = el("span", "caption error");
+  note.setAttribute("role", "alert");
+  box.onchange = async () => {
+    note.textContent = "";
+    try {
+      const r = await core.call<{ keychain: KeyStatus["keychain"] }>("key.cache", { enable: box.checked });
+      box.checked = r.keychain === "cached";
+      await refreshKey(); renderNav();
+      void route();
+    } catch {
+      box.checked = !box.checked;
+      note.textContent = neutralText("The keychain did not accept that. Try again.");
+    }
+  };
+  keep.append(box);
+  key.append(keep, note);
+  if (keyStatus?.keychain === "stale") key.append(ptext("p", "caption", "A key saved by an earlier build of this app is in the keychain. Turn the switch on to replace it with one this build can read."));
+  const cap = ptext("span", "caption muted", "Off by default. When on, DISCOnect opens without the passphrase whenever this phone itself is unlocked. The key is never moved to another phone, not even by a backup.");
+  cap.id = "kc2";
+  key.append(cap);
+  out.append(key);
+
+  const mine = pcard("This phone");
+  mine.append(el("h2", "heading", "This phone"));
+  mine.append(ptext("p", "body", "Forgetting deletes this phone's copy of your data, its key file and its keychain entry. Your Mac keeps everything. Pair again to use this phone again."));
+  mine.append(forgetButton());
+  out.append(mine);
+
+  const about = pcard("About");
+  about.append(el("h2", "heading", "About"));
+  const kv2 = el("dl", "kv");
+  const core2 = el("dd", "mono caption wrap", info.core.replace("/", " ")); // the core already says "(in-process)"
+  kv2.append(el("dt", "", "Product"), el("dd", "", productWords.product), el("dt", "", "Core"), core2);
+  about.append(kv2);
+  out.append(about);
+}
+
+// ---- The phone's Sync ----
+const phonePull = { running: false, failure: null as { lead: string; text: string } | null, result: "" };
+
+/** The three things a pull can say that a person can act on, in plain words; anything else is one fixed sentence. */
+function phoneSyncFailure(e: unknown): { lead: string; text: string } {
+  const c = core.isCoreError(e) ? e : null;
+  if (c?.code === "relay_auth_failed") {
+    return { lead: "Your Mac refused this phone", text: "The date and time on this phone and on your Mac do not agree. Check both, then pull again." };
+  }
+  if (c?.code === "relay_unverified") {
+    return {
+      lead: "This may not be your Mac",
+      text: "The answer could not be verified: it may come from another Mac, your Mac may have been set up again with a new key, or the network may have altered it. This phone never pairs again by itself. If your Mac was set up again, forget this phone in Settings and pair it again from your Mac.",
+    };
+  }
+  if (c?.code === "not_found" && /unreachable/i.test(c.message)) {
+    return { lead: "Your Mac is not reachable", text: "Open DISCOnect on your Mac with \"Serve the relay on this network\" on, join the same network with this phone, then pull again." };
+  }
+  return { lead: "The pull did not finish", text: "Pull again. If it keeps failing, close and reopen the app." };
+}
+
+/** Drawn from screenSync (the lint pins every user-started call there); `pull` is its one network call. */
+function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.CoreError | null, pull: () => Promise<void>): void {
+  header(out, "Sync", "This phone pulls what is new from your Mac, on your network.");
+  // no store yet (a key file landed, the first pull has not): the pull below makes it, so only the rows are missing
+  if (!status && statusErr?.code !== "not_found") {
+    out.append(pbanner("Sync could not be read", PHONE_READ_FAIL, true));
+    return;
+  }
+  const f = phonePull.failure;
+  if (f) out.append(pbanner(f.lead, f.text, true));
+  const unreachable = f?.lead === "Your Mac is not reachable";
+  const mac = pcard("Your Mac");
+  const when = status?.last_pulled_at
+    ? new Date(status.last_pulled_at).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "never";
+  // no address row: nothing the page may call returns the relay's address (sync.status has no such field); the board's
+  // "Your Mac · address" row waits for a core field
+  const kv = el("dl", "kv");
+  kv.append(el("dt", "", "Last pull"), el("dd", "", when));
+  mac.append(kv);
+  const go = el("button", "wide", f ? "Pull again" : "Pull now") as HTMLButtonElement;
+  go.disabled = phonePull.running;
+  go.onclick = () => void pull();
+  mac.append(go);
+  if (phonePull.running) {
+    const live = el("p", "caption muted", "Pulling from your Mac…");
+    live.setAttribute("role", "status");
+    mac.append(live);
+  }
+  if (phonePull.result) mac.append(el("p", "body", phonePull.result));
+  out.append(mac);
+  if (status && !unreachable) {
+    const stat = pcard("Status");
+    stat.append(el("h2", "heading", "Status"));
+    const rows: [string, string][] = [
+      ["Bundles pulled", String(status.bundles.pulled_applied ?? 0)],
+      ["Bundles refused", String(status.bundles.pulled_rejected ?? 0)],
+      ["Records from your Mac", String(status.records_seen)],
+      ["Conflicts", String(status.conflicts)],
+      ["Chain gaps", status.gaps.length ? String(status.gaps.length) : "none"],
+    ];
+    const kv2 = el("dl", "kv");
+    for (const [k, v] of rows) kv2.append(el("dt", "", k), el("dd", "value-small", v));
+    stat.append(kv2);
+    out.append(stat);
+  } else if (unreachable) {
+    out.append(ptext("p", "caption muted", "Everything on this phone is as of the last pull. Nothing is lost while the Mac is away."));
+  }
+  out.append(ptext("p", "caption muted", PHONE_SYNC_NOTE));
 }
 
 // ---- Coach (Bet 15) ---------------------------------------------------------------------
@@ -2606,11 +3001,12 @@ void (async () => {
   const i = args.indexOf("--screen");
   const arg = args[i + 1] ?? "";
   const night = /^sleep\/\d{4}-\d{2}-\d{2}$/.test(arg); // evidence runs: open one night
-  const wanted = i >= 0 && (night || SCREENS.some((s) => s.id === arg)) ? arg : null;
+  const wanted = i >= 0 && (night || visibleScreens().some((s) => s.id === arg)) ? arg : null;
   const h = args.indexOf("--health-days");
   if (h >= 0 && [90, 365, 1825].includes(Number(args[h + 1]))) healthDays = Number(args[h + 1]);
   const th = args.indexOf("--theme"); // evidence runs and trials: force a palette (pastel follows the system scheme)
   if (th >= 0 && ["pastel", "light", "dark", "pastel-light", "pastel-dark", "classic", "classic-light", "classic-dark"].includes(args[th + 1])) document.documentElement.dataset.theme = args[th + 1];
+  else if (PHONE) applyTheme(savedTheme()); // the phone's Appearance choice, when the launch did not force a palette
   const sc = args.indexOf("--scroll"); // evidence runs: scroll the drawn screen
   if (sc >= 0 && /^\d{1,5}$/.test(args[sc + 1] ?? "")) scrollDebug = Number(args[sc + 1]);
   const t = args.indexOf("--trend"); // evidence runs: open Trends on one metric
@@ -2633,11 +3029,15 @@ void (async () => {
   if (import.meta.env.DEV) {
     // evidence runs: the drawer drawn open
     if (args.includes("--debug-drawer-open")) setTimeout(() => setDrawer(true), 800);
+    // evidence runs (the phone): the Forget sheet drawn open, by a real click on the screen's own button
+    if (args.includes("--debug-forget-open")) {
+      setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Forget this phone…")?.click(), 1500);
+    }
     // evidence runs: a real click on the Sync screen's own "Sync now" button (the network call
     // still comes from a click, never from the page's own code path)
     if (args.includes("--debug-sync-run")) {
       setTimeout(() => {
-        const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now");
+        const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now" || b.textContent === "Pull now");
         button?.click();
       }, 800);
     }

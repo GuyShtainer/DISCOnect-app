@@ -197,3 +197,15 @@ input.code-input:disabled { opacity: 0.6; }
 .hypno .stage-awake, .legend .chip.stage-awake { fill: var(--stage-awake); background: var(--stage-awake); }
 .legend .chip.stage-unmeasurable { background: repeating-linear-gradient(45deg, var(--stage-unmeasurable) 0 1px, var(--surface) 1px 4px); }
 @media (max-width: 720px) { .calendar { grid-template-columns: repeat(7, minmax(0, 1fr)); } .calendar .cell { width: auto; } }
+
+/* ---- The phone (12-F, shape C): tokens only. `.phone` is set on <body> by the iOS build alone. ---- */
+.wrap { overflow-wrap: anywhere; min-width: 0; }
+.wide { width: 100%; }
+button.danger { background: var(--surface); color: var(--ink); border: 1px solid var(--status-failed); }
+input.invalid { border-color: var(--status-failed); }
+.phone a.button { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+.phone .vcard .spread { min-height: 16px; }
+.phone .sidebar .more { margin: 0 0 var(--space-3); }
+.sheet-shade { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 3; background: var(--ink); opacity: 0.4; }
+.sheet { position: fixed; z-index: 4; left: 0; right: 0; bottom: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4) calc(var(--space-4) + env(safe-area-inset-right)) calc(var(--space-4) + env(safe-area-inset-bottom)) calc(var(--space-4) + env(safe-area-inset-left)); gap: var(--space-3); max-height: 90vh; overflow-y: auto; }
+.phone .card p { margin: 0; }
