@@ -43,7 +43,7 @@ fn core_of(state: &State<'_, Core>) -> Result<Sidecar, CoreError> {
 /// the OS drop handled in Rust (`import_drop.rs`), so a script in the webview cannot name a path. `key.unlock` is the
 /// keychain path only (the sidecar refuses it with a passphrase; see [`core_unlock`]).
 pub const ALLOWED_METHODS: &[&str] = &[
-    "app.info", "data.today", "data.live", "data.sleep", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
+    "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
     "sync.status", "sync.run", "relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel",
 ];
 

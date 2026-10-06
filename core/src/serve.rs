@@ -515,6 +515,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("data.today", Handler::Reply(data_today)),
     ("data.live", Handler::Reply(data_live)),
     ("data.sleep", Handler::Reply(data_sleep)),
+    ("data.contract", Handler::Reply(data_contract)),
     ("data.facts", Handler::Reply(data_facts)),
     ("import.run", Handler::Spawn(import_run)),
     ("import.last", Handler::Reply(import_last)),
@@ -823,6 +824,32 @@ fn data_sleep(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     night
         .to_serde()
         .ok_or_else(|| Failure::serve("internal", "sleep result is not JSON"))
+}
+
+/// `data.contract`: the numeric metrics with unit, cadence and declared scopes, in contract order. Reads
+/// nothing from the store, so it answers on a locked one.
+fn data_contract(_session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    let contract = Contract::get()?;
+    let metrics: Vec<Value> = contract
+        .metrics
+        .iter()
+        .filter_map(|item| {
+            let scopes: Vec<&String> = contract
+                .source_scopes
+                .iter()
+                .filter(|scope| {
+                    contract
+                        .streams_for
+                        .iter()
+                        .any(|entry| entry.metric == item.metric && &entry.source_scope == *scope)
+                })
+                .collect();
+            (!scopes.is_empty()).then(|| {
+                json!({"metric": item.metric, "unit": item.unit, "cadence": item.cadence, "scopes": scopes})
+            })
+        })
+        .collect();
+    Ok(json!({"scopes": contract.source_scopes, "metrics": metrics}))
 }
 
 /// `_contract_pairs`: every (numeric metric, scope) the contract declares a stream for, in contract order.

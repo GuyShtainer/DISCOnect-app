@@ -262,6 +262,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "data.today",
             "data.live",
             "data.sleep",
+            "data.contract",
             "data.facts",
             "import.run",
             "import.last",
@@ -490,6 +491,27 @@ fn sleep_night_with_two_equally_near_offsets_takes_the_earlier() {
     only_offsets(&conn, &[("2025-06-30T03:00:00Z", 3600), ("2025-06-30T05:00:00Z", 7200)]);
     let night = Rig::new(&db).send("data.sleep", json!({}))["result"].clone();
     assert_eq!(night["sessions"][0]["utc_offset_s"], 3600);
+}
+
+#[test]
+fn contract_lists_the_numeric_metrics_with_their_declared_scopes_and_answers_locked() {
+    let (_d1, locked_db) = encrypted_copy();
+    let (_d2, plain_db) = plain_store();
+    for db in [&locked_db, &plain_db] {
+        let reply = Rig::new(db).send("data.contract", json!({}))["result"].clone();
+        assert_eq!(reply["scopes"], json!(["device", "vendor_cloud", "local", "live"]));
+        let rows = reply["metrics"].as_array().expect("metrics");
+        let by = |name: &str| rows.iter().find(|r| r["metric"] == name).cloned().expect(name);
+        assert_eq!(by("heart_rate")["cadence"], "sample");
+        assert_eq!(by("stress")["cadence"], "sample");
+        assert_eq!(by("steps")["cadence"], "daily");
+        assert_eq!(by("steps")["scopes"], json!(["local"]));
+        assert_eq!(rows[0]["metric"], "heart_rate");
+        for row in rows {
+            assert_eq!(row.as_object().expect("object").len(), 4);
+            assert!(!row["scopes"].as_array().expect("scopes").is_empty());
+        }
+    }
 }
 
 #[test]
