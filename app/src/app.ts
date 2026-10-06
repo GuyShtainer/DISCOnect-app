@@ -21,6 +21,8 @@ type LedgerRow = {
   not_covered: number; gaps: { from?: string; to?: string; status?: string; days?: number }[]; gaps_truncated: boolean;
 };
 type LiveBlock = { records: number; samples: number; first_day: string | null; last_day: string | null };
+type LiveSession = { start_utc: string; end_utc: string; start_local: string; end_local: string; minutes: number };
+type LiveDay = { day: string; sessions: LiveSession[]; metrics: { metric: string; unit: string | null; minutes: number; median: number | null }[] };
 type ImportRun = {
   id: number; started_at: string | null; finished_at: string | null; transport: string; status: string;
   files_seen: number; files_imported: number; files_duplicate: number; files_failed: number; records_written: number; error: string | null;
@@ -222,13 +224,20 @@ function header(out: ParentNode, title: string, sub: string): void {
 }
 
 // ---- Today -----------------------------------------------------------------------------
-/** The live-link card: the day's means of the folded minute samples, apart from every other scope. Nothing when no link was ever stored. */
+/** The live-link card: the day's sessions and, per folded metric, the median of the link's minutes, apart from
+ *  every other scope. Nothing when no link was ever stored. Today's sessions when there are any, else the
+ *  latest day with one (the health block's last day is a UTC date, so its local neighbour is tried too). */
 async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
   const live = health?.live;
   if (!live || !live.records || !live.last_day) return;
-  const lastDay = live.last_day;
-  const results = await Promise.all(LIVE_FOLDED.map((m) => core.call<Metric>("data.metric", { metric: m.metric, scope: "live", days: 1, last_day: lastDay }).catch(() => null)));
+  let day: LiveDay | null = null;
+  for (const candidate of [todayDay, live.last_day, dayAfter(live.last_day)]) {
+    const found = await core.call<LiveDay>("data.live", { day: candidate }).catch(() => null);
+    if (found && found.sessions.length) { day = found; break; }
+    if (!day && found) day = found;
+  }
+  if (!day) return;
   const card = el("section", "card");
   card.setAttribute("aria-label", "Live link");
   const row = el("div", "row");
@@ -237,21 +246,37 @@ async function liveCard(out: ParentNode, todayDay: string): Promise<void> {
   tag.append(el("span", "swatch live"), document.createTextNode(scopeWord("live")));
   row.append(tag);
   card.append(row);
-  card.append(el("span", "caption muted", `${live.records} session records · ${live.samples} minute samples · ${lastDay === todayDay ? "today" : `latest ${lastDay}`}`));
+  const n = day.sessions.length;
+  const spans = day.sessions.map((x) => `${clock(x.start_local)}–${clock(x.end_local, x.start_local)}`).join(", ");
+  const minutes = day.sessions.reduce((acc, x) => acc + x.minutes, 0);
+  const when = day.day === todayDay ? "today" : `latest ${day.day}`;
+  card.append(el("span", "caption muted", n
+    ? `${n} ${n === 1 ? "session" : "sessions"} · ${spans} · ${minutes} min · ${when}`
+    : `No session ${when === "today" ? "today" : `on ${day.day}`} · ${live.records} session records stored`));
   const grid = el("div", "grid3 body live-grid");
-  results.forEach((m, i) => {
-    const d = m?.days.find((x) => x.day === lastDay) ?? m?.days[m.days.length - 1];
-    if (!m || !d || d.value === null) return;
-    const spec = LIVE_FOLDED[i];
-    grid.append(el("span", "", metricLabel(spec.metric)));
-    const v = el("span", "value-small scope-live", fmt(d.value, null));
-    if (spec.unit) v.append(el("span", "unit", ` ${spec.unit}`));
+  for (const m of day.metrics) {
+    if (!m.minutes || m.median === null) continue;
+    grid.append(el("span", "", metricLabel(m.metric)));
+    const v = el("span", "value-small scope-live", fmt(m.median, null));
+    if (m.unit && m.unit !== "score") v.append(el("span", "unit", ` ${m.unit}`));
     grid.append(v);
-    grid.append(el("span", "muted caption", "daily mean of the link's minutes"));
-  });
+    grid.append(el("span", "muted caption", `median over ${m.minutes} min`));
+  }
   card.append(grid);
-  card.append(el("span", "caption muted", "Means of the minutes the watch sent while the link ran. Kept apart from the device's own figures and never combined with them. Data health lists every session."));
+  card.append(el("span", "caption muted", "Medians of the minutes the watch sent while the link ran. Kept apart from the device's own figures and never combined with them. Data health lists every session."));
   out.append(card);
+}
+
+/** "HH:MM" of a local `YYYY-MM-DDTHH:MM`; with the date when it is not `sameDayAs`'s. */
+function clock(local: string, sameDayAs?: string): string {
+  const time = local.slice(11, 16);
+  return sameDayAs && local.slice(0, 10) !== sameDayAs.slice(0, 10) ? `${local.slice(0, 10)} ${time}` : time;
+}
+
+function dayAfter(day: string): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
 }
 
 async function screenToday(out: ParentNode): Promise<void> {

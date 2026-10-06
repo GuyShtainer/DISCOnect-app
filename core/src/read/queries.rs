@@ -17,7 +17,7 @@ use super::pyrepr;
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
 use crate::model::Instant;
-use crate::time::{now_instant, parse_iso_utc};
+use crate::time::{iso_utc, now_instant, parse_iso_utc};
 use crate::wirejson::PyStr;
 use crate::writer::{py_round, py_sum};
 
@@ -528,6 +528,114 @@ fn latest_sample_day(
 
 /// `latest_value`: the newest `(local day, value)` stored for one numeric metric and scope, or None.
 /// A sample metric reports the mean of its newest local day.
+/// `LIVE_SCOPE`: the live link's source scope.
+pub const LIVE_SCOPE: &str = "live";
+
+/// `_local_minute`: `YYYY-MM-DDTHH:MM` on the watch's clock at `moment` (UTC assumed where no offset is known).
+fn local_minute(moment: Instant, offsets: &ClockOffsets) -> Result<String, ReadError> {
+    let offset = offsets.offset_at(moment).unwrap_or(0);
+    moment
+        .checked_add_signed(Duration::seconds(offset))
+        .map(|local| local.format("%Y-%m-%dT%H:%M").to_string())
+        .ok_or(ReadError::Overflow)
+}
+
+/// `live_day`: the live link on one local day — its sessions (runs of `json:live` records whose spans
+/// overlap or touch, kept when their start or end falls on `day` on the watch's clock, each with its
+/// count of distinct folded minutes) and, per metric the fold keeps in contract order, the minutes
+/// whose local day is `day` with their lower median (null when none).
+pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<Value, ReadError> {
+    let date = parse_day(day, "day")?;
+    let day = iso(date);
+    let offsets = load_offsets(conn)?;
+    let mut streams: Vec<&str> = Vec::new();
+    for item in &contract.session_streams_for {
+        if item.source_scope == LIVE_SCOPE {
+            for stream in &item.streams {
+                if !streams.contains(&stream.as_str()) {
+                    streams.push(stream);
+                }
+            }
+        }
+    }
+    let placeholders = vec!["?"; streams.len()].join(",");
+    let mut sessions: Vec<(Instant, Instant)> = Vec::new();
+    {
+        let mut statement = conn.prepare(&format!(
+            "SELECT start_utc, end_utc FROM raw_records WHERE stream IN ({placeholders}) \
+             AND start_utc IS NOT NULL AND end_utc IS NOT NULL ORDER BY start_utc, end_utc"
+        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(streams.iter()))?;
+        while let Some(row) = rows.next()? {
+            let first = parse_moment(text(row.get_ref(0)?)?)?;
+            let last = parse_moment(text(row.get_ref(1)?)?)?;
+            if local_day(&offsets, first, false)? != day && local_day(&offsets, last, false)? != day {
+                continue;
+            }
+            match sessions.last_mut() {
+                Some(previous) if first <= previous.1 => {
+                    if last > previous.1 {
+                        previous.1 = last;
+                    }
+                }
+                _ => sessions.push((first, last)),
+            }
+        }
+    }
+    let mut out_sessions = Vec::new();
+    for (first, last) in &sessions {
+        let (low, high) = (iso_utc(first), iso_utc(last));
+        let minutes: i64 = conn.query_row(
+            "SELECT count(DISTINCT ts_utc) FROM metric_samples WHERE source_scope=? AND ts_utc BETWEEN ? AND ?",
+            rusqlite::params![LIVE_SCOPE, low, high],
+            |row| row.get(0),
+        )?;
+        out_sessions.push(json!({
+            "start_utc": low,
+            "end_utc": high,
+            "start_local": local_minute(*first, &offsets)?,
+            "end_local": local_minute(*last, &offsets)?,
+            "minutes": minutes,
+        }));
+    }
+    // local days can begin up to 14 h before/after their UTC namesake; over-fetch and filter
+    let fetch_low = iso(shift(date, -1)?);
+    let fetch_high = iso(shift(date, 2)?);
+    let mut metrics = Vec::new();
+    for item in &contract.metrics {
+        let folded = contract
+            .session_streams_for
+            .iter()
+            .any(|s| s.metric == item.metric && s.source_scope == LIVE_SCOPE);
+        if !folded {
+            continue;
+        }
+        let mut statement = conn.prepare(
+            "SELECT ts_utc, value FROM metric_samples WHERE metric=? AND source_scope=? \
+             AND ts_utc >= ? AND ts_utc < ? ORDER BY ts_utc",
+        )?;
+        let mut rows = statement.query(rusqlite::params![item.metric, LIVE_SCOPE, fetch_low, fetch_high])?;
+        let mut values: Vec<(f64, Stored)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let moment = parse_moment(text(row.get_ref(0)?)?)?;
+            if local_day(&offsets, moment, false)? != day {
+                continue;
+            }
+            let cell = row.get_ref(1)?;
+            values.push((number(cell)?, stored(cell)));
+        }
+        // the lower median: element (n - 1) / 2 of the ascending order (a stable sort, as Python's)
+        values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let count = values.len();
+        let median = match count {
+            0 => Value::Null,
+            n => values.into_iter().nth((n - 1) / 2).map(|(_, v)| v).unwrap_or(Ok(Value::Null))?,
+        };
+        metrics.push(json!({"metric": item.metric, "unit": item.unit, "minutes": count, "median": median}));
+    }
+    Ok(json!({"day": day, "sessions": out_sessions, "metrics": metrics}))
+}
+
 pub fn latest_value(
     conn: &Connection,
     contract: &Contract,

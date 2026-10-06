@@ -260,6 +260,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "data.health",
             "data.metric",
             "data.today",
+            "data.live",
             "data.facts",
             "import.run",
             "import.last",
