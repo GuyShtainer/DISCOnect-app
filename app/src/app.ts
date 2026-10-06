@@ -1138,8 +1138,12 @@ function sleepMinutes(m: number): string {
   return n >= 60 ? `${Math.floor(n / 60)} h ${String(n % 60).padStart(2, "0")} min` : `${n} min`;
 }
 
-/** A day's daily sleep figures, by source: the device's sleep length (seconds) and the vendor cloud's score. */
-type DailySleep = { device?: number; vendor_cloud?: number };
+/** One daily figure of a night: the sleep length (`sleep_duration`, in MINUTES) or the sleep score. */
+type DailyFigure = { metric: "sleep_duration" | "sleep_score"; value: number };
+/** A day's daily sleep figure per source: the scope's own metric (device: sleep length in minutes; vendor cloud: sleep
+ *  score) when it has one, else the other metric stored for that scope. */
+type DailySleep = { device?: DailyFigure; vendor_cloud?: DailyFigure };
+const OWN_METRIC: Record<string, DailyFigure["metric"]> = { device: "sleep_duration", vendor_cloud: "sleep_score" };
 
 /** The days of a month (`YYYY-MM`) on which any source has a night (sleep duration from the device, sleep score from the
  *  vendor cloud), each with the daily figure that marks it. */
@@ -1147,12 +1151,20 @@ async function sleepMarks(month: string): Promise<Map<string, DailySleep>> {
   const [y, m] = month.split("-").map(Number);
   const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
   const last = `${month}-${String(days).padStart(2, "0")}`;
-  const reads = await Promise.all([["sleep_duration", "device"], ["sleep_score", "vendor_cloud"]].map(([metric, scope]) =>
+  const pairs = SLEEP_SCOPES.flatMap((scope) => (["sleep_duration", "sleep_score"] as const).map((metric) => ({ metric, scope })));
+  const reads = await Promise.all(pairs.map(({ metric, scope }) =>
     core.call<Metric>("data.metric", { metric, scope, days, last_day: last }).catch(() => null)));
   const marked = new Map<string, DailySleep>();
   reads.forEach((r, i) => {
-    const scope = i === 0 ? "device" : "vendor_cloud";
-    for (const d of r?.days ?? []) if (d.value !== null) marked.set(d.day, { ...(marked.get(d.day) ?? {}), [scope]: d.value });
+    const { metric, scope } = pairs[i];
+    for (const d of r?.days ?? []) {
+      if (d.value === null) continue;
+      const have = marked.get(d.day) ?? {};
+      const now = have[scope as keyof DailySleep];
+      // the scope's own metric wins; the other one only fills an empty place
+      if (!now || (metric === OWN_METRIC[scope] && now.metric !== metric)) have[scope as keyof DailySleep] = { metric, value: d.value };
+      marked.set(d.day, have);
+    }
   });
   return marked;
 }
@@ -1173,7 +1185,8 @@ function sleepCalendar(chosen: string | null, firstMonth: string, firstMarks: Ma
     const next = el("button", "secondary", "›") as HTMLButtonElement;
     next.setAttribute("aria-label", "Next month");
     const step = (by: number): void => {
-      const d = new Date(Date.UTC(y, m - 1 + by, 1));
+      const [py, pm] = month.split("-").map(Number); // the pending month, not the drawn one: two quick clicks move two months
+      const d = new Date(Date.UTC(py, pm - 1 + by, 1));
       month = d.toISOString().slice(0, 7);
       const mine = ++ticket;
       void sleepMarks(month).then((got) => { if (mine === ticket) { marks = got; draw(); } });
@@ -1229,9 +1242,17 @@ function hypnogram(session: SleepSession): HTMLElement {
   const off = known ? (session.utc_offset_s as number) : 0;
   const W = 960, X0 = 64, X1 = 944, ROW = 32, TOP = 8, H = TOP + ROW * 4 + 28;
   const x = (t: number): number => X0 + ((t - t0) / (t1 - t0)) * (X1 - X0);
+  // the hover text of a segment: the core's own local stage times; UTC (and said so) while no offset is stored
+  const segTitle = (s: SleepStage & { a: number; b: number }): SVGElement => {
+    const t = svgEl("title", {});
+    t.textContent = known
+      ? `${STAGE_WORD[s.stage] ?? s.stage} ${s.start_local ?? hhmm(s.a, off)}\u2013${s.end_local ?? hhmm(s.b, off)}`
+      : `${STAGE_WORD[s.stage] ?? s.stage} ${hhmm(s.a, 0)}\u2013${hhmm(s.b, 0)} UTC`;
+    return t;
+  };
   const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Sleep stages through the night" });
   const defs = svgEl("defs", {});
-  const pat = svgEl("pattern", { id: "hypno-unmeasurable", patternUnits: "userSpaceOnUse", width: "6", height: "6", patternTransform: "rotate(45)" });
+  const pat = svgEl("pattern", { id: `hypno-unmeasurable-${session.source_scope}`, patternUnits: "userSpaceOnUse", width: "6", height: "6", patternTransform: "rotate(45)" });
   pat.append(svgEl("line", { x1: "0", y1: "0", x2: "0", y2: "6", class: "hatch" }));
   defs.append(pat);
   svg.append(defs);
@@ -1245,46 +1266,65 @@ function hypnogram(session: SleepSession): HTMLElement {
   for (const s of stages) {
     const x0 = x(s.a), w = Math.max(1, x(s.b) - x0);
     if (s.stage === "unmeasurable") {
-      svg.append(svgEl("rect", { x: String(x0), y: String(TOP), width: String(w), height: String(ROW * 4), fill: "url(#hypno-unmeasurable)", class: "unmeasurable" }));
+      const hatched = svgEl("rect", { x: String(x0), y: String(TOP), width: String(w), height: String(ROW * 4), fill: `url(#hypno-unmeasurable-${session.source_scope})`, class: "unmeasurable" });
+      hatched.append(segTitle(s));
+      svg.append(hatched);
       continue;
     }
     const row = STAGE_ROWS.indexOf(s.stage);
     if (row < 0) continue; // a stage word this screen does not know is not drawn
-    svg.append(svgEl("rect", { x: String(x0), y: String(TOP + row * ROW + 4), width: String(w), height: String(ROW - 8), class: `stage-${s.stage}` }));
+    const bar = svgEl("rect", { x: String(x0), y: String(TOP + row * ROW + 4), width: String(w), height: String(ROW - 8), class: `stage-${s.stage}` });
+    bar.append(segTitle(s));
+    svg.append(bar);
   }
   const hour = 3600000;
   const span = (t1 - t0) / hour;
   const stride = Math.max(1, Math.ceil(span / 8)) * hour;
-  for (let t = Math.ceil((t0 + off * 1000) / stride) * stride - off * 1000; t <= t1; t += stride) {
-    const tx = svgEl("text", { x: String(x(t)), y: String(TOP + ROW * 4 + 18), "text-anchor": "middle", class: "tick" });
+  const ticks: number[] = [];
+  for (let t = Math.ceil((t0 + off * 1000) / stride) * stride - off * 1000; t <= t1; t += stride) ticks.push(t);
+  if (!ticks.length) ticks.push(t0, t1); // no whole hour inside a short night: label its two ends
+  ticks.forEach((t, i) => {
+    const edge = i === ticks.length - 1 && X1 - x(t) < 24; // the last label never runs past the viewBox
+    const tx = svgEl("text", { x: String(x(t)), y: String(TOP + ROW * 4 + 18), "text-anchor": edge ? "end" : "middle", class: "tick" });
     tx.textContent = hhmm(t, off);
     svg.append(tx);
-  }
+  });
   box.append(svg);
   return box;
 }
 
 async function screenSleep(out: ParentNode, later: Later, sub: string | undefined): Promise<void> {
   const health = await core.call<Health>("data.health", { window_days: 7 }).catch(() => null);
-  header(out, "Sleep", sub ?? "");
+  header(out, "Sleep", ""); // the subtitle is the night the core answers with, set below
   if (health?.never_imported) {
     const nothing = bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder on the Import screen. Every screen fills from the first import.");
     nothing.append(importLink());
     out.append(nothing);
     return;
   }
-  if (sub !== undefined && !DAY_RE.test(sub)) {
+  const notANight = (): void => {
     out.append(bannerEl("Not a night", "A night is written as a date, like 2025-06-15. Pick one in the calendar."));
+  };
+  if (sub !== undefined && !DAY_RE.test(sub)) {
+    notANight();
     sub = undefined;
   }
-  const night = await core.call<Night>("data.sleep", sub ? { date: sub } : {});
+  let night: Night;
+  try {
+    night = await core.call<Night>("data.sleep", sub ? { date: sub } : {});
+  } catch (e) {
+    // a date that is shaped right but not on the calendar (2025-02-30): the core says bad_params; show the latest night
+    if (!(sub && core.isCoreError(e) && e.code === "bad_params")) throw e;
+    notANight();
+    night = await core.call<Night>("data.sleep", {});
+  }
   const date = night.date;
   const month = (date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
   const marks = await sleepMarks(month);
   if (date && night.sessions.length && !marks.has(date)) marks.set(date, {});
   out.append(sleepCalendar(date, month, marks));
   if (!date) {
-    out.append(el("span", "caption muted", night.reason ?? "No sleep is stored yet."));
+    out.append(el("span", "caption muted", sentence(night.reason) ?? "No sleep is stored yet."));
     return;
   }
   const head = out.querySelector(".row .caption");
@@ -1296,12 +1336,13 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
     if (!s) {
       const box = el("div", "absent");
       const daily = date ? marks.get(date)?.[scope as keyof DailySleep] : undefined;
-      box.append(el("span", "body", `No stage record of this night from ${scopeWord(scope)}`));
-      if (typeof daily === "number") {
+      box.append(el("span", "body", `No record of this night from ${scopeWord(scope)}`));
+      if (daily) {
         // the day is marked by a daily figure alone (a summary without a session): say what is stored
-        box.append(el("span", "caption muted", scope === "device"
-          ? `Only a sleep length is stored for the day: ${sleepMinutes(daily / 60)}.`
-          : `Only a sleep score is stored for the day: ${Math.round(daily)}.`));
+        const own = daily.metric === OWN_METRIC[scope];
+        box.append(el("span", "caption muted", daily.metric === "sleep_duration"
+          ? `${own ? "Sleep length for the day" : "Only a sleep length is stored for the day"}: ${sleepMinutes(daily.value)}.`
+          : `${own ? "Sleep score for the day" : "Only a sleep score is stored for the day"}: ${Math.round(daily.value)}.`));
       }
       two.append(box);
       continue;
@@ -1371,14 +1412,15 @@ async function screenSleep(out: ParentNode, later: Later, sub: string | undefine
   out.append(table);
 
   const hrv = await core.call<Metric>("data.metric", { metric: "hrv_rmssd", scope: "device", days: 30, last_day: date }).catch(() => null);
+  const last = await core.call<Metric>("data.metric", { metric: "hrv_last_night_average", scope: "device", days: 1, last_day: date }).catch(() => null);
   const card = el("section", "card");
-  card.append(el("h2", "heading", metricLabel("hrv_rmssd")));
-  const tonight = hrv?.days.find((d) => d.day === date)?.value ?? null;
+  card.append(el("h2", "heading", metricLabel("hrv_last_night_average")));
+  const tonight = last?.days.find((d) => d.day === date)?.value ?? null;
   card.append(el("span", "value", tonight === null ? "not recorded" : fmt(tonight, "ms")));
   out.append(card);
   if (hrv && hrv.days.some((d) => d.value !== null)) {
     const chart = el("div", "chart short");
-    card.append(chart, el("span", "caption muted", `The 30 days ending ${date}, the ${scopeWord("device")} source; a line never bridges a gap.`));
+    card.append(chart, el("span", "caption muted", `The line is ${metricLabel("hrv_rmssd")}, the 30 days ending ${date}, the ${scopeWord("device")} source; it never bridges a gap.`));
     later(() => drawTrend(chart, [{ scope: hrv.scope, unit: hrv.unit, days: hrv.days }], metricLabel("hrv_rmssd")));
   } else {
     card.append(el("span", "caption muted", "No HRV readings in these 30 days."));

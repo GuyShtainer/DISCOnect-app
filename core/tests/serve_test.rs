@@ -458,6 +458,40 @@ fn sleep_night_without_an_offset_has_no_local_keys_and_a_stage_can_cross_midnigh
     assert_eq!(bare["sessions"][0]["stages"][0]["start_utc"], "2025-06-14T20:30:00Z");
 }
 
+fn only_offsets(conn: &rusqlite::Connection, pairs: &[(&str, i64)]) {
+    conn.execute("DELETE FROM clock_offsets", []).expect("delete");
+    for (moment, seconds) in pairs {
+        conn.execute("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES(?, ?)", rusqlite::params![moment, seconds])
+            .expect("insert");
+    }
+}
+
+#[test]
+fn sleep_night_without_an_end_takes_the_offset_nearest_its_start() {
+    // the 06-30 device session runs 21:00Z..04:00Z; the 05:00Z offset is nearest its end, the 21:00Z one its start
+    let (_dir, db) = live_copy();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    only_offsets(&conn, &[("2025-06-29T21:00:00Z", 3600), ("2025-06-30T05:00:00Z", 7200)]);
+    let mut rig = Rig::new(&db);
+    let with_end = rig.send("data.sleep", json!({}))["result"].clone();
+    assert_eq!(with_end["sessions"][0]["utc_offset_s"], 7200);
+    conn.execute("UPDATE sleep_sessions SET end_utc=NULL WHERE date='2025-06-30'", [])
+        .expect("update");
+    let night = rig.send("data.sleep", json!({}))["result"].clone();
+    assert_eq!(night["sessions"][0]["utc_offset_s"], 3600);
+    assert_eq!(stages_local(&night["sessions"][0]), [pair("22:00", "23:00")]);
+}
+
+#[test]
+fn sleep_night_with_two_equally_near_offsets_takes_the_earlier() {
+    let (_dir, db) = live_copy();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    // the session's end, 04:00Z, is exactly between the two
+    only_offsets(&conn, &[("2025-06-30T03:00:00Z", 3600), ("2025-06-30T05:00:00Z", 7200)]);
+    let night = Rig::new(&db).send("data.sleep", json!({}))["result"].clone();
+    assert_eq!(night["sessions"][0]["utc_offset_s"], 3600);
+}
+
 #[test]
 fn sleep_needs_the_store_unlocked() {
     let (_dir, db) = encrypted_copy();
