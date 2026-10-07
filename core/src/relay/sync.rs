@@ -1111,7 +1111,12 @@ const HOLD_EXEMPT_REASONS: [&str; 9] = [
 /// left out of an automatic run.
 fn held_back(conn: &Connection) -> Result<HashSet<String>, SyncError> {
     let now = crate::time::now_instant();
-    let mut stmt = conn.prepare("SELECT name, noted_at, reason FROM relay_bundles WHERE status='rejected'")?;
+    // a half-applied name (`applying`) whose refetch was rejected keeps its marker and carries the reason: held the
+    // same way; a good copy's booking clears the reason, so a crash-only marker is never held
+    let mut stmt = conn.prepare(
+        "SELECT name, noted_at, reason FROM relay_bundles \
+         WHERE status='rejected' OR (status='applying' AND reason IS NOT NULL)",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
     })?;

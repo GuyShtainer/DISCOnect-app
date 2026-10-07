@@ -779,3 +779,39 @@ fn an_unreachable_lan_site_keeps_the_name_pending() {
     assert_eq!((again[2].pulled, again[2].error), (1, None));
     server.stop();
 }
+
+/// BL-5 review: the marker kept by BL-5b carries the reason, so the automatic run does not fetch a damaged
+/// half-applied copy on every tick; a click still does, and a good copy's booking clears the reason.
+#[test]
+fn a_half_applied_name_rejected_on_refetch_is_held_like_a_rejected_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let roots = three_roots(tmp.path());
+    let a = device();
+    import_day(&a, tmp.path(), "2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let (sites, mut reports) = open(&roots[..1]);
+    let name = push_all(a.conn(), &master(), &sites, &mut reports).expect("push").bundles[0].clone();
+    let b = device();
+    let (sites, mut reports) = open(&roots[..1]);
+    assert_eq!(pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull").applied, vec![name.clone()]);
+    b.conn()
+        .execute("UPDATE relay_bundles SET status='applying' WHERE name=?", rusqlite::params![name])
+        .expect("a crash before the derive step");
+    let path = roots[0].join(&name);
+    let good = fs::read(&path).expect("read");
+    let mut bad = good.clone();
+    bad[good.len() / 2] ^= 0xFF;
+    fs::write(&path, &bad).expect("damage");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run1 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 1"); // a crash-only marker is never held
+    assert_eq!((run1.rejected.len(), run1.status, reports[0].rejected), (1, "partial", 1));
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles WHERE status='applying' AND reason IS NOT NULL"), 1);
+    let (sites, mut reports) = open(&roots[..1]);
+    let run2 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 2"); // held: nothing fetched, run clean
+    assert!(run2.applied.is_empty() && run2.rejected.is_empty(), "{run2:?}");
+    assert_eq!((run2.status, reports[0].rejected, reports[0].pulled), ("ok", 0, 0));
+    fs::write(&path, &good).expect("restore");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run3 = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull 3"); // a click fetches the good copy
+    assert_eq!((run3.applied, run3.status), (vec![name], "ok"));
+    assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles WHERE status='applied' AND reason IS NULL"), 1);
+}

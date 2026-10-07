@@ -38,7 +38,9 @@ type Health = {
   live?: LiveBlock; never_imported: boolean; recent_imports?: ImportRun[];
   coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[]; unattributed_failures?: number; undatable_files?: number };
 };
-const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files", relay: "sync", reparse: "re-read" };
+const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files", relay: "sync", reparse: "re-read", gadgetbridge: "Gadgetbridge export", ciq: "watch app" };
+/** A `relay` run still `running` while this app's own sync (a click or a tick) is out: not interrupted, just not ended (BL-5a review). */
+const syncRunOfOurs = (run: ImportRun): boolean => run.status === "running" && run.transport === "relay" && (autoSync.running || syncRun.running);
 
 // The metric list is read once per session from data.contract (contract order; sample cadence = daily mean);
 // each entry's scopes (the live link last, where a session stream folds the metric) are what Trends and Sleep draw.
@@ -768,15 +770,16 @@ const autoSync = {
   line: "", // the walk line under the switch: "Synced on its own at HH:MM · N new" or the failure, once
   running: false, // a tick holds the core's one task slot: Sync now and Start an offer wait for it instead of hearing busy
   pending: null as Promise<void> | null,
-  silent: 0, // ticks in a row that heard busy/locked (the slot held by a long import, a sync, a pairing); BL-5a
+  silent: 0, // ticks in a row that heard busy (the slot held by a long import, a sync, a pairing); BL-5a
   waitingSince: null as Date | null, // the first silent tick of the run; the walk line says so from the third
 };
-const AUTO_SYNC_SILENT_SAY = 3; // ≥10 min of silence before the walk line names the wait
+const AUTO_SYNC_SILENT_SAY = 3; // silent ticks in a row, and two periods of wall clock (a focus runs a tick too), before the line names the wait
 const clockHm = (d: Date): string => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 /** The walk line's tail while ticks keep hearing busy (BL-5a): empty until the third silent tick in a row. */
 function autoSyncWaitText(): string {
-  return autoSync.silent >= AUTO_SYNC_SILENT_SAY && autoSync.waitingSince
-    ? ` Waiting since ${clockHm(autoSync.waitingSince)}: something else is using the store.` : "";
+  const since = autoSync.waitingSince;
+  return autoSync.silent >= AUTO_SYNC_SILENT_SAY && since && Date.now() - since.getTime() >= 2 * autoSync.every
+    ? ` Waiting since ${clockHm(since)}: something else is using the store.` : "";
 }
 function autoSyncLoad(): void {
   try { autoSync.on = localStorage.getItem(AUTO_SYNC_STORE) !== "off"; } catch { autoSync.on = true; }
@@ -785,6 +788,7 @@ function autoSyncSet(on: boolean): void {
   autoSync.on = on;
   try { if (on) localStorage.removeItem(AUTO_SYNC_STORE); else localStorage.setItem(AUTO_SYNC_STORE, "off"); } catch { /* storage is optional */ }
   if (!on) autoSync.line = "";
+  autoSync.silent = 0; autoSync.waitingSince = null; // a wait never outlives the switch
 }
 async function autoSyncRun(): Promise<void> {
   if (PHONE || !autoSync.on || locked() || syncRun.running || pairPushing || autoSync.running || current() === "sync/pair") return;
@@ -805,14 +809,15 @@ async function autoSyncTick(): Promise<void> {
     fresh = r.pull.records_new;
     autoSync.line = `Synced on its own at ${clock(autoSync.at)} · ${fresh} new${r.status === "partial" || r.pull.status === "partial" ? " (partial)" : ""}${failed > 0 ? ` · ${failed} of ${polled.length} relays could not be used; see Relays below` : ""}`;
   } catch (e) {
-    if (core.isCoreError(e) && (e.code === "busy" || e.code === "locked")) {
+    if (core.isCoreError(e) && e.code === "busy") {
       // the slot is held: nothing to do this tick; from the third silent tick in a row the walk line says so (BL-5a)
       autoSync.silent += 1;
       autoSync.waitingSince ??= new Date();
       if (autoSync.silent >= AUTO_SYNC_SILENT_SAY && current() === "sync") void route();
       return;
     }
-    if (core.isCoreError(e) && (e.code === "not_found" || e.code === "not_folder")) return; // no store or no folder is not a wait; the next tick looks again
+    // locked = the store's key is not unlocked (never a held slot), no store, no folder: not a wait; the next tick looks again
+    if (core.isCoreError(e) && (e.code === "locked" || e.code === "not_found" || e.code === "not_folder")) return;
     if (!autoSync.on) return;
     autoSync.at = new Date();
     autoSync.silent = 0; autoSync.waitingSince = null;
@@ -1995,6 +2000,7 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
   }
   if (importUi.running) return bannerEl("Busy", IMPORT_BUSY); // nothing of ours runs, yet the slot is held
   if (!run) return bannerEl("Nothing imported yet", "Drop an export zip or a copied watch folder below. Every screen fills from the first import.");
+  if (syncRunOfOurs(run)) return bannerEl("Syncing", "A sync is bringing records in · the counts arrive when it ends");
   if (run.status === "running" || run.status === "interrupted") {
     // the newest run never ended and nothing of ours runs now: `interrupted` = a later write open noticed the dead
     // writer; `running` = not noticed yet, or a command-line import running beside the app (7b-10)
@@ -2078,7 +2084,7 @@ async function screenImport(out: ParentNode): Promise<void> {
       } else {
         const word = run.status === "interrupted" ? "interrupted"
           : run.status === "cancelled" ? "cancelled"
-          : run.status === "running" ? (i === 0 && importUi.running ? "running" : "interrupted")
+          : run.status === "running" ? (i === 0 && (importUi.running || syncRunOfOurs(run)) ? "running" : "interrupted")
           : "done";
         grid.append(el("span", "caption", word));
       }
