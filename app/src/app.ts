@@ -2073,7 +2073,7 @@ function bannerEl(lead: string, text: string, error = false): HTMLElement {
 /** A core refusal in words: a lead and a sentence. The machine word (`busy`, `not_found`) and the core's own
  *  sentence never reach the page; the lint pins it. */
 const CORE_WORDS: Record<string, { lead: string; text: string }> = {
-  busy: { lead: "Another task is running", text: "An import, a sync, a pull or a pairing is using this store, or a key change is not finished. Try again when it ends." },
+  busy: { lead: "Another task is running", text: "An import, a sync, a pull or a pairing is using this store, the relay is still stopping, or a key change is not finished. Try again in a moment." },
   locked: { lead: "The store is locked", text: "Unlock it with your passphrase, then try again." },
   not_found: { lead: "Nothing there yet", text: "What this screen asked for does not exist yet." },
   bad_params: { lead: "That could not be used", text: "The request was not in a shape the core accepts. Close and reopen the app." },

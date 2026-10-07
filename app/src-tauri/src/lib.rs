@@ -156,22 +156,17 @@ fn mcp_command(app: tauri::AppHandle) -> String {
     }
 }
 
-/// Release filter: drop every `--debug-*` flag and, unless it is one of the flags that take no operand,
-/// the operand after it (so `--debug-window 390x844` leaves nothing behind).
+/// Release filter: drop every `--debug-*` flag and, when the next argument is not a `--` flag, that argument too
+/// (so `--debug-window 390x844` leaves nothing behind). No release path passes a door, so the shipped binary needs no
+/// table of which doors take an operand — and carries none of their names (BACKLOG, the ios-toolkit release IPA
+/// finding: the door names were visible to `strings`). The doors that take no operand are listed in the tests below.
 fn release_args(args: Vec<String>) -> Vec<String> {
-    // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
-    // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 34] = [
-        "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
-        "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed", "--debug-relays-remove-b", "--debug-live-seed",
-    ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
     while let Some(a) = it.next() {
         if !a.starts_with("--debug-") {
             out.push(a);
-        } else if !NO_OPERAND.contains(&a.as_str()) && it.peek().is_some_and(|n| !n.starts_with("--")) {
+        } else if it.peek().is_some_and(|n| !n.starts_with("--")) {
             it.next();
         }
     }
@@ -181,6 +176,27 @@ fn release_args(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod release_args_tests {
     use super::release_args;
+
+    /// The doors that take no operand (the last eighteen are the phone's pairing evidence flags, 12-F row 4): kept here
+    /// as the list the per-flag test walks; the release filter itself no longer needs it.
+    const NO_OPERAND: [&str; 34] = [
+        "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
+        "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed", "--debug-relays-remove-b", "--debug-live-seed",
+    ];
+
+    /// The release rule needs no table: a bare word after any door goes with it (no release path passes a door).
+    #[test]
+    fn a_release_build_drops_a_bare_word_after_any_door_and_names_no_door() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(release_args(v(&["--debug-drawer-open", "today", "--theme", "dark"])), v(&["--theme", "dark"]));
+        for flag in NO_OPERAND {
+            assert_eq!(release_args(v(&[flag, "--theme", "dark"])), v(&["--theme", "dark"]), "{flag}");
+        }
+        let src = include_str!("lib.rs");
+        let body = src.split("fn release_args(").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        assert_eq!(body.matches("\"--debug-").count(), 1, "the release filter names no door, only the prefix");
+    }
 
     #[test]
     fn a_release_build_drops_debug_flags_with_their_operands() {
