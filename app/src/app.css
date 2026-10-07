@@ -223,4 +223,5 @@ html.scanning .topbar { display: none; }
 .camera { min-height: 340px; display: flex; align-items: center; justify-content: center; }
 .finder { width: 220px; height: 220px; border: 2px solid var(--accent); border-radius: var(--radius-lg); }
 .phone .steps { flex-direction: column; gap: var(--space-2); }
+.phone .row.head { flex-direction: column; align-items: flex-start; gap: var(--space-1); } /* the subtitle below the title, never beside it */
 html.scanning .main { padding-top: calc(env(safe-area-inset-top) + var(--space-4)); }

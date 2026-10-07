@@ -253,7 +253,7 @@ async function refreshKey(): Promise<KeyStatus | null> {
     keyStatus = await core.call<KeyStatus>("key.status");
   } catch (e) {
     keyStatus = null;
-    banner = core.isCoreError(e) ? `The core is not available: ${e.message}` : String(e);
+    banner = "The core is not available. Quit and reopen the app.";
   }
   return keyStatus;
 }
@@ -334,7 +334,8 @@ async function route(): Promise<void> {
       banner.append(importLink());
       out.append(banner);
     } else {
-      out.append(core.isCoreError(e) ? bannerEl(e.code, e.message, true) : bannerEl("Error", String(e), true));
+      const w = coreWords(e);
+      out.append(bannerEl(w.lead, w.text, true));
     }
   }
   if (mine !== generation) return;
@@ -346,7 +347,7 @@ async function route(): Promise<void> {
 }
 
 function header(out: ParentNode, title: string, sub: string): void {
-  const row = el("div", "row");
+  const row = el("div", "row head"); // `.head`: on the phone the subtitle always sits below the title
   row.append(el("h1", "display", title));
   row.append(el("span", "caption muted", sub));
   out.append(row);
@@ -631,7 +632,7 @@ async function toggleLive(): Promise<void> {
     liveRunning = code === "live_busy"; // a refused second start: the first link still runs
     if (!liveRunning) {
       liveStatus = "stopped";
-      liveStop = code;
+      liveStop = "could not start"; // a refusal's machine word never shows
     }
   }
   drawLive();
@@ -1034,7 +1035,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   };
   const errorBanners = (): void => {
     if (syncError) {
-      out.append(bannerEl(SYNC_LEADS[syncError.code] ?? syncError.code, SYNC_WORDS[syncError.code] ?? syncError.message, true));
+      out.append(bannerEl(coreWords(syncError).lead, coreWords(syncError).text, true));
       syncError = null;
     }
     if (relayStoppedNote) {
@@ -1051,7 +1052,10 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     out.append(back);
     if (pairEnding) out.append(bannerEl(pairEnding.text, "", pairEnding.error));
     if (pairNoDevice) out.append(bannerEl("Nothing yet", "No device has reached this Mac yet. If the system asked about incoming connections, allow them; both devices must be on the same network."));
-    if (addrErr) out.append(bannerEl(addrErr.code, addrErr.message, true));
+    if (addrErr) {
+      const w = addrErr.code === "not_found" ? NO_RELAY : coreWords(addrErr); // no relay folder: say the step, not the code
+      out.append(bannerEl(w.lead, w.text, true));
+    }
     const grid = el("div", "card pair");
     const left = el("div", "field");
     const offerOpen = pairPhase === "open" || pairPhase === "bound" || pairPhase === "released";
@@ -1138,7 +1142,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
   card.append(kv);
   if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync push --relay <folder> --remember"));
-  if (statusErr) out.append(bannerEl(statusErr.code, statusErr.message, true));
+  if (statusErr) out.append(bannerEl(coreWords(statusErr).lead, coreWords(statusErr).text, true));
   if (status && addrs) {
     const sw = el("label", "switch");
     sw.append(el("span", "", "Keep serving while the app runs"));
@@ -1150,7 +1154,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     card.append(sw, addressSelect());
     card.append(el("p", "caption muted", "Off, the relay serves only while an offer is open. The switch resets when the app quits."));
   } else if (status && addrErr && !noRelay) {
-    card.append(el("p", "caption muted", `${addrErr.code}: ${addrErr.message}`));
+    card.append(el("p", "caption muted", coreLine(addrErr)));
   }
   // a running listener is always shown and always stoppable, whatever relay.addresses answered (review 7b-2 S4, S5)
   if (serving) {
@@ -1928,6 +1932,31 @@ function bannerEl(lead: string, text: string, error = false): HTMLElement {
   return b;
 }
 
+/** A core refusal in words: a lead and a sentence. The machine word (`busy`, `not_found`) and the core's own
+ *  sentence never reach the page; the lint pins it. */
+const CORE_WORDS: Record<string, { lead: string; text: string }> = {
+  busy: { lead: "Another task is running", text: "An import, a sync, a pull or a pairing is using this store, or a key change is not finished. Try again when it ends." },
+  locked: { lead: "The store is locked", text: "Unlock it with your passphrase, then try again." },
+  not_found: { lead: "Nothing there yet", text: "What this screen asked for does not exist yet." },
+  bad_params: { lead: "That could not be used", text: "The request was not in a shape the core accepts. Close and reopen the app." },
+  core_unavailable: { lead: "The core is not running", text: "Quit and reopen the app." },
+  pair_failed: { lead: "Pairing did not finish", text: "Cancel on the other device and start a new offer." },
+  relay_unreachable: { lead: "The relay is not reachable", text: "Check that the relay is available from this device, then try again." },
+  relay_auth_failed: { lead: SYNC_LEADS.relay_auth_failed, text: SYNC_WORDS.relay_auth_failed },
+  relay_unverified: { lead: SYNC_LEADS.relay_unverified, text: SYNC_WORDS.relay_unverified },
+  wrong_passphrase: { lead: "Wrong passphrase", text: "That passphrase does not open this database." },
+};
+const CORE_WORDS_OTHER = { lead: "That did not work", text: "Try again. If it keeps failing, close and reopen the app." };
+function coreWords(e: unknown): { lead: string; text: string } {
+  return (core.isCoreError(e) ? CORE_WORDS[e.code] : undefined) ?? CORE_WORDS_OTHER;
+}
+/** One line for a caption or an inline note. */
+function coreLine(e: unknown): string {
+  const w = coreWords(e);
+  return `${w.lead}. ${w.text}`;
+}
+const NO_RELAY = { lead: "No relay set up yet", text: "Pairing hands the key over through a relay, and this store has none. The Relay section on Sync shows the command that sets one; run it once, then come back." };
+
 function healthLiveCard(out: ParentNode, live: LiveBlock | undefined): void {
   if (!live || !live.records) return;
   const card = el("section", "card body");
@@ -2115,7 +2144,7 @@ async function screenKey(out: ParentNode): Promise<void> {
         location.hash = "#/today";
         await route();
       } catch (e) {
-        err.textContent = core.isCoreError(e) && e.code === "wrong_passphrase" ? "That passphrase does not open this database." : core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e);
+        err.textContent = core.isCoreError(e) && e.code === "wrong_passphrase" ? "That passphrase does not open this database." : coreLine(e);
       } finally {
         button.disabled = false;
       }
@@ -2143,7 +2172,7 @@ async function screenKey(out: ParentNode): Promise<void> {
       await refreshKey(); renderNav();
     } catch (e) {
       box.checked = !box.checked;
-      note.textContent = core.isCoreError(e) ? `${e.code}: ${e.message}` : String(e);
+      note.textContent = coreLine(e);
     }
   };
   const wrap = el("span"); wrap.style.display = "inline-flex"; wrap.style.alignItems = "center"; wrap.style.gap = "var(--space-2)";
