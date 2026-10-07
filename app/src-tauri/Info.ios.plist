@@ -5,6 +5,8 @@
 	<!-- iOS only: Tauri merges this file into the iPhone app's Info.plist (the Mac app does not read it). -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DISCOnect pulls your own encrypted data from your computer on this network.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>DISCOnect uses the camera only to scan the pairing code shown on your Mac.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

@@ -45,6 +45,11 @@ objc2 = "0.6.4"
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIApplication", "UIWindow", "UIView", "UILabel", "UIColor", "UIResponder", "UIScene", "UIWindowScene", "NSText", "UIFont", "UIScreen"] }
 block2 = "0.6.2"
 
+# 12-F row 4: the pairing screen's camera. A phone-only plugin (Android and iOS; the Mac app never links it), pinned to
+# one release with the lockfile. Apache-2.0 OR MIT. It is registered `#[cfg(mobile)]` in `lib.rs`, and the page reaches
+# it only through the iOS-scoped capability `capabilities/phone-scan.json`.
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+tauri-plugin-barcode-scanner = "=2.5.1"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

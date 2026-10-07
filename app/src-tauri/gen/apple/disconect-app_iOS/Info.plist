@@ -49,5 +49,7 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>DISCOnect uses the camera only to scan the pairing code shown on your Mac.</string>
 </dict>
 </plist>

@@ -123,7 +123,13 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 /// Release filter: drop every `--debug-*` flag and, unless it is one of the flags that take no operand,
 /// the operand after it (so `--debug-window 390x844` leaves nothing behind).
 fn release_args(args: Vec<String>) -> Vec<String> {
-    const NO_OPERAND: [&str; 6] = ["--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock", "--debug-forget-open"];
+    // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
+    // debug door that feeds the offer text from a file and answers the screens' choices
+    const NO_OPERAND: [&str; 29] = [
+        "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock", "--debug-forget-open",
+        "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing",
+    ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
     while let Some(a) = it.next() {
@@ -150,6 +156,20 @@ mod release_args_tests {
         assert_eq!(release_args(v(&["--screen", "sync", "--debug-sync-run", "--theme", "dark"])), v(&["--screen", "sync", "--theme", "dark"]));
         assert_eq!(release_args(v(&["--screen", "trend", "--debug-tip", "2025-06-20", "--trend", "steps"])), v(&["--screen", "trend", "--trend", "steps"]));
     }
+
+    /// 12-F row 4: every pairing evidence flag takes no operand, so a release build drops the flag and keeps the
+    /// argument after it (`--theme dark`), and drops an operand-taking flag together with its operand.
+    #[test]
+    fn a_release_build_drops_every_phone_pairing_flag_and_keeps_what_follows() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for flag in [
+            "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
+            "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today",
+        ] {
+            assert_eq!(release_args(v(&[flag, "--theme", "dark"])), v(&["--theme", "dark"]), "{flag}");
+        }
+        assert_eq!(release_args(v(&["--debug-pair-unknown", "x", "--theme", "dark"])), v(&["--theme", "dark"]));
+    }
 }
 
 /// The app's own argv (after the executable), so the UI can honour `--screen <id>`.
@@ -168,6 +188,46 @@ fn launch_args() -> Vec<String> {
         args.push("--debug-drop-over".into());
     }
     args
+}
+
+/// iOS only (12-F row 4): keep the screen awake while the pairing code is up, so the phone does not lock mid-wait. The
+/// page turns it on when the Code screen shows and off on every way out of it (and once at start-up, in case a reload
+/// left it on). It sets `UIApplication.idleTimerDisabled`, which UIKit wants on the main thread. Nothing else calls it.
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn keep_awake(app: tauri::AppHandle, on: bool) -> Result<(), CoreError> {
+    app.run_on_main_thread(move || {
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            objc2_ui_kit::UIApplication::sharedApplication(mtm).setIdleTimerDisabled(on);
+        }
+    })
+    .map_err(|_| CoreError::new("internal", "could not reach the main thread"))
+}
+
+/// Evidence hook, debug iOS builds only: the offer text the Mac side wrote to the file named by
+/// `DISCONECT_DEBUG_OFFER_FILE` (polled every 500 ms for up to 90 s, because the offerer writes it a moment after the
+/// app starts). It is the simulator's stand-in for the camera. The text is returned to the page and never logged.
+/// Compiled out of release builds.
+#[cfg(all(debug_assertions, target_os = "ios"))]
+#[tauri::command]
+async fn debug_offer_from_file() -> Result<String, CoreError> {
+    let none = || CoreError { code: "bad_params".into(), message: "no debug offer file".into() };
+    let path = std::env::var_os("DISCONECT_DEBUG_OFFER_FILE").ok_or_else(none)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        for _ in 0..180 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let t = text.trim();
+                if t.starts_with("disconect-pair:v2.") {
+                    return Some(t.to_string());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        None
+    })
+    .await
+    .map_err(|_| none())?
+    .ok_or_else(none)
 }
 
 /// Last stderr lines of the core for a diagnostics panel (never key material: the core keeps
@@ -443,6 +503,26 @@ impl AwayClock {
     }
 }
 
+/// How long the cover may stay on after the app is active again when it was held for a lock (12-F row 5 fix S4): the page
+/// releases it once it has painted Unlock; if it never does, this long after the hold the cover comes off anyway.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+const COVER_FAILSAFE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Whether a cover held at `since` still stays at `now`: held, and the failsafe has not run out. Pure, so it is tested.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+fn cover_hold_stays(since: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    since.is_some_and(|at| now.saturating_duration_since(at) < COVER_FAILSAFE)
+}
+
+/// iOS only (row 5 fix S4): the page calls this after it has painted Unlock (post a `requestAnimationFrame`); the cover
+/// that was held across the lock comes off. Harmless when nothing is held.
+#[cfg(target_os = "ios")]
+#[tauri::command]
+fn cover_release(app: tauri::AppHandle) -> Result<(), CoreError> {
+    app.run_on_main_thread(cover::release)
+        .map_err(|_| CoreError::new("internal", "could not reach the main thread"))
+}
+
 /// Drop the master through the same router the page uses, then tell the page (`core://locked`, no payload) so it draws
 /// Unlock. Synchronous: the in-process call is a lock and a reply, and it must finish before the cover comes off.
 #[cfg(target_os = "ios")]
@@ -450,6 +530,7 @@ fn lock_after_absence(app: &tauri::AppHandle) {
     let state = app.state::<Core>();
     let Ok(core) = core_of(&state) else { return };
     if tauri::async_runtime::block_on(core.call("key.lock", serde_json::json!({}))).is_ok() {
+        // the cover was already held by cover.rs (it decides at DidBecomeActive); the page releases it after painting Unlock
         let _ = app.emit("core://locked", serde_json::json!({}));
     }
 }
@@ -458,6 +539,17 @@ fn lock_after_absence(app: &tauri::AppHandle) {
 mod away_tests {
     use super::{away_requires_lock, AWAY_LIMIT};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_held_cover_stays_until_the_failsafe_and_an_unheld_one_never_does() {
+        use super::{cover_hold_stays, COVER_FAILSAFE};
+        let at = std::time::Instant::now();
+        assert!(!cover_hold_stays(None, at), "nothing held: the cover comes off at once");
+        assert!(cover_hold_stays(Some(at), at), "just held: it stays");
+        assert!(cover_hold_stays(Some(at), at + COVER_FAILSAFE - Duration::from_millis(1)), "inside the failsafe: it stays");
+        assert!(!cover_hold_stays(Some(at), at + COVER_FAILSAFE), "at the failsafe: it comes off");
+        assert_eq!(COVER_FAILSAFE, Duration::from_millis(1500));
+    }
 
     #[test]
     fn under_the_limit_keeps_the_master_the_limit_and_over_lock_and_a_clock_gone_back_locks() {
@@ -595,6 +687,9 @@ pub fn run() {
             debug_keychain_proof_door(app.handle(), &proof_notes);
             Ok(())
         });
+    // 12-F row 4: the phone's camera scan (the Mac app never links the plugin; its capability is iOS-scoped).
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     // Bet 17: `support_sites`/`support_open` exist only on macOS (`coach/commands.rs`'s own `#[cfg]`), so the
     // debug/release split below is crossed with `target_os = "macos"` rather than naming them unconditionally
     // (a non-macOS build, e.g. the iOS shell `tests/mobile_config.rs` checks, must still compile).
@@ -618,10 +713,16 @@ pub fn run() {
         live::live_start, live::live_stop, live::live_state]);
     // 12-F S5: the phone's lists carry no coach command (the coach is the product's one internet egress and is not on
     // the phone), so the phone binary registers none of them. `live_*` stay until Bet 14 decides the phone's link.
-    #[cfg(all(debug_assertions, mobile))]
+    #[cfg(all(debug_assertions, mobile, target_os = "ios"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file, debug_offer_from_file, keep_awake, cover_release,
+        live::live_start, live::live_stop, live::live_state]);
+    #[cfg(all(not(debug_assertions), mobile, target_os = "ios"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, keep_awake, cover_release,
+        live::live_start, live::live_stop, live::live_state]);
+    #[cfg(all(debug_assertions, mobile, not(target_os = "ios")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,
         live::live_start, live::live_stop, live::live_state]);
-    #[cfg(all(not(debug_assertions), mobile))]
+    #[cfg(all(not(debug_assertions), mobile, not(target_os = "ios")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command,
         live::live_start, live::live_stop, live::live_state]);
     let app = builder
