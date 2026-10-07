@@ -1611,6 +1611,11 @@ fn chains_follow_the_applied_bundles_and_self_is_this_stores_own_id() {
     let relay = relay_in(tmp.path());
     // nothing pushed yet: no row, and status never mints an id
     assert!(sync::status(a.conn()).expect("status").chains.is_empty());
+    let minted: i64 = a
+        .conn()
+        .query_row("SELECT count(*) FROM relay_device", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(minted, 0, "status mints no writer id");
     push(&a, &relay);
     pull(&b, &relay);
     let (ca, cb) = (
@@ -1650,6 +1655,46 @@ fn chains_follow_the_applied_bundles_and_self_is_this_stores_own_id() {
     // the JSON key is `self`
     let value = sync::status_value(&sync::status(a.conn()).expect("status"));
     assert!(value["chains"][0].get("self").is_some());
+}
+
+#[test]
+fn a_forget_leaves_the_old_writer_id_listed_and_the_new_chain_counts_what_it_received() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    import(&a, &fit_drop(tmp.path(), "d1", &["monitoring_timestamp16"]));
+    import(&b, &fit_drop(tmp.path(), "d2", &["monitoring_cycles_resolution"]));
+    let relay = relay_in(tmp.path());
+    push(&a, &relay);
+    push(&b, &relay);
+    pull(&a, &relay);
+    pull(&b, &relay);
+    let own = |d: &Device| {
+        sync::status(d.conn()).expect("status").chains.into_iter().find(|c| c.is_self).expect("own chain")
+    };
+    let old_a = own(&a);
+    let b_chain = own(&b);
+    assert_eq!(old_a.bundles, 1);
+    assert!(old_a.records > 0 && b_chain.records > 0);
+    // A forgets (its relay tables go, the relay objects stay), pushes again and pulls
+    sync::forget_relay_state(a.conn()).expect("forget");
+    push(&a, &relay);
+    pull(&a, &relay);
+    pull(&b, &relay);
+    let new_a = own(&a);
+    assert_ne!(new_a.device_id, old_a.device_id);
+    // the new chain carries what A had received as well as what it made: records is what a writer's bundles carried
+    assert_eq!((new_a.bundles, new_a.records), (1, old_a.records + b_chain.records));
+    for d in [&a, &b] {
+        let rows = sync::status(d.conn()).expect("status").chains;
+        assert_eq!(rows.len(), 3, "B's chain and both of A's");
+        let old_row = rows.iter().find(|c| c.device_id == old_a.device_id).expect("old A row");
+        assert!(!old_row.is_self, "A's old id is another writer, on A as well as on B");
+        assert_eq!((old_row.bundles, old_row.records), (1, old_a.records));
+    }
+    let on_b = sync::status(b.conn()).expect("status").chains;
+    let new_on_b = on_b.iter().find(|c| c.device_id == new_a.device_id).expect("new A row");
+    assert!(!new_on_b.is_self);
+    assert_eq!((new_on_b.bundles, new_on_b.records), (new_a.bundles, new_a.records));
 }
 
 type LiveRawRow = (String, String, String, String, Option<String>, Option<String>, Option<String>, String, Vec<u8>, String);

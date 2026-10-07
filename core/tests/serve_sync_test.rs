@@ -320,12 +320,12 @@ fn sync_status_chains_name_each_writer_with_counts_and_a_self_flag() {
     let row = &ca[0];
     assert_eq!((row["bundles"].as_i64(), row["records"].as_i64(), row["last_seq"].as_i64()), (Some(1), Some(2), Some(1)));
     assert_eq!(row["self"], true);
-    assert_eq!(row["device_id"].as_str().expect("id").len(), 16);
+    assert_eq!(row["chain"].as_str().expect("id").len(), 16);
     assert_eq!(cb.len(), 1);
     assert_eq!(cb[0]["self"], false);
     assert_eq!(
-        (&cb[0]["device_id"], &cb[0]["bundles"], &cb[0]["records"], &cb[0]["last_seq"]),
-        (&row["device_id"], &row["bundles"], &row["records"], &row["last_seq"])
+        (&cb[0]["chain"], &cb[0]["bundles"], &cb[0]["records"], &cb[0]["last_seq"]),
+        (&row["chain"], &row["bundles"], &row["records"], &row["last_seq"])
     );
     // B now holds something of its own (a different file), pushes; A pulls
     let drop = tmp.path().join("b-drop");
@@ -342,7 +342,7 @@ fn sync_status_chains_name_each_writer_with_counts_and_a_self_flag() {
     let (ca, cb) = (chains_of(&mut rig_a, 17), chains_of(&mut rig_b, 18));
     for chains in [&ca, &cb] {
         assert_eq!(chains.len(), 2);
-        assert!(chains[0]["device_id"].as_str() < chains[1]["device_id"].as_str());
+        assert!(chains[0]["chain"].as_str() < chains[1]["chain"].as_str());
         assert_eq!(chains.iter().filter(|c| c["self"] == true).count(), 1);
     }
     let strip = |chains: &Vec<Value>| -> Vec<Value> {
@@ -354,7 +354,7 @@ fn sync_status_chains_name_each_writer_with_counts_and_a_self_flag() {
     };
     assert_eq!(strip(&ca), strip(&cb));
     // each store's own row is the other's non-self row
-    let own = |chains: &Vec<Value>| chains.iter().find(|c| c["self"] == true).expect("own")["device_id"].clone();
+    let own = |chains: &Vec<Value>| chains.iter().find(|c| c["self"] == true).expect("own")["chain"].clone();
     assert_ne!(own(&ca), own(&cb));
 }
 

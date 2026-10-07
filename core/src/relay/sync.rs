@@ -1683,7 +1683,7 @@ pub fn status_value(report: &StatusReport) -> serde_json::Value {
         .chains
         .iter()
         .map(|c| {
-            serde_json::json!({"device_id": c.device_id, "bundles": c.bundles, "records": c.records,
+            serde_json::json!({"chain": c.device_id, "bundles": c.bundles, "records": c.records,
                 "last_seq": c.last_seq, "self": c.is_self})
         })
         .collect();
