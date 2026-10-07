@@ -13,7 +13,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::canon;
 use crate::keys::{self, Secret32};
@@ -25,7 +25,11 @@ use crate::relay::sync::{self, PullResult};
 use crate::store;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole of one request. Both pairing requests are tiny LAN exchanges answered in milliseconds; this also
+/// bounds how long a cancel waits behind a hung request (12-H: the flag is read between requests, not inside one).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// A `.<name>.tmp<pid>` sibling older than this is a crashed writer's orphan, swept by the next `write_atomic`.
+const ORPHAN_AGE: Duration = Duration::from_secs(60);
 /// How often the joiner asks whether the offerer released.
 const POLL_EVERY: Duration = Duration::from_millis(500);
 /// A sealed payload is a master and a key file: far below this.
@@ -176,6 +180,10 @@ fn join_with(
             other => break other?,
         }
     };
+    // a cancel that landed during the POST ends here, on every caller: no reply is opened, no code is shown
+    if cancel.load(Ordering::SeqCst) {
+        return Err(PairError::Cancelled);
+    }
     match status {
         202 => {}
         410 => return Err(PairError::OfferEnded),
@@ -322,6 +330,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    sweep_orphans(&parent, &name);
     let temp = parent.join(format!(".{name}.tmp{}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -361,6 +370,29 @@ const PROTECTION_CLASS_A: libc::c_int = 1;
 
 /// Best effort: set class A on an open file. The result is not an error of the write (the simulator reports no
 /// classes); the landing's read-back hook looks at the key file on the device and re-applies.
+/// Remove `.<name>.tmp*` siblings a crashed writer left (older than [`ORPHAN_AGE`]; a live writer's temp is
+/// seconds old). Only that pattern, never `name` itself, never another name; every failure is ignored.
+fn sweep_orphans(parent: &Path, name: &str) {
+    let prefix = format!(".{name}.tmp");
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with(&prefix) || file_name.len() == prefix.len() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= ORPHAN_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn set_class_a(file: &std::fs::File) {
     use std::os::fd::AsRawFd;
@@ -417,5 +449,28 @@ mod write_atomic_tests {
         write_atomic(&target, b"two").expect("rewrite");
         assert_eq!(std::fs::read(&target).expect("read"), b"two");
         assert_eq!(mode(&target), 0o600);
+    }
+
+    /// 12-H (c): a crashed writer's `.<name>.tmp<pid>` is swept once it is old; a fresh sibling (a live writer)
+    /// and another name's temp are left alone.
+    #[test]
+    fn write_atomic_sweeps_only_stale_orphans_of_its_own_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("key.json");
+        let stale = dir.path().join(".key.json.tmp424242");
+        let fresh = dir.path().join(".key.json.tmp777");
+        let other = dir.path().join(".other.json.tmp1");
+        for path in [&stale, &fresh, &other] {
+            std::fs::write(path, b"leftover").expect("seed");
+        }
+        let two_minutes_back = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        for path in [&stale, &other] {
+            std::fs::File::options().write(true).open(path).expect("open").set_modified(two_minutes_back).expect("mtime");
+        }
+        write_atomic(&target, b"new").expect("write");
+        assert_eq!(std::fs::read(&target).expect("read"), b"new");
+        assert!(!stale.exists(), "the old orphan of this name is swept");
+        assert!(fresh.exists(), "a fresh temp may be a live writer's");
+        assert!(other.exists(), "another name's temp is not ours to sweep");
     }
 }
