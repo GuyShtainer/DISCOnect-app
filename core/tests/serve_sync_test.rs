@@ -177,7 +177,7 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
                "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
-               "chains": [], "serving": null, "relay_url": null, "relay_kind": null, "relays": null})
+               "chains": [], "serving": null, "relay_url": null, "relay_kind": null, "relays": null, "relay_list": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");
@@ -226,6 +226,50 @@ fn sync_status_names_the_lan_relay_address_and_nothing_else() {
         relay_json(&db, json!({"lan": bad}));
         assert_eq!(url(&mut rig), Value::Null, "{bad}: not a usable LAN address, so none is shown");
     }
+}
+
+#[test]
+fn sync_status_relay_list_is_the_file_as_configured() {
+    let (_dir, db) = encrypted_store(false);
+    let mut rig = Rig::new(&db);
+    assert_eq!(rig.send(0, "key.unlock", json!({"passphrase": PASSPHRASE}))[0]["result"], json!({"unlocked": true}));
+    let listed = |rig: &mut Rig| rig.send(1, "sync.status", json!({}))[0]["result"]["relay_list"].clone();
+    assert_eq!(listed(&mut rig), Value::Null, "no relay.json");
+    relay_json(&db, json!({"relays": []}));
+    assert_eq!(listed(&mut rig), json!([]));
+    relay_json(
+        &db,
+        json!({"relays": [
+            {"id": "a1", "kind": "folder", "path": "/vol/one", "label": "Disk"},
+            {"id": "b2", "kind": "folder", "path": "/vol/two", "serve": true},
+            {"id": "c3", "kind": "lan", "url": " http://192.168.1.20:8321/ ", "label": "Home"}]}),
+    );
+    assert_eq!(
+        listed(&mut rig),
+        json!([
+            {"id": "a1", "kind": "folder", "label": "Disk", "serve": false, "path": "/vol/one"},
+            {"id": "b2", "kind": "folder", "label": "", "serve": true, "path": "/vol/two"},
+            {"id": "c3", "kind": "lan", "label": "Home", "serve": false, "url": "http://192.168.1.20:8321"}])
+    );
+    relay_json(&db, json!({"relays": [{"id": "d4", "kind": "lan", "url": "http://u:p@10.0.0.1:1"}]}));
+    assert_eq!(listed(&mut rig), json!([{"id": "d4", "kind": "lan", "label": "", "serve": false, "url": null}]));
+    // the configured text, exactly: never expanded, resolved or stat-ed
+    relay_json(
+        &db,
+        json!({"relays": [{"id": "e5", "kind": "folder", "path": "~/relay x"},
+                          {"id": "f6", "kind": "folder", "path": "relay"}]}),
+    );
+    assert_eq!(
+        listed(&mut rig),
+        json!([
+            {"id": "e5", "kind": "folder", "label": "", "serve": false, "path": "~/relay x"},
+            {"id": "f6", "kind": "folder", "label": "", "serve": false, "path": "relay"}])
+    );
+    relay_json(&db, json!({"folder": "/some/folder"}));
+    assert_eq!(
+        listed(&mut rig),
+        json!([{"id": "default", "kind": "folder", "label": "", "serve": true, "path": "/some/folder"}])
+    );
 }
 
 #[test]

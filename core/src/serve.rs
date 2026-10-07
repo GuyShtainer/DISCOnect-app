@@ -1154,16 +1154,16 @@ fn relay_json_path(db_path: &Path) -> PathBuf {
 }
 
 /// `relay_url` of `sync.status`: the normalised base address of the first LAN relay `relay.json` names, else null.
-fn relay_url_value(path: &Path) -> Value {
-    relay_config::read_list(path)
-        .and_then(|entries| relay_config::first_lan_url(&entries))
+fn relay_url_value(entries: Option<&[relay_config::RelayEntry]>) -> Value {
+    entries
+        .and_then(relay_config::first_lan_url)
         .and_then(|url| relay_config::lan_base_url(&url))
         .map_or(Value::Null, Value::String)
 }
 
 /// `relay_kind` of `sync.status`: what kinds of relay `relay.json`'s list holds.
-fn relay_kind_value(path: &Path) -> Value {
-    let Some(entries) = relay_config::read_list(path).filter(|entries| !entries.is_empty()) else {
+fn relay_kind_value(entries: Option<&[relay_config::RelayEntry]>) -> Value {
+    let Some(entries) = entries.filter(|entries| !entries.is_empty()) else {
         return Value::Null;
     };
     let folders = entries.iter().filter(|e| matches!(e.config, relay_config::RelayConfig::Folder(_))).count();
@@ -1179,6 +1179,37 @@ fn relay_kind_value(path: &Path) -> Value {
     )
 }
 
+/// `relay_list` of `sync.status` (BL-7): the entries of `relay.json` in file order, null with no file; a folder's
+/// `path` is the configured text (never expanded, canonicalised or stat-ed), a LAN entry's `url` is
+/// `lan_base_url` of it (null when refused). Exactly one of `path` / `url` per entry.
+fn relay_list_value(entries: Option<&[relay_config::RelayEntry]>) -> Value {
+    let Some(entries) = entries else {
+        return Value::Null;
+    };
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| {
+                let mut row = serde_json::Map::new();
+                row.insert("id".into(), json!(entry.id));
+                row.insert("label".into(), json!(entry.label));
+                row.insert("serve".into(), json!(entry.serve));
+                match &entry.config {
+                    relay_config::RelayConfig::Folder(text) => {
+                        row.insert("kind".into(), json!("folder"));
+                        row.insert("path".into(), json!(text));
+                    }
+                    relay_config::RelayConfig::Lan(text) => {
+                        row.insert("kind".into(), json!("lan"));
+                        row.insert("url".into(), relay_config::lan_base_url(text).map_or(Value::Null, Value::String));
+                    }
+                }
+                Value::Object(row)
+            })
+            .collect(),
+    )
+}
+
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay
 /// tables answers what a fresh one would.
 fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
@@ -1189,11 +1220,17 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     if let Some(object) = status.as_object_mut() {
         // Rust only: what the relay of this session is doing right now (null when it serves nothing)
         object.insert("serving".into(), serving::serving_value(&session.relay));
+        // `relay.json` is read once; `relay_url`, `relay_kind` and `relay_list` all come from that one read.
+        let entries = relay_config::read_list(&relay_json_path(&session.db_path));
+        let entries = entries.as_deref();
         // The address this device pulls from, `http://host:port` from `relay.json`; null with no LAN relay named
-        // (a folder relay has no address). Never a path, a credential or a folder name.
-        object.insert("relay_url".into(), relay_url_value(&relay_json_path(&session.db_path)));
+        // (a folder relay has no address). Never a credential.
+        object.insert("relay_url".into(), relay_url_value(entries));
         // `folder` | `lan` | `mixed` over the list's entries, null with no file or an empty list.
-        object.insert("relay_kind".into(), relay_kind_value(&relay_json_path(&session.db_path)));
+        object.insert("relay_kind".into(), relay_kind_value(entries));
+        // The list itself (BL-7): each folder's path is carried on purpose (the person's own setting, shown on their
+        // own screen), masked / scoped in the privacy walk; `relay_url` and each `url` are still never a credential.
+        object.insert("relay_list".into(), relay_list_value(entries));
         // The `sites` of the last `sync.run` of this session; null before the first.
         let last = session.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         object.insert("relays".into(), last.unwrap_or(Value::Null));
