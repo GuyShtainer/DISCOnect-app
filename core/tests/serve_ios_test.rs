@@ -33,8 +33,8 @@ fn answer(method: &str) -> Value {
 }
 
 #[test]
-fn the_five_server_roles_are_refused_on_ios() {
-    for method in ["relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel"] {
+fn the_four_server_roles_are_refused_on_ios() {
+    for method in ["relay.addresses", "relay.serve", "pair.offer", "pair.confirm"] {
         let reply = answer(method);
         assert_eq!(reply["id"], 7, "{method}");
         assert_eq!(reply["error"]["code"], "unsupported_transport", "{method}");
@@ -46,4 +46,12 @@ fn the_five_server_roles_are_refused_on_ios() {
 fn other_methods_still_reach_their_handlers() {
     let reply = answer("app.info");
     assert!(reply.get("error").is_none(), "{reply}");
+}
+
+#[test]
+fn pair_cancel_is_the_joiners_on_ios_and_never_reaches_the_relay() {
+    // no join in flight: the Python twin's own answer, not the refusal of a server role
+    let reply = answer("pair.cancel");
+    assert_eq!(reply["error"]["code"], "not_found");
+    assert_eq!(reply["error"]["message"], "there is no offer to cancel");
 }

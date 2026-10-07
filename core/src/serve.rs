@@ -80,6 +80,10 @@ use crate::time::now_instant;
 use crate::write_lock::LockError;
 use crate::wirejson::{self, Id, Json, PyStr};
 
+mod join;
+pub use join::{JoinHooks, MAX_OFFER_TEXT};
+use join::JoinHub;
+
 /// What `app.info.core` says: this implementation, not Python's version string.
 pub const CORE: &str = concat!("disconect-core/", env!("CARGO_PKG_VERSION"));
 
@@ -398,6 +402,8 @@ pub struct Session {
     /// The relay this session serves: at most one LAN server, its offer, the watchers (process memory only).
     relay: Shared,
     relay_hooks: Hooks,
+    /// The phone's join in flight, its joiners and the master hand-back (see [`join::JoinHub`]).
+    join: Arc<JoinHub>,
 }
 
 impl Session {
@@ -411,6 +417,27 @@ impl Session {
             hold: None,
             relay: serving::new_state(),
             relay_hooks: Hooks::default(),
+            join: Arc::new(JoinHub::new()),
+        }
+    }
+
+    /// Test hook: the join worker's landing wait, reachability backoff and an injected landing failure.
+    #[doc(hidden)]
+    pub fn set_join_hooks(&mut self, hooks: JoinHooks) {
+        self.join.set_hooks(hooks);
+    }
+
+    /// How many joiners the session keeps (tests): a counter that stays valid after the session moves.
+    #[doc(hidden)]
+    pub fn joiner_counter(&self) -> impl Fn() -> usize + Send + 'static {
+        let hub = Arc::clone(&self.join);
+        move || hub.joiner_count()
+    }
+
+    /// Take the master a finished landing handed back (see [`join::JoinHub`]); the start of every request.
+    fn take_handed(&mut self) {
+        if let Some(master) = self.join.take_handed() {
+            self.unlocked = Some(master);
         }
     }
 
@@ -458,11 +485,15 @@ impl Session {
 
     /// True when nothing needs unlocking (no key file) or `key.unlock` succeeded in this process.
     pub fn is_unlocked(&self) -> bool {
-        !self.key_file_exists() || self.unlocked.is_some()
+        !self.key_file_exists() || self.unlocked.is_some() || self.join.landing()
     }
 
     /// Raise `locked` while an encrypted store has not been unlocked in this process.
     pub fn require_unlocked(&self) -> Result<(), Failure> {
+        // between the key file landing and the master reaching this session: neither `locked` nor a reader
+        if self.unlocked.is_none() && self.join.landing() {
+            return Err(Failure::serve("busy", "a pairing is landing; try again in a moment"));
+        }
         if self.is_unlocked() {
             Ok(())
         } else {
@@ -531,6 +562,8 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("pair.cancel", Handler::Reply(pair_cancel)),
     ("tools.call", Handler::Ordered(tools_call)),
     ("pair.forget", Handler::Reply(pair_forget)),
+    ("pair.join", Handler::Spawn(join::pair_join)),
+    ("pair.land", Handler::Reply(join::pair_land)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -705,6 +738,8 @@ fn key_unlock(session: &mut Session, call: &Call) -> Result<Value, Failure> {
 /// locked, or nothing to lock, answers the same). The keychain item, if any, is left alone.
 fn key_lock(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     session.unlocked = None;
+    // a pairing that lands after this must not hand its master back (12-F row 3 review, M1)
+    session.join.revoke();
     Ok(json!({"state": "locked"}))
 }
 
@@ -1039,7 +1074,7 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err(Failure::serve("busy", "an import is already running"));
+        return Err(Failure::serve("busy", session.join.busy_message("an import is already running")));
     }
     // a path with a lone surrogate cannot name a file here: it is reported as missing (booked, kb/23)
     let text = path.to_text();
@@ -1205,7 +1240,7 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     {
         return Err(Failure::serve(
             "busy",
-            "an import or a sync is already running",
+            session.join.busy_message("an import or a sync is already running"),
         ));
     }
     let job = SyncJob {
@@ -1457,8 +1492,19 @@ fn pair_confirm(session: &mut Session, call: &Call) -> Result<Value, Failure> {
 /// End the open offer (idempotent); `not_found` when there is none.
 fn pair_cancel(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     session.require_unlocked()?;
+    end_open_offer(session)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn end_open_offer(session: &Session) -> Result<Value, Failure> {
     serving::cancel(&session.relay_env())?;
     Ok(json!({"state": "aborted"}))
+}
+
+/// The phone serves nothing: its `pair.cancel` reaches the joiner's flag only, never the relay's offer.
+#[cfg(target_os = "ios")]
+fn end_open_offer(session: &Session) -> Result<Value, Failure> {
+    join::cancel_join(session)
 }
 
 // ---- tools ----
@@ -1610,10 +1656,10 @@ fn forget_holding_slot(session: &mut Session, paths: &crate::pair_forget::Paths)
 }
 
 /// The server roles a phone never plays (the Mac serves the relay and offers pairing), refused before
-/// their handlers run. The names are the protocol's own; `ALLOWED_METHODS` in the app is unchanged.
+/// their handlers run. The names are the protocol's own. `pair.cancel` is not one on the phone since 12-F row 3: it is the
+/// joiner's cancel (see [`join::cancel_join`]); `pair.join`, `pair.land` and `pair.forget` are the phone's own methods.
 #[cfg(target_os = "ios")]
-const SERVER_ROLES: [&str; 5] =
-    ["relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel"];
+const SERVER_ROLES: [&str; 4] = ["relay.addresses", "relay.serve", "pair.offer", "pair.confirm"];
 
 #[cfg(target_os = "ios")]
 fn refuse_server_roles(call: &Call) -> Option<String> {
@@ -1628,6 +1674,7 @@ fn refuse_server_roles(call: &Call) -> Option<String> {
 
 /// The response line for `call`, or None when the handler answers later (the import worker).
 fn dispatch(session: &mut Session, call: &Call) -> Option<String> {
+    session.take_handed();
     #[cfg(target_os = "ios")]
     if let Some(refusal) = refuse_server_roles(call) {
         return Some(refusal);
@@ -1676,6 +1723,7 @@ pub fn serve_lines(session: &mut Session, input: impl Read) -> i32 {
     // the relay ends first: an open offer is aborted and the server stopped, so no listener outlives the
     // session while a worker is awaited (a worker that has not bound yet sees `ended` and does not)
     serving::end_session(&session.relay_env());
+    session.join.shutdown();
     session.wait_for_imports();
     0
 }
