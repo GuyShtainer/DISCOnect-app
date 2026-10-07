@@ -507,7 +507,7 @@ mod tests {
         std::fs::File::options().write(true).open(dir.join("z-old.jsonl")).unwrap().set_modified(old).unwrap();
         let ok = || Ok(json!({"ok": 1, "duplicate": 0, "failed": 0}));
         let door = Script(Mutex::new(vec![ok(), ok()]), Mutex::new(Vec::new()));
-        tauri::async_runtime::block_on(import_all(&door, &data, &[data.clone()])).unwrap();
+        tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
         let seen = door.1.lock().unwrap();
         assert_eq!(seen[0], seed_text(2), "the older file first");
         assert_eq!(seen[1], seed_text(1));
@@ -528,7 +528,7 @@ mod tests {
         std::fs::write(dir.join("big.jsonl"), vec![b' '; (MAX_BYTES + 1) as usize]).unwrap();
         let ok = || Ok(json!({"ok": 1, "duplicate": 0, "failed": 0}));
         let door = Script(Mutex::new(vec![ok(), Err(CoreError::new("busy", "the core is busy")), ok()]), Mutex::new(Vec::new()));
-        let r = tauri::async_runtime::block_on(import_all(&door, &data, &[data.clone()])).unwrap();
+        let r = tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
         assert_eq!((r["files"].as_u64(), r["ok"].as_u64(), r["failed"].as_u64(), r["refused"].as_u64()), (Some(3), Some(2), Some(1), Some(1)));
         let held = load_ledger(&data);
         assert_eq!((held.sessions, held.last_refused, held.last_failed), (2, 1, 1), "both ok files, and what was skipped");
@@ -559,7 +559,7 @@ mod tests {
         seed_next(&data).unwrap();
         let door = Dies(Mutex::new(0));
         let d2 = data.clone();
-        let res = std::thread::spawn(move || tauri::async_runtime::block_on(import_all(&door, &d2, &[d2.clone()]))).join();
+        let res = std::thread::spawn(move || tauri::async_runtime::block_on(import_all(&door, &d2, std::slice::from_ref(&d2)))).join();
         assert!(res.is_err());
         assert_eq!(load_ledger(&data).sessions, 1);
         let _ = std::fs::remove_dir_all(&data);
@@ -571,7 +571,7 @@ mod tests {
         std::fs::create_dir_all(data.join(LIVE_DIR)).unwrap();
         std::fs::write(data.join(LIVE_DIR).join("junk.jsonl"), b"nope\n").unwrap();
         let door = Fake(Mutex::new(Vec::new()), true);
-        let r = tauri::async_runtime::block_on(import_all(&door, &data, &[data.clone()])).unwrap();
+        let r = tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
         assert_eq!((r["files"].as_u64(), r["refused"].as_u64()), (Some(0), Some(1)));
         let _ = std::fs::remove_dir_all(&data);
     }

@@ -316,11 +316,6 @@ fn lan_check_with(text: &str, loopback_ok: bool, ifaces: &[Iface]) -> Result<Str
     Ok(format!("http://{host}:{port}"))
 }
 
-/// [`lan_check`] without the word.
-pub fn clean_lan_url(text: &str) -> Option<String> {
-    lan_check(text).ok()
-}
-
 /// The LAN address `relay.json` names (the paired Mac), in either of the file's forms: the legacy `{"lan": url}` and the
 /// list form `{"relays": [{"kind": "lan", "url": ...}]}`.
 pub fn mac_url_in(dir: &Path) -> Option<String> {
@@ -967,10 +962,18 @@ mod tests {
         assert!(!text.contains("bookmark"), "{text}");
     }
 
+    /// [`lan_check`] without the word.
+    fn clean_lan_url(text: &str) -> Option<String> {
+        lan_check(text).ok()
+    }
+
     fn iface(text: &str, prefix: u8) -> Iface {
-        let (v6, bits) = match text.parse::<std::net::IpAddr>().unwrap() {
-            std::net::IpAddr::V4(a) => (false, u128::from(u32::from(a))),
-            std::net::IpAddr::V6(a) => (true, u128::from(a)),
+        // parsed through the url crate so this file names no address type (the egress guard)
+        let host = if text.contains(':') { format!("[{text}]") } else { text.to_string() };
+        let (v6, bits) = match url::Url::parse(&format!("http://{host}:1")).unwrap().host().unwrap() {
+            url::Host::Ipv4(a) => (false, u128::from(u32::from_be_bytes(a.octets()))),
+            url::Host::Ipv6(a) => (true, u128::from_be_bytes(a.octets())),
+            url::Host::Domain(_) => panic!("not an address"),
         };
         Iface { v6, bits, prefix }
     }
