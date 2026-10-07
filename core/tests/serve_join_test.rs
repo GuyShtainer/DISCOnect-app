@@ -184,6 +184,12 @@ fn now() -> u64 {
 const CLOCK_EXPIRED: &str = "This offer expired by this phone's clock. Check the date and time.";
 const CLOCK_AHEAD: &str = "This offer is too far ahead of this phone's clock. Check the date and time.";
 const ALREADY_PAIRED: &str = "This phone is already paired";
+const BAD_ADDRESS: &str = "the offer's address cannot be a pairing address";
+const FORGET_PENDING: &str = "This phone has not finished forgetting its last pairing. Close and reopen the app, then try again.";
+#[cfg(target_os = "ios")]
+const NOT_ON_LINK: &str = "This offer's address is not on this phone's network. Join the same Wi-Fi as your Mac and start a new offer on it.";
+#[cfg(target_os = "ios")]
+const BUSY_PAIRING: &str = "a pairing is still running or stopping; try again in a moment";
 
 /// A syntactically valid offer for `url` (a real X25519 public key; the secrets are random, so it is not
 /// joinable) with the given expiry.
@@ -257,10 +263,14 @@ fn the_prefix_refuses_before_any_network_call_in_order() {
     refuse("a dotted name", json!({"offer": forged_offer("http://relay.example.com:80", fresh)}), ("bad_params", host));
     // the hostname is checked before the expiry
     refuse("hostname and expired", json!({"offer": forged_offer("http://mac.local:1", 1000)}), ("bad_params", host));
+    // an address that is never a pairing address comes right after the IP literal, before the clock
+    refuse("0.0.0.0 and expired", json!({"offer": forged_offer("http://0.0.0.0:24816", 1000)}), ("bad_params", BAD_ADDRESS));
     // exp: at most 900 + 300 s ahead
     refuse("exp too far", json!({"offer": forged_offer(&url, now() + 1500)}), ("pair_failed", CLOCK_AHEAD));
-    // expired by this phone's clock, with 300 s of tolerance
+    // expired by this phone's clock: no tolerance past exp (the joiner itself refuses now > exp)
     refuse("expired", json!({"offer": forged_offer(&url, now() - 400)}), ("pair_failed", CLOCK_EXPIRED));
+    refuse("expired by 100 s", json!({"offer": forged_offer(&url, now() - 100)}), ("pair_failed", CLOCK_EXPIRED));
+    refuse("expired by 5 s", json!({"offer": forged_offer(&url, now() - 5)}), ("pair_failed", CLOCK_EXPIRED));
     refuse("long expired", json!({"offer": forged_offer(&url, 1000)}), ("pair_failed", CLOCK_EXPIRED));
     assert!(!wire.tripped(), "a refusal made a network call");
     assert!(phone_files(&db).is_empty(), "a refusal wrote something");
@@ -417,6 +427,9 @@ fn a_join_against_the_library_offerer_lands_and_hands_the_master_back() {
     assert_eq!(digits.len(), 6);
     assert_eq!(done["result"]["state"], "landed", "{done}");
     assert_eq!(done["result"]["pull"]["records_new"], 2);
+    // N8: the key file's protection class: unknown (null) in the simulator, a bool on a device
+    assert!(done["result"].as_object().expect("object").contains_key("key_file_protected"), "{done}");
+    assert!(done["result"]["key_file_protected"].is_null(), "the simulator reports no classes: {done}");
     // the four landing steps came as progress, in order, before the final answer
     let lines = live.lines();
     let phases: Vec<&str> = lines
@@ -525,9 +538,12 @@ fn a_second_join_is_busy_and_a_cancel_before_release_writes_nothing() {
     // a second join (the same or another offer text) while one runs
     let other = Tripwire::new();
     let second = live.call("pair.join", json!({"offer": mac.offer}));
-    assert_eq!(error_of(&second), ("busy", "an import or a sync is already running"));
+    assert_eq!(error_of(&second), ("busy", BUSY_PAIRING));
     let third = live.call("pair.join", json!({"offer": forged_offer(&other.url(), now() + 600)}));
-    assert_eq!(error_of(&third), ("busy", "an import or a sync is already running"));
+    assert_eq!(error_of(&third), ("busy", BUSY_PAIRING));
+    // N7: an import or a sync that finds the slot held by a join is told so
+    let import = live.call("import.run", json!({"path": "/nonexistent"}));
+    assert_eq!(error_of(&import), ("busy", BUSY_PAIRING));
     assert!(!other.tripped());
     // pair.land before the release is refused
     let early = live.call("pair.land", json!({"confirm": true}));
@@ -598,6 +614,10 @@ fn the_land_wait_ends_as_a_no() {
     mac.confirm(&digits).expect("release");
     let done = live.response(id);
     assert_eq!(error_of(&done), ("pair_failed", "Not paired. Cancel on your Mac too."));
+    assert!(phone_files(&pdb).is_empty());
+    // N3: a `pair.land` after the wait ran out is refused, never answered "landing"
+    let late = live.call("pair.land", json!({"confirm": true}));
+    assert_eq!(late["error"]["code"], "not_found", "{late}");
     assert!(phone_files(&pdb).is_empty());
 }
 
@@ -750,17 +770,79 @@ fn a_cancel_during_the_reachability_wait_ends_it() {
     assert!(phone_files(&pdb).is_empty());
 }
 
+/// S4: there is no tolerance past `exp` (the joiner refuses `now > exp` itself, so a 300 s allowance in the prefix
+/// never changed an outcome): a phone clock fast by any amount past `exp` is refused before the network.
 #[test]
-#[cfg(target_os = "ios")]
-fn a_phone_clock_fast_by_less_than_the_tolerance_is_refused_with_the_clock_message() {
-    // inside the prefix's 300 s tolerance, the joiner itself refuses an offer past its exp: same words
+fn a_phone_clock_past_exp_is_refused_before_any_network_call() {
     let (_pdir, pdb) = phone();
     let wire = Tripwire::new();
     let mut live = Live::start(&pdb, fast_join());
-    let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), now() - 100)}));
-    assert_eq!(error_of(&reply), ("pair_failed", CLOCK_EXPIRED));
+    for past in [1u64, 100, 299, 300, 301, 900] {
+        let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), now() - past)}));
+        assert_eq!(error_of(&reply), ("pair_failed", CLOCK_EXPIRED), "past {past}");
+    }
     assert!(!wire.tripped());
     assert_eq!((live.joiners)(), 0);
+    assert!(phone_files(&pdb).is_empty());
+}
+
+/// S2 stage 1 (every core): addresses that are never a pairing address are refused after the IP-literal check.
+#[test]
+fn an_offer_address_that_is_never_a_pairing_address_is_refused_on_every_core() {
+    let (_dir, db) = phone();
+    let mut live = Live::start(&db, JoinHooks::default());
+    let fresh = now() + 600;
+    for host in [
+        "0.0.0.0", "0.1.2.3", "255.255.255.255", "224.0.0.1", "239.255.255.250", "240.0.0.1", "169.254.1.1",
+        "[::]", "[ff02::1]", "[fe80::1]", "[febf::1]", "[::ffff:0:0]",
+    ] {
+        let reply = live.call("pair.join", json!({"offer": forged_offer(&format!("http://{host}:24816"), fresh)}));
+        assert_eq!(error_of(&reply), ("bad_params", BAD_ADDRESS), "{host}");
+    }
+    assert!(phone_files(&db).is_empty());
+    assert_eq!((live.joiners)(), 0);
+    // not refused by the class: loopback, private and global addresses pass stage 1 and meet the next refusal
+    // (the expiry here, so no core goes on to the network or the phone's stage 2)
+    for host in ["127.0.0.1", "[::1]", "10.0.0.5", "192.168.1.20", "100.64.0.1", "[fd00::5]", "8.8.8.8", "[2001:4860:4860::8888]"] {
+        let reply = live.call("pair.join", json!({"offer": forged_offer(&format!("http://{host}:24816"), 1000)}));
+        assert_eq!(error_of(&reply), ("pair_failed", CLOCK_EXPIRED), "{host}");
+    }
+}
+
+/// The twin's trim equals Rust's: `str::trim` strips Unicode White_Space only (not U+001C..U+001F).
+#[test]
+fn the_offer_text_is_trimmed_by_unicode_white_space_only() {
+    let (_dir, db) = phone();
+    let mut live = Live::start(&db, JoinHooks::default());
+    let good = forged_offer("http://127.0.0.1:24816", 1000); // refused as expired once it parses
+    for (label, lead, trail) in [("space", " ", "\n"), ("ideographic space", "\u{3000}", ""), ("nel and nbsp", "\u{85}", "\u{a0}")] {
+        let reply = live.call("pair.join", json!({"offer": format!("{lead}{good}{trail}")}));
+        assert_eq!(error_of(&reply), ("pair_failed", CLOCK_EXPIRED), "{label}");
+    }
+    for (label, text) in [("a leading FS", format!("\u{1c}{good}")), ("a trailing US", format!("{good}\u{1f}")), ("a leading ZWSP", format!("\u{200b}{good}"))] {
+        let reply = live.call("pair.join", json!({"offer": text}));
+        assert_eq!(error_of(&reply), ("bad_params", "that is not a pairing offer"), "{label}");
+    }
+}
+
+/// N5: an unfinished forget (its marker beside the store) refuses a join before any network call.
+#[test]
+fn a_pending_forget_refuses_a_join_after_the_landing_site_check() {
+    let (_dir, db) = phone();
+    let wire = Tripwire::new();
+    let folder = db.parent().expect("folder").to_path_buf();
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    std::fs::write(folder.join("forget.pending"), b"").expect("marker");
+    let mut live = Live::start(&db, JoinHooks::default());
+    let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), now() + 600)}));
+    assert_eq!(error_of(&reply), ("pair_failed", FORGET_PENDING));
+    // the expiry is checked first, and "already paired" wins over a pending forget
+    let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), 1000)}));
+    assert_eq!(error_of(&reply), ("pair_failed", CLOCK_EXPIRED));
+    std::fs::write(&db, b"x").expect("store");
+    let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), now() + 600)}));
+    assert_eq!(error_of(&reply), ("pair_failed", ALREADY_PAIRED));
+    assert!(!wire.tripped());
 }
 
 #[test]
@@ -929,4 +1011,313 @@ fn a_forged_reply_shows_no_code_and_every_variant_reads_the_same() {
         stop.store(true, Ordering::SeqCst);
         thread.join().expect("liar");
     }
+}
+
+// ---- 12-F row 3 review fixes (simulator) ----
+
+/// A TCP proxy in front of the Mac's listener that holds one response until released: the first reply to a
+/// `POST` (the offerer's `202`) or the first `200` of a `GET .../payload`. Every request goes upstream with
+/// `Connection: close` and every reply comes back with it, so a held reply never meets a reused connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldWhat {
+    Post,
+    Payload200,
+}
+
+struct Hold {
+    url: String,
+    reached: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+fn read_request(conn: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    conn.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 2048];
+    loop {
+        match conn.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&chunk[..n]),
+        }
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    (!data.is_empty()).then_some(data)
+}
+
+impl Hold {
+    fn new(upstream: &str, what: HoldWhat) -> Hold {
+        let upstream = upstream.strip_prefix("http://").expect("http url").to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("addr").port());
+        let (reached, release, stop) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (r, g, s) = (Arc::clone(&reached), Arc::clone(&release), Arc::clone(&stop));
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::SeqCst) {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                conn.set_nonblocking(false).expect("blocking");
+                let Some(request) = read_request(&mut conn) else { continue };
+                // head as text, body as the bytes it is (a join body is binary)
+                let split = request.windows(4).position(|w| w == b"\r\n\r\n").map_or(request.len(), |at| at + 4);
+                let text = String::from_utf8_lossy(&request[..split]).into_owned();
+                let first = text.lines().next().unwrap_or("").to_string();
+                // forward with Connection: close (the offerer checks the Host header against its own address)
+                let head: String = text
+                    .split("\r\n")
+                    .map(|l| if l.to_ascii_lowercase().starts_with("host:") { format!("Host: {upstream}") } else { l.to_string() })
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+                    .replacen("\r\n", "\r\nConnection: close\r\n", 1);
+                let mut forwarded = head.into_bytes();
+                forwarded.extend_from_slice(&request[split..]);
+                let Ok(mut up) = std::net::TcpStream::connect(&upstream) else { continue };
+                let _ = up.write_all(&forwarded);
+                let mut reply = Vec::new();
+                let _ = up.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = up.read_to_end(&mut reply);
+                let reply_text = String::from_utf8_lossy(&reply).into_owned();
+                let held = match what {
+                    HoldWhat::Post => first.starts_with("POST "),
+                    HoldWhat::Payload200 => first.contains("/payload") && reply_text.starts_with("HTTP/1.1 200"),
+                } && !r.load(Ordering::SeqCst);
+                if held {
+                    r.store(true, Ordering::SeqCst);
+                    while !g.load(Ordering::SeqCst) && !s.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                // the reply as it came, its head's Connection header replaced
+                let split = reply.windows(4).position(|w| w == b"\r\n\r\n").map_or(reply.len(), |at| at + 4);
+                let head: String = String::from_utf8_lossy(&reply[..split])
+                    .lines()
+                    .filter(|l| !l.to_ascii_lowercase().starts_with("connection:"))
+                    .map(|l| format!("{l}\r\n"))
+                    .collect();
+                let head = head.replacen("\r\n\r\n", "\r\n", 1);
+                let _ = conn.write_all(head.as_bytes());
+                let _ = conn.write_all(b"Connection: close\r\n\r\n");
+                let _ = conn.write_all(&reply[split..]);
+            }
+        });
+        Hold { url, reached, release, stop, thread: Some(thread) }
+    }
+
+    fn wait_reached(&self) {
+        assert!(wait_until(40, || self.reached.load(Ordering::SeqCst)), "the proxy never saw the held request");
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.release.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// `mac.offer` pointed at `url` instead (the transcript does not hold the URL).
+fn offer_at(offer: &str, url: &str) -> String {
+    let parsed = Offer::parse(offer).expect("offer");
+    Offer { url: url.to_string(), ..parsed }.encode()
+}
+
+fn mac_url(mac: &Mac) -> String {
+    Offer::parse(&mac.offer).expect("offer").url
+}
+
+/// M1, the landing: `key.lock` while the landing runs must not be undone by the hand-back. The pairing still
+/// lands (paired, locked) and the answer says landed.
+#[test]
+#[cfg(target_os = "ios")]
+fn a_key_lock_during_landing_is_not_undone_by_the_hand_back() {
+    let (_pdir, pdb) = phone();
+    let mac = mac(None);
+    let hooks = JoinHooks { step_pause: Duration::from_millis(400), ..fast_join() };
+    let mut live = Live::start(&pdb, hooks);
+    let id = live.send("pair.join", json!({"offer": mac.offer}));
+    let digits = code_of(&mut live);
+    mac.confirm(&digits).expect("release");
+    live.phase("released");
+    live.call("pair.land", json!({"confirm": true}));
+    // the key file exists and the landing is paused after a step: lock the app now (lock_after_absence)
+    assert!(wait_until(40, || keys::key_path_for(&pdb).exists()), "the key file never landed");
+    let locked = live.call("key.lock", json!({}));
+    assert_eq!(locked["result"], json!({"state": "locked"}));
+    let done = live.response(id);
+    assert_eq!(done["result"]["state"], "landed", "the pairing still lands: {done}");
+    assert!(pdb.exists() && keys::key_path_for(&pdb).exists());
+    // locked, and every reader answers locked: no master came back
+    let status = live.call("key.status", json!({}));
+    assert_eq!(status["result"]["unlocked"], false, "the hand-back undid key.lock: {status}");
+    let sync = live.call("sync.status", json!({}));
+    assert_eq!(error_of(&sync).0, "locked", "{sync}");
+    let data = live.call("data.today", json!({}));
+    assert_eq!(error_of(&data).0, "locked", "{data}");
+    assert_eq!((live.joiners)(), 0);
+    // a later join starts clean (the flag is per join): the phone is paired now, so it is refused as such
+    let again = live.call("pair.join", json!({"offer": mac.offer}));
+    assert_eq!(error_of(&again), ("pair_failed", ALREADY_PAIRED));
+}
+
+/// M1, the wait: `key.lock` while the join waits for `pair.land` ends it as a no and lands nothing.
+#[test]
+#[cfg(target_os = "ios")]
+fn a_key_lock_during_the_land_wait_ends_the_join_not_paired() {
+    let (_pdir, pdb) = phone();
+    let mac = mac(None);
+    let mut live = Live::start(&pdb, fast_join());
+    let id = live.send("pair.join", json!({"offer": mac.offer}));
+    let digits = code_of(&mut live);
+    mac.confirm(&digits).expect("release");
+    live.phase("released");
+    let started = Instant::now();
+    assert_eq!(live.call("key.lock", json!({}))["result"], json!({"state": "locked"}));
+    let done = live.response(id);
+    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Cancel on your Mac too."));
+    assert!(started.elapsed() < Duration::from_secs(20), "the 600 s wait was not ended");
+    assert!(phone_files(&pdb).is_empty(), "nothing is written while the key is supposed to be dropped");
+    assert_eq!((live.joiners)(), 0);
+    assert_eq!(live.call("pair.land", json!({"confirm": true}))["error"]["code"], "not_found");
+}
+
+/// S1: a cancel that races the offerer's `202` is answered "aborted" and then no code event appears.
+#[test]
+#[cfg(target_os = "ios")]
+fn a_cancel_that_races_the_202_shows_no_code() {
+    let (_pdir, pdb) = phone();
+    let mac = mac(None);
+    let hold = Hold::new(&mac_url(&mac), HoldWhat::Post);
+    let mut live = Live::start(&pdb, fast_join());
+    let id = live.send("pair.join", json!({"offer": offer_at(&mac.offer, &hold.url)}));
+    hold.wait_reached(); // the Mac answered; the phone has not seen it
+    let cancelled = live.call("pair.cancel", json!({}));
+    assert_eq!(cancelled["result"], json!({"state": "aborted"}));
+    hold.release.store(true, Ordering::SeqCst);
+    let done = live.response(id);
+    assert_eq!(error_of(&done), ("pair_failed", "Cancelled. Cancel on your Mac too."));
+    assert!(live.lines().iter().all(|l| l["event"] != "pair"), "an event followed the aborted reply: {:?}", live.lines());
+    assert!(phone_files(&pdb).is_empty());
+    assert_eq!((live.joiners)(), 0);
+}
+
+/// S3: the release gate. A cancel answered "aborted" while the payload's 200 is in flight wins: no "released",
+/// "Cancelled", nothing written. (Without the gate the worker would release and wait for `pair.land`.)
+#[test]
+#[cfg(target_os = "ios")]
+fn a_cancel_while_the_payload_is_in_flight_wins_over_the_release() {
+    let (_pdir, pdb) = phone();
+    let mac = mac(None);
+    let hold = Hold::new(&mac_url(&mac), HoldWhat::Payload200);
+    let hooks = JoinHooks { land_wait: Duration::from_millis(500), ..fast_join() };
+    let mut live = Live::start(&pdb, hooks);
+    let id = live.send("pair.join", json!({"offer": offer_at(&mac.offer, &hold.url)}));
+    let digits = code_of(&mut live);
+    mac.confirm(&digits).expect("release");
+    hold.wait_reached(); // the payload's 200 is held
+    let cancelled = live.call("pair.cancel", json!({}));
+    assert_eq!(cancelled["result"], json!({"state": "aborted"}));
+    hold.release.store(true, Ordering::SeqCst);
+    let done = live.response(id);
+    assert_eq!(error_of(&done), ("pair_failed", "Cancelled. Cancel on your Mac too."));
+    assert!(live.lines().iter().all(|l| l["phase"] != "released"), "released after an answered cancel");
+    assert!(phone_files(&pdb).is_empty());
+    assert_eq!((live.joiners)(), 0);
+}
+
+/// N9: a valid reveal (the real `N_o` matching `c`) with a bad tag reads the same as every other forged reply.
+#[test]
+#[cfg(target_os = "ios")]
+fn a_valid_reveal_with_a_bad_tag_reads_as_did_not_check_out() {
+    let n_o = [0x42u8; 32];
+    let (_secret, public) = pair::ephemeral().expect("key");
+    let offer = Offer { pub_key: public, c: pair::commit(&n_o), s: [9u8; 16], id: [5u8; 16], exp: now() + 600, url: String::new() };
+    let mut body = n_o.to_vec();
+    body.extend_from_slice(&[0x99u8; 32]); // a tag nobody computed
+    let (url, stop, thread) = liar(body);
+    let (_pdir, pdb) = phone();
+    let mut live = Live::start(&pdb, fast_join());
+    let reply = live.call("pair.join", json!({"offer": Offer { url, ..offer }.encode()}));
+    assert_eq!(
+        error_of(&reply),
+        ("pair_failed", "Your Mac's answer did not check out. Cancel on your Mac and start a new offer.")
+    );
+    assert!(live.lines().iter().all(|l| l["event"] != "pair"), "a bad tag showed a code or an event");
+    assert!(phone_files(&pdb).is_empty());
+    stop.store(true, Ordering::SeqCst);
+    thread.join().expect("liar");
+}
+
+/// N2: two texts of one parsed offer are one joiner (the key is the canonical re-encoding, not the text).
+#[test]
+#[cfg(target_os = "ios")]
+fn two_texts_of_one_parsed_offer_share_a_joiner() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (_pdir, pdb) = phone();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().expect("addr").port());
+    let mute = Mute::on(listener);
+    let mut live = Live::start(&pdb, fast_join());
+    let text = forged_offer(&url, now() + 600);
+    // the same offer with spaces in its JSON: another text, the same parsed offer
+    let json = URL_SAFE_NO_PAD.decode(text.strip_prefix("disconect-pair:v2.").expect("prefix")).expect("base64");
+    let value: Value = serde_json::from_slice(&json).expect("json");
+    let spaced = serde_json::to_string_pretty(&value).expect("pretty");
+    let other = format!("disconect-pair:v2.{}", URL_SAFE_NO_PAD.encode(spaced.as_bytes()));
+    assert_ne!(text, other);
+    assert_eq!(Offer::parse(&text).expect("a").encode(), Offer::parse(&other).expect("b").encode());
+    let _ = live.call("pair.join", json!({"offer": text}));
+    assert_eq!((live.joiners)(), 1);
+    let _ = live.call("pair.join", json!({"offer": other}));
+    assert_eq!((live.joiners)(), 1, "the same parsed offer is the same joiner");
+    let bodies = mute.bodies.lock().expect("bodies").clone();
+    assert!(bodies.len() >= 6 && bodies.iter().all(|b| *b == bodies[0]), "the retry re-posted another key");
+}
+
+/// S2 stage 2 (simulator): a globally routable address that is not on one of this phone's networks is refused
+/// before the network; RFC1918 reaches the network attempt; loopback is allowed in a simulator build.
+#[test]
+#[cfg(target_os = "ios")]
+fn stage_two_refuses_an_off_link_global_address_and_lets_private_and_sim_loopback_through() {
+    let (_pdir, pdb) = phone();
+    let mut live = Live::start(&pdb, fast_join());
+    let fresh = now() + 600;
+    for host in ["8.8.8.8", "1.1.1.1", "[2001:4860:4860::8888]"] {
+        let reply = live.call("pair.join", json!({"offer": forged_offer(&format!("http://{host}:24816"), fresh)}));
+        assert_eq!(error_of(&reply), ("pair_failed", NOT_ON_LINK), "{host}");
+    }
+    assert!(phone_files(&pdb).is_empty());
+    assert_eq!((live.joiners)(), 0);
+    // RFC1918 (and CGNAT, ULA) are not refused: the worker starts and waits for the address (no answer yet)
+    for host in ["10.255.254.253", "192.168.254.253", "172.31.254.253", "100.64.254.253", "[fd00:dead::5]"] {
+        let id = live.send("pair.join", json!({"offer": forged_offer(&format!("http://{host}:24816"), fresh)}));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(live.response_within(id, 0).is_none(), "{host}: refused by the class instead of reaching the network attempt");
+        assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}), "{host}");
+        let done = live.response(id);
+        assert_eq!(error_of(&done), ("pair_failed", "Cancelled. Cancel on your Mac too."), "{host}");
+    }
+    // loopback is allowed in the simulator (every other test here joins through it)
+    let wire = Tripwire::new();
+    let id = live.send("pair.join", json!({"offer": forged_offer(&wire.url(), fresh)}));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(live.response_within(id, 0).is_none(), "loopback was refused in a simulator build");
+    assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
+    let _ = live.response(id);
 }

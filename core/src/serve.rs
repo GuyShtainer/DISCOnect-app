@@ -738,6 +738,8 @@ fn key_unlock(session: &mut Session, call: &Call) -> Result<Value, Failure> {
 /// locked, or nothing to lock, answers the same). The keychain item, if any, is left alone.
 fn key_lock(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     session.unlocked = None;
+    // a pairing that lands after this must not hand its master back (12-F row 3 review, M1)
+    session.join.revoke();
     Ok(json!({"state": "locked"}))
 }
 
@@ -1072,7 +1074,7 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err(Failure::serve("busy", "an import is already running"));
+        return Err(Failure::serve("busy", session.join.busy_message("an import is already running")));
     }
     // a path with a lone surrogate cannot name a file here: it is reported as missing (booked, kb/23)
     let text = path.to_text();
@@ -1238,7 +1240,7 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     {
         return Err(Failure::serve(
             "busy",
-            "an import or a sync is already running",
+            session.join.busy_message("an import or a sync is already running"),
         ));
     }
     let job = SyncJob {
