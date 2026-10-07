@@ -510,9 +510,16 @@ fn phone_privacy_walk(lines: &[Value], digits: &str) {
     let mut leaves = 0;
     for line in lines {
         let mut copy = line.clone();
-        // `sync.status.result.relay_url` is serve-protocol's own allow-listed leaf, not the join's
+        // `sync.status.result.relay_url` is serve-protocol's own allow-listed leaf, not the join's; BL-7's
+        // `relay_list[N].url` is the same value and `relay_list[N].path` its allow-listed folder twin
         if let Some(result) = copy.get_mut("result").and_then(Value::as_object_mut) {
             result.remove("relay_url");
+            for entry in result.get_mut("relay_list").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.remove("url");
+                    entry.remove("path");
+                }
+            }
         }
         if copy["event"] == "pair" && copy["phase"] == "code" {
             let code = copy["code"].as_str().expect("code");
