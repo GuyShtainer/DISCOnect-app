@@ -442,6 +442,7 @@ impl Relay for LanRelay {
             .filter(|name| is_object_name(name) && name.starts_with(&prefix))
             .collect();
         kept.sort();
+        kept.dedup();
         Ok(kept)
     }
 

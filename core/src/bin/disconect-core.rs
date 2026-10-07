@@ -520,9 +520,9 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                 return if result.partial || reports.iter().any(|r| r.error.is_some()) { Err((1, String::new())) } else { Ok(()) };
             }
             let result = if strict {
-                sync::pull_strict(opened.conn(), master.as_slice(), &sites, &mut reports)
+                sync::pull_strict(opened.conn(), master.as_slice(), &sites, &mut reports, false)
             } else {
-                sync::pull_all(opened.conn(), master.as_slice(), &sites, &mut reports)
+                sync::pull_all(opened.conn(), master.as_slice(), &sites, &mut reports, false)
             }
             .map_err(failed)?;
             let sites_shown = shown(&reports);

@@ -204,7 +204,7 @@ fn a_repack_after_a_lost_conflict_leaves_the_retired_record_out_and_a_fresh_stor
     push_all(b.conn(), &master(), &b_sites, &mut b_reports).expect("b push");
     // A pulls the union: its record loses and is retired
     let (a_sites, mut a_reports) = open(&roots[..2]);
-    let pulled = pull_all(a.conn(), &master(), &a_sites, &mut a_reports).expect("a pull");
+    let pulled = pull_all(a.conn(), &master(), &a_sites, &mut a_reports, false).expect("a pull");
     assert_eq!((pulled.conflicts, pulled.status), (1, "ok"));
     assert_eq!(steps_of(&a), 8000.0);
     // site 2 is emptied; the heal re-packs A's bundle without the retired record
@@ -220,11 +220,11 @@ fn a_repack_after_a_lost_conflict_leaves_the_retired_record_out_and_a_fresh_stor
     let c = device();
     let mut c_reports = vec![SiteReport::new("00000002", "folder")];
     let (only_two, _) = open_sites(&folder_specs(&[roots[1].as_path()]), &master());
-    let first = pull_all(c.conn(), &master(), &only_two, &mut c_reports).expect("c pull the healed site");
+    let first = pull_all(c.conn(), &master(), &only_two, &mut c_reports, false).expect("c pull the healed site");
     assert_eq!((first.applied.len(), first.rejected.len(), first.status), (1, 0, "ok"));
     assert_eq!(count(c.conn(), "SELECT count(*) FROM raw_records"), 0);
     let (only_one, _) = open_sites(&folder_specs(&[roots[0].as_path()]), &master());
-    let second = pull_all(c.conn(), &master(), &only_one, &mut c_reports).expect("c pull the winner's site");
+    let second = pull_all(c.conn(), &master(), &only_one, &mut c_reports, false).expect("c pull the winner's site");
     assert_eq!(second.status, "ok");
     assert_eq!(steps_of(&c), 8000.0, "the winner arrives through its own bundle");
 }
@@ -253,7 +253,7 @@ fn a_pull_falls_through_a_bad_copy_to_the_next_site_and_applies_each_name_once()
 
     let b = device();
     let (sites, mut reports) = open(&roots[..2]);
-    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
+    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull");
     assert_eq!(pulled.applied.len(), 2, "{pulled:?}");
     assert!(pulled.applied.contains(&shared) && pulled.applied.contains(&lonely));
     assert!(pulled.rejected.is_empty(), "a bad copy on one site is not a rejection");
@@ -279,7 +279,7 @@ fn a_name_every_site_rejects_is_rejected_once() {
     }
     let b = device();
     let (sites, mut reports) = open(&roots[..2]);
-    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
+    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull");
     assert_eq!((pulled.applied.len(), pulled.rejected.len(), pulled.status), (0, 1, "partial"));
     assert_eq!((reports[0].rejected, reports[1].rejected), (1, 1));
 }
@@ -306,32 +306,79 @@ fn a_rejected_name_is_not_fetched_again_for_a_day_and_the_run_is_ok() {
 
     let b = device();
     let (sites, mut reports) = open(&roots[..1]);
-    let run1 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 1");
+    let run1 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 1");
     assert_eq!((run1.rejected.len(), run1.status, reports[0].rejected), (1, "partial", 1));
-    // a second bundle arrives: the garbage is held back (nothing fetched, nothing counted), the run is clean
+    // a run that does not hold (a click, the CLI, the phone) fetches it again right away, rejects it again, and
+    // the booking moves to the new time
+    let at = |hours: u64| disconect_core::time::iso_from_unix(disconect_core::time::now_unix() - hours * 3600);
+    b.conn()
+        .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![at(2), first])
+        .expect("age");
+    let (sites, mut reports) = open(&roots[..1]);
+    let click = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull click");
+    assert_eq!((click.rejected.len(), click.status, reports[0].rejected), (1, "partial", 1));
+    assert!(booked(b.conn(), &first) > at(1), "the click's booking carries the new time");
+    // a second bundle arrives: the garbage is held back under an automatic run (nothing fetched, nothing counted), the run is clean
     import_day(&a, tmp.path(), "2025-06-16", 5000, "2025-06-16T12:00:00.0");
     let (sites, mut reports) = open(&roots[..1]);
     let second = push_all(a.conn(), &master(), &sites, &mut reports).expect("push 2").bundles[0].clone();
     let (sites, mut reports) = open(&roots[..1]);
-    let run2 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 2");
+    let run2 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 2");
     assert_eq!(run2.applied, vec![second]);
     assert!(run2.rejected.is_empty(), "{run2:?}");
     assert_eq!((run2.status, reports[0].rejected, reports[0].pulled), ("ok", 0, 1));
     // a booking 23 h old still holds the name back; one 25 h old is retried once and booked again with a new time
-    let at = |hours: u64| disconect_core::time::iso_from_unix(disconect_core::time::now_unix() - hours * 3600);
     b.conn()
         .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![at(23), first])
         .expect("age");
     let (sites, mut reports) = open(&roots[..1]);
-    let run3 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 3");
+    let run3 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 3");
     assert_eq!((run3.rejected.len(), run3.status, reports[0].rejected), (0, "ok", 0));
     b.conn()
         .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![at(25), first])
         .expect("age");
     let (sites, mut reports) = open(&roots[..1]);
-    let run4 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 4");
+    let run4 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 4");
     assert_eq!((run4.rejected.len(), run4.status, reports[0].rejected), (1, "partial", 1));
     assert!(booked(b.conn(), &first) > at(1), "the booking carries the new time");
+}
+
+#[test]
+fn an_io_failure_is_never_held_and_a_booking_in_the_future_is_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let roots = three_roots(tmp.path());
+    let a = device();
+    import_day(&a, tmp.path(), "2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let (sites, mut reports) = open(&roots[..1]);
+    let name = push_all(a.conn(), &master(), &sites, &mut reports).expect("push").bundles[0].clone();
+    let object = roots[0].join(account_for(&master())).join(name.split_once('/').expect("name").1);
+    // run 1: a permission-denied read is booked rejected (a folder error is never transient)
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let b = device();
+    let (sites, mut reports) = open(&roots[..1]);
+    let run1 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 1");
+    assert_eq!((run1.rejected.len(), run1.applied.len()), (1, 0), "{run1:?}");
+    assert_eq!(run1.rejected[0].1, "PermissionError");
+    // run 2: the read is good again; the I/O reason is not held, so the bundle applies under hold true
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o644)).expect("chmod back");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run2 = pull_all(b.conn(), &master(), &sites, &mut reports, true).expect("pull 2");
+    assert_eq!((run2.applied.clone(), run2.rejected.len(), run2.status), (vec![name.clone()], 0, "ok"), "{run2:?}");
+    // a booking in the future (a clock set back) counts as expired: fetched under hold true, booked at the new time
+    let c = device();
+    fs::write(&object, b"not a bundle").expect("damage");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run3 = pull_all(c.conn(), &master(), &sites, &mut reports, true).expect("pull 3");
+    assert_eq!(run3.rejected.len(), 1, "{run3:?}");
+    let ahead = disconect_core::time::iso_from_unix(disconect_core::time::now_unix() + 4 * 24 * 3600);
+    c.conn()
+        .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![ahead, name])
+        .expect("future");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run4 = pull_all(c.conn(), &master(), &sites, &mut reports, true).expect("pull 4");
+    assert_eq!((run4.rejected.len(), run4.status, reports[0].rejected), (1, "partial", 1), "{run4:?}");
+    assert!(booked(c.conn(), &name) < ahead, "the booking carries the corrected time");
 }
 
 #[test]
@@ -346,7 +393,7 @@ fn a_copy_damaged_on_site_one_and_good_on_site_two_marks_site_one_nothing() {
     fs::write(roots[0].join(account_for(&master())).join(object), b"not a bundle").expect("damage");
     let b = device();
     let (sites, mut reports) = open(&roots[..2]);
-    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
+    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull");
     assert_eq!(pulled.applied, vec![name]);
     assert!(pulled.rejected.is_empty());
     assert_eq!(pulled.status, "ok");
@@ -366,7 +413,7 @@ fn a_chains_last_at_is_the_newest_applied_bundles_created_utc() {
     }
     let b = device();
     let (sites, mut reports) = open(&roots[..1]);
-    assert_eq!(pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull").applied.len(), 2);
+    assert_eq!(pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull").applied.len(), 2);
     // pin two distinct header times (the pushes above may share a second), the newer one on the second bundle
     b.conn()
         .execute(
@@ -716,7 +763,7 @@ fn an_unreachable_lan_site_keeps_the_name_pending() {
         report: 2,
     });
     reports.push(SiteReport::new("00000003", "lan"));
-    let first = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
+    let first = pull_all(b.conn(), &master(), &sites, &mut reports, false).expect("pull");
     assert!(first.applied.is_empty() && first.rejected.is_empty(), "{first:?}");
     assert_eq!(first.status, "partial");
     assert_eq!(reports[2].error, Some("unreachable"));
@@ -727,7 +774,7 @@ fn an_unreachable_lan_site_keeps_the_name_pending() {
     // the Mac is back: the same name is pulled
     down.store(false, Ordering::SeqCst);
     let mut again = vec![SiteReport::new("00000001", "folder"), SiteReport::new("00000002", "folder"), SiteReport::new("00000003", "lan")];
-    let second = pull_all(b.conn(), &master(), &sites, &mut again).expect("pull again");
+    let second = pull_all(b.conn(), &master(), &sites, &mut again, false).expect("pull again");
     assert_eq!((second.applied.clone(), second.status), (vec![name], "ok"));
     assert_eq!((again[2].pulled, again[2].error), (1, None));
     server.stop();

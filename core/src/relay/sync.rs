@@ -7,8 +7,8 @@
 //! -> `relay.put`. Pull = `relay.list(account)` minus the applied bundles -> `unpack` -> verify
 //! every record's bytes -> the normal `Writer` as one import run with transport `relay`: FIT
 //! first, then JSON records through the export decoders, then the readiness batch, then the
-//! derived dailies. A bundle that fails authentication or validation is recorded `rejected` and
-//! retried on the next pull.
+//! derived dailies. A bundle that fails authentication or validation is recorded `rejected`; a click, the CLI and the phone's pull retry it on every pull, the desktop's
+//! automatic run holds it a day (I/O reasons and future bookings excepted).
 //!
 //! Conflict rule (JSON streams): same `(stream, source_key)`, different `payload_hash` -> the
 //! record whose decoded facts carry the later observed time wins, ties by the larger
@@ -1050,7 +1050,7 @@ fn repair_damaged(
 pub fn pull(conn: &Connection, master: &[u8], relay: &dyn Relay) -> Result<PullResult, SyncError> {
     let mut reports = vec![SiteReport::new("default", "folder")];
     let mut faults = vec![None];
-    let result = pull_core(conn, master, &[(relay, 0)], &mut reports, &mut faults)?;
+    let result = pull_core(conn, master, &[(relay, 0)], &mut reports, &mut faults, false)?;
     match faults.pop().flatten() {
         Some(error) => Err(error.into()),
         None => Ok(result),
@@ -1061,14 +1061,16 @@ pub fn pull(conn: &Connection, master: &[u8], relay: &dyn Relay) -> Result<PullR
 /// name tried on every site that lists it, in site order, until one unpacks (`rejected` only when all fail). A
 /// site that cannot be listed contributes nothing; a transient failure skips that site for the rest of the run and
 /// leaves its names pending (the run is `partial`). Failures are the reports' `error`, never the run's.
+/// `hold_rejected` (the desktop's automatic run only) leaves out a name booked `rejected` less than a day ago.
 pub fn pull_all(
     conn: &Connection,
     master: &[u8],
     sites: &[Site],
     reports: &mut [SiteReport],
+    hold_rejected: bool,
 ) -> Result<PullResult, SyncError> {
     let mut faults: Vec<Option<RelayError>> = (0..sites.len()).map(|_| None).collect();
-    pull_core(conn, master, &targets(sites), reports, &mut faults)
+    pull_core(conn, master, &targets(sites), reports, &mut faults, hold_rejected)
 }
 
 /// [`pull_all`] for a list of one: the site's first failure is raised as the error (what [`pull`] does), its report
@@ -1078,9 +1080,10 @@ pub fn pull_strict(
     master: &[u8],
     sites: &[Site],
     reports: &mut [SiteReport],
+    hold_rejected: bool,
 ) -> Result<PullResult, SyncError> {
     let mut faults: Vec<Option<RelayError>> = (0..sites.len()).map(|_| None).collect();
-    let result = pull_core(conn, master, &targets(sites), reports, &mut faults)?;
+    let result = pull_core(conn, master, &targets(sites), reports, &mut faults, hold_rejected)?;
     match faults.into_iter().flatten().next() {
         Some(error) => Err(error.into()),
         None => Ok(result),
@@ -1090,18 +1093,39 @@ pub fn pull_strict(
 /// A name booked `rejected` is not fetched again for a day (the core's clock): one retry per day.
 const REJECTED_BACKOFF_SECONDS: i64 = 24 * 3600;
 
-/// Names booked `rejected` less than a day ago: left out of the run.
+/// Reasons of a folder I/O failure: a hiccup of the storage says nothing about the bundle, so such a name is never held
+/// (the Python twin's `HOLD_EXEMPT_REASONS` is the same list).
+const HOLD_EXEMPT_REASONS: [&str; 9] = [
+    "OSError",
+    "TimeoutError",
+    "BlockingIOError",
+    "InterruptedError",
+    "BrokenPipeError",
+    "PermissionError",
+    "IsADirectoryError",
+    "NotADirectoryError",
+    "FileExistsError",
+];
+
+/// Names booked `rejected` less than a day ago, not for an I/O reason and not booked in the future (a clock set back):
+/// left out of an automatic run.
 fn held_back(conn: &Connection) -> Result<HashSet<String>, SyncError> {
     let now = crate::time::now_instant();
-    let mut stmt = conn.prepare("SELECT name, noted_at FROM relay_bundles WHERE status='rejected'")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut stmt = conn.prepare("SELECT name, noted_at, reason FROM relay_bundles WHERE status='rejected'")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+    })?;
     let mut held = HashSet::new();
     for row in rows {
-        let (name, noted_at) = row?;
-        if let Some(booked) = parse_iso_utc(&noted_at)
-            && (now - booked).num_seconds() < REJECTED_BACKOFF_SECONDS
-        {
-            held.insert(name);
+        let (name, noted_at, reason) = row?;
+        if HOLD_EXEMPT_REASONS.contains(&reason.as_deref().unwrap_or("")) {
+            continue;
+        }
+        if let Some(booked) = parse_iso_utc(&noted_at) {
+            let age = (now - booked).num_seconds();
+            if (0..REJECTED_BACKOFF_SECONDS).contains(&age) {
+                held.insert(name);
+            }
         }
     }
     Ok(held)
@@ -1113,6 +1137,7 @@ fn pull_core(
     relays: &[Target<'_>],
     reports: &mut [SiteReport],
     faults: &mut [Option<RelayError>],
+    hold_rejected: bool,
 ) -> Result<PullResult, SyncError> {
     let account = account_for(master);
     let mut result = PullResult::default();
@@ -1124,7 +1149,7 @@ fn pull_core(
     };
     let known = names("applied")?;
     let half_applied = names("applying")?;
-    let held_back = held_back(conn)?;
+    let held_back = if hold_rejected { held_back(conn)? } else { HashSet::new() };
     // the union of the listings in first-seen order (site order, then listing order), each name with its sites
     let mut pending: Vec<(String, Vec<usize>)> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();

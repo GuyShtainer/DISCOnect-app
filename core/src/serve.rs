@@ -1269,9 +1269,9 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
     emit(sync_event("sync", "push", "done", Some(&push)));
     emit(sync_event("sync", "pull", "start", None));
     let pulled = if strict {
-        relay_sync::pull_strict(conn, job.master.as_slice(), &sites, &mut reports)
+        relay_sync::pull_strict(conn, job.master.as_slice(), &sites, &mut reports, job.auto)
     } else {
-        relay_sync::pull_all(conn, job.master.as_slice(), &sites, &mut reports)
+        relay_sync::pull_all(conn, job.master.as_slice(), &sites, &mut reports, job.auto)
     };
     let pulled = pulled.inspect_err(|_| keep(&reports))?;
     let pull = json!({
