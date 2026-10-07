@@ -273,6 +273,11 @@ fn import_live_batch(
 ) -> Result<(), SourceError> {
     let total = files.len() as u64;
     for (done, (label, readings, cut_off)) in (1u64..).zip(files) {
+        if cancel.is_some_and(|asked| asked()) {
+            // before each file, as in every phase
+            writer.stats.cancelled = true;
+            return Ok(());
+        }
         if cut_off {
             *writer.stats.dropped.entry(DROPPED_LIVE_CUT_OFF.to_string()).or_insert(0) += 1;
         }
@@ -303,10 +308,6 @@ fn import_live_batch(
         if let Some(report) = progress.as_deref_mut() {
             report(done, Some(total), outcome);
         }
-        if cancel.is_some_and(|asked| asked()) {
-            writer.stats.cancelled = true;
-            return Ok(());
-        }
     }
     Ok(())
 }
@@ -318,9 +319,9 @@ fn import_live_batch(
 /// Never a file name or path.
 pub type Progress<'a> = &'a mut dyn FnMut(u64, Option<u64>, &str);
 
-/// `CancelCheck`: asked after each file, right after `progress`. True stops the import there: the file that was
-/// being read is kept, nothing later is read, the phases not yet started are skipped, the phase that was cut keeps
-/// its tail derivations, and the run is booked `cancelled` (`ImportStats::cancelled`).
+/// `CancelCheck`: asked before each file, in every phase. True stops the import there: the files already written
+/// are kept, nothing later is read, the phases not yet started are skipped, the phase that was cut keeps its tail
+/// derivations, and the run is booked `cancelled` (`ImportStats::cancelled`).
 pub type Cancel<'a> = &'a dyn Fn() -> bool;
 
 /// Lend a progress callback to one phase without giving it away.
@@ -353,13 +354,14 @@ pub(crate) fn import_batch(
     }
     let total = files.len() as u64;
     for (done, (label, data)) in (1u64..).zip(files) {
+        if cancel.is_some_and(|asked| asked()) {
+            // before each write: a cancel during the offset pass reads nothing
+            writer.stats.cancelled = true; // the batch's own derivations still run for what was written
+            break;
+        }
         let outcome = writer.write_fit(data, label, None)?;
         if let Some(report) = progress.as_deref_mut() {
             report(done, Some(total), outcome_text(outcome));
-        }
-        if cancel.is_some_and(|asked| asked()) {
-            writer.stats.cancelled = true; // the batch's own derivations still run for what was written
-            break;
         }
     }
     writer.derive_daily_steps()?;
@@ -405,12 +407,8 @@ pub fn import_path_with(
                 if writer.stats.cancelled {
                     return Ok(());
                 }
-                export::import_connect_export(path, &mut writer, reborrow(&mut progress), cancel)
-            })
-            .and_then(|()| {
-                if writer.stats.cancelled {
-                    return Ok(());
-                }
+                // the JSON phase; a cancel inside it still gets the re-derivation, so the rows read keep content order
+                export::import_connect_export(path, &mut writer, reborrow(&mut progress), cancel)?;
                 let stored = stored_json_streams(conn)?;
                 rederive_json(conn, &mut writer, &stored)?;
                 writer.derive_live_samples()?;
@@ -420,7 +418,7 @@ pub fn import_path_with(
         iter_live_files(path).and_then(|live_files| {
             let single_live_file = path.is_file() && !live_files.is_empty();
             import_live_batch(live_files, &mut writer, reborrow(&mut progress), cancel)?;
-            let fit_files = if single_live_file { Vec::new() } else { iter_fit_files(path)? };
+            let fit_files = if single_live_file || writer.stats.cancelled { Vec::new() } else { iter_fit_files(path)? };
             if !writer.stats.cancelled {
                 import_batch(&fit_files, &mut writer, reborrow(&mut progress), cancel).map_err(SourceError::from)?;
             }

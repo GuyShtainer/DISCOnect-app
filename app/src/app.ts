@@ -1677,7 +1677,7 @@ function importPaint(): void {
 }
 
 function importProgressLine(): string {
-  if (importUi.cancelling) return `Stopping after this file · ${importUi.done} read`;
+  if (importUi.cancelling) return importUi.done > 0 ? `Stopping after this file · ${importUi.done} read` : "Stopping · nothing read yet";
   if (!importUi.seen) return "Starting";
   // only an export's JSON phase reports no total (a folder counts its files from the first event)
   if (importUi.total === null) return `Reading the export's records · ${importUi.done} read`;
@@ -1799,11 +1799,13 @@ async function importCancel(): Promise<void> {
     await core.call("import.cancel");
   } catch (e) {
     if (!(core.isCoreError(e) && e.code === "not_found")) {
-      importUi.error = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+      // a notice, not the outcome: the import keeps running (review N6)
+      importUi.notice = core.isCoreError(e) ? e.message : String(e);
       importRedraw();
     }
     return;
   }
+  if (!importUi.running) return; // the end event overtook the reply (review N6): nothing to mark
   importUi.cancelling = true;
   const button = document.getElementById("import-cancel") as HTMLButtonElement | null;
   if (button) button.disabled = true;
@@ -1835,8 +1837,9 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
   }
   if (run.status === "cancelled") {
     const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
-    const read = `${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`;
-    return bannerEl("Cancelled", `${when} · stopped after ${read} · what was read is kept · drop it again to finish, files already held are skipped`);
+    const read = run.files_seen === 0 ? "stopped before the first file" : `stopped after ${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`;
+    const failed = run.files_failed > 0 ? ` · ${run.files_failed} failed` : "";
+    return bannerEl("Cancelled", `${when} · ${read}${failed} · what was read is kept · drop it again to finish, files already held are skipped`);
   }
   const failedRun = run.status === "failed";
   const withFailures = !failedRun && run.files_failed > 0;
@@ -1892,8 +1895,13 @@ async function screenImport(out: ParentNode): Promise<void> {
       grid.append(el("span", "", TRANSPORT_WORD[run.transport] ?? run.transport));
       grid.append(el("span", "value-small", `${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`));
       const failedRun = run.status === "failed";
-      const withFailures = !failedRun && run.files_failed > 0;
-      if (failedRun || withFailures) {
+      const cancelledRun = run.status === "cancelled"; // before `withFailures`: a cancelled run with failed files says so (review N5)
+      const withFailures = !failedRun && !cancelledRun && run.files_failed > 0;
+      if (cancelledRun && run.files_failed > 0) {
+        const a = el("a", "caption", "cancelled, with failures");
+        a.setAttribute("href", "#/health");
+        grid.append(a);
+      } else if (failedRun || withFailures) {
         const a = el("a", "caption", failedRun ? "failed" : "done with failures");
         a.setAttribute("href", "#/health");
         grid.append(a);

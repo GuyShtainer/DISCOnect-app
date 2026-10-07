@@ -365,9 +365,9 @@ fn a_second_import_while_one_runs_is_busy_and_reads_keep_working() {
 
 
 #[test]
-fn a_held_import_cancelled_before_release_reads_one_file_and_is_booked_cancelled() {
-    // the flag is set while the worker is held, so exactly the first file is read: the check sits right after
-    // each file's progress event (twin of the Python test of the same name)
+fn a_held_import_cancelled_before_release_reads_nothing_and_is_booked_cancelled() {
+    // the flag is set while the worker is held before it starts, so nothing is read: the check sits before each
+    // file, the first included (twin of the Python test of the same name; the per-phase cuts are import_cancel_test)
     let (dir, db) = new_store();
     let export = export_folder(dir.path());
     let mut rig = Rig::new(&db);
@@ -395,16 +395,12 @@ fn a_held_import_cancelled_before_release_reads_one_file_and_is_booked_cancelled
         by_id(1)["error"],
         json!({"code": "cancelled", "message": "the import was cancelled; the files read so far are kept"})
     );
-    assert_eq!(
-        events(&lines).iter().map(|e| e.0).collect::<Vec<_>>(),
-        vec![1],
-        "the file being read finished; nothing later was read"
-    );
+    assert!(events(&lines).is_empty(), "nothing was read: the cancel landed before the first file");
     let last = rig.send(4, "import.last", json!({}));
     let run = &last.last().expect("answer")["result"]["runs"][0];
     assert_eq!(
         (run["status"].as_str(), run["files_seen"].as_i64(), run["files_imported"].as_i64(), run["error"].is_null()),
-        (Some("cancelled"), Some(1), Some(1), true)
+        (Some("cancelled"), Some(0), Some(0), true)
     );
     let none = rig.send(5, "import.cancel", json!({}));
     assert_eq!(
@@ -416,8 +412,8 @@ fn a_held_import_cancelled_before_release_reads_one_file_and_is_booked_cancelled
     let result = &again.last().expect("answer")["result"];
     assert_eq!(
         (result["ok"].as_i64(), result["duplicate"].as_i64()),
-        (Some(2), Some(1)),
-        "the slot is free; the file kept counts as a duplicate"
+        (Some(3), Some(0)),
+        "the slot is free; nothing was kept, so nothing is a duplicate (three members: two good, one not)"
     );
 }
 

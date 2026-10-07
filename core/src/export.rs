@@ -1343,7 +1343,7 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// `import_connect_export`: feed every recognised JSON file of the export to `writer`; everything
 /// else counts as ignored. (The FIT corpus is the caller's: [`collect_fit_members`].)
-/// `progress(done, None, stream)` is called after each imported file, then `cancel` is asked (see
+/// `progress(done, None, stream)` is called after each imported file; `cancel` is asked before each one (see
 /// [`crate::sources::Cancel`]); `done` counts from 0 for the JSON phase and an ignored entry is not counted.
 pub fn import_connect_export(
     path: &Path,
@@ -1359,14 +1359,14 @@ pub fn import_connect_export(
             writer.stats.ignored += 1;
             continue;
         };
+        if cancel.is_some_and(|asked| asked()) {
+            writer.stats.cancelled = true;
+            return Ok(());
+        }
         import_entry(&mut tree, index, &info, writer)?;
         done += 1;
         if let Some(report) = progress.as_deref_mut() {
             report(done, None, info.stream);
-        }
-        if cancel.is_some_and(|asked| asked()) {
-            writer.stats.cancelled = true;
-            return Ok(());
         }
     }
     Ok(())
