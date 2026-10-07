@@ -273,14 +273,20 @@ pub fn adopt_mac(dir: &Path, store: &mut Store) -> bool {
     true
 }
 
-/// Remove an entry; a removed Mac is remembered so `relay.json` does not bring it back.
-pub fn remove(store: &mut Store, id: &str) -> bool {
-    let Some(at) = store.relays.iter().position(|e| e.id == id) else { return false };
+/// Remove an entry. The paired Mac (the LAN entry `relay.json` names, `paired`) cannot be removed: the Mac is the
+/// pairing, and "Forget this phone" is the way out of it. Any other removed LAN entry is remembered so `relay.json`
+/// does not bring it back.
+pub fn remove(store: &mut Store, id: &str, paired: Option<&str>) -> Result<(), Refusal> {
+    let Some(at) = store.relays.iter().position(|e| e.id == id) else { return Err(Refusal("not_found")) };
+    let e = &store.relays[at];
+    if e.kind == "lan" && paired.is_some() && e.url.as_deref() == paired {
+        return Err(Refusal("paired_mac"));
+    }
     let gone = store.relays.remove(at);
     if gone.kind == "lan" {
         store.mac_dismissed = gone.url;
     }
-    true
+    Ok(())
 }
 
 pub fn rename(store: &mut Store, id: &str, label: &str) -> bool {
@@ -524,9 +530,7 @@ pub async fn relays_remove(app: tauri::AppHandle, id: String) -> Result<Value, C
     let dir = data_dir(&app)?;
     let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
     let mut store = load(&dir);
-    if !remove(&mut store, &id) {
-        return Err(refusal(Refusal("not_found")));
-    }
+    remove(&mut store, &id, mac_url_in(&dir).as_deref()).map_err(refusal)?;
     commit(&dir, &mut store).map_err(refusal)?;
     Ok(json!({"removed": true}))
 }
@@ -618,7 +622,7 @@ pub fn debug_seed(app: &tauri::AppHandle) {
     let mut store = load(&dir);
     if drop_b {
         if let Some(b) = store.relays.iter().filter(|e| e.kind == "folder").nth(1).map(|e| e.id.clone()) {
-            remove(&mut store, &b);
+            let _ = remove(&mut store, &b, None);
             let _ = commit(&dir, &mut store);
         }
         return;
@@ -751,7 +755,10 @@ mod tests {
         assert_eq!((store.relays[0].label.as_str(), store.relays[0].kind.as_str()), (MAC_LABEL, "lan"));
         assert!(!adopt_mac(&dir, &mut store), "adopted once");
         let id = store.relays[0].id.clone();
-        assert!(remove(&mut store, &id));
+        assert_eq!(remove(&mut store, &id, Some("http://192.168.1.20:24816")).err().map(|r| r.0), Some("paired_mac"), "the paired Mac stays");
+        assert_eq!(store.relays.len(), 1);
+        assert_eq!(remove(&mut store, "0000000a", Some("http://192.168.1.20:24816")).err().map(|r| r.0), Some("not_found"));
+        assert!(remove(&mut store, &id, None).is_ok(), "no longer the paired address: removable");
         assert!(!adopt_mac(&dir, &mut store), "removed on purpose: not brought back");
         add_lan(&mut store, "http://192.168.1.20:24816", "Your Mac").unwrap();
         assert_eq!(store.mac_dismissed, None);

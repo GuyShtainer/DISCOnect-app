@@ -2977,6 +2977,7 @@ const RELAY_REFUSALS: Record<string, string> = {
   not_local: "That address is not on a private or local network. Use the Mac's address on your home network.",
   busy: "Another relay change is running. Try again in a moment.",
   not_found: "That relay is no longer in the list.",
+  paired_mac: "Your Mac is the pairing and stays in the list. Forget this phone ends it.",
   unavailable: "The Files picker could not open. Try again.",
 };
 function relayRefusal(e: unknown): string {
@@ -3069,8 +3070,15 @@ async function relaysCard(out: ParentNode): Promise<void> {
       actions.replaceChildren(ask, yes, keep);
       keep.focus();
     });
-    actions.append(rename, remove);
-    row.append(actions);
+    // The paired Mac has no Remove: the Mac is the pairing, and Forget this phone is the way out of it.
+    const pairedMac = r.kind === "lan" && !!list.mac_url && r.url === list.mac_url;
+    if (pairedMac) {
+      actions.append(rename);
+      row.append(actions, el("p", "caption muted", "Your Mac is the pairing, so it stays in the list."));
+    } else {
+      actions.append(rename, remove);
+      row.append(actions);
+    }
     rows.append(row);
   }
   card.append(rows);
