@@ -720,6 +720,7 @@ type SyncStatus = {
   gaps: unknown[]; last_pushed_at: string | null; last_pulled_at: string | null;
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
   relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
+  relay_kind?: "folder" | "lan" | "mixed" | null; // 19a: what the relay list holds; the timer runs only with a folder in it
   chains?: { device_id: string; bundles: number; records: number; last_seq: number; self: boolean }[]; // 19b: counts per device chain; absent until the core says it
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
@@ -730,6 +731,7 @@ const SITE_WORDS: Record<string, string> = {
   unavailable: "Not reachable", same_relay: "Same as another relay", bad_url: "Bad address", unsupported_transport: "Needs the desktop core",
   unreachable: "Not reachable", refused: "Refused", unverified: "Not verified", too_large: "Too large", bad_name: "Bad name",
   missing: "Folder missing", no_permission: "No permission", io_error: "Read or write failed",
+  not_auto: "Clicks only", // 19a: a network relay is never polled on a schedule; it is a rule, not a failure
 };
 const SITE_KINDS: Record<string, string> = { folder: "Folder", lan: "Network" };
 type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
@@ -752,6 +754,52 @@ let debugTipDay: string | null = null; // --debug-tip YYYY-MM-DD (evidence runs)
 let debugPairDigits = false; // --debug-pair-digits (evidence runs, debug builds)
 let pairTimer: ReturnType<typeof setTimeout> | null = null;
 let syncListenersArmed = false;
+
+// ---- 19a: the desktop syncs from its folder relays on its own ------------------------------------
+// autoSyncRun() is the one sync.run outside screenSync (test_lint_app.py slices this section out by its two
+// heading comments): it always passes auto: true, and the core runs the folder sites only — a network relay is
+// reported not_auto and never polled on a schedule (pitch 19a; the OFF_NETWORK promise stays enforced by the core).
+// The phone never runs it (it syncs by its own rule when opened).
+const AUTO_SYNC_STORE = "disconect.autoSync"; // the user's switch, per device; absent = on
+const autoSync = {
+  on: true, every: 5 * 60 * 1000, first: 30_000,
+  timer: null as ReturnType<typeof setTimeout> | null,
+  at: null as Date | null, // the last run that reached the core (ok or failed), for the walk line and the focus rule
+  line: "", // the walk line under the switch: "Synced on its own at HH:MM · N new" or the failure, once
+};
+function autoSyncLoad(): void {
+  try { autoSync.on = localStorage.getItem(AUTO_SYNC_STORE) !== "off"; } catch { autoSync.on = true; }
+}
+function autoSyncSet(on: boolean): void {
+  autoSync.on = on;
+  try { if (on) localStorage.removeItem(AUTO_SYNC_STORE); else localStorage.setItem(AUTO_SYNC_STORE, "off"); } catch { /* storage is optional */ }
+  if (!on) autoSync.line = "";
+}
+async function autoSyncRun(): Promise<void> {
+  if (PHONE || !autoSync.on || locked() || syncRun.running || pairPushing) return;
+  const clock = (d: Date): string => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  try {
+    const r = await core.call<{ pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run", { auto: true });
+    autoSync.at = new Date();
+    const failed = (r.sites ?? []).filter((x) => x.error && x.error !== "not_auto").length;
+    autoSync.line = `Synced on its own at ${clock(autoSync.at)} · ${r.pull.records_new} new${r.status === "partial" || r.pull.status === "partial" ? " (partial)" : ""}${failed > 0 ? ` · ${failed} of ${r.sites?.length ?? 0} relays could not be used; see Relays below` : ""}`;
+  } catch (e) {
+    if (core.isCoreError(e) && (e.code === "busy" || e.code === "locked" || e.code === "not_found" || e.code === "not_folder")) return; // nothing to do this tick; the next one looks again
+    autoSync.at = new Date();
+    autoSync.line = `Could not sync on its own at ${clock(autoSync.at)}. ${coreLine(e)}`;
+  }
+  syncRedraw();
+}
+function autoSyncSchedule(delay: number): void {
+  if (PHONE) return;
+  if (autoSync.timer) clearTimeout(autoSync.timer);
+  autoSync.timer = setTimeout(() => { void autoSyncRun().finally(() => autoSyncSchedule(autoSync.every)); }, delay);
+}
+if (!PHONE) window.addEventListener("focus", () => { // back to the app: look once, but not twice within a minute
+  if (autoSync.at && Date.now() - autoSync.at.getTime() < 60_000) return;
+  void autoSyncRun();
+});
+// ---- 19a end --------------------------------------------------------------------------------------
 
 /** Redraw only while the Sync screen (or its pairing view) is on; any other screen picks the state up on return. */
 function syncRedraw(): void {
@@ -968,7 +1016,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     redraw();
     try {
       const r = await core.call<{ push: { bundles: number; records: number }; pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run");
-      const failed = (r.sites ?? []).filter((s) => s.error).length;
+      const failed = (r.sites ?? []).filter((s) => s.error && s.error !== "not_auto").length;
       const partial = r.status === "partial" || r.pull.status === "partial";
       syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${partial ? " (partial)" : ""}.${failed > 0 ? ` ${failed} of ${r.sites?.length ?? 0} relays could not be used; see Relays below.` : ""}`;
     } catch (e) {
@@ -1214,6 +1262,18 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   pairBtn.href = "#/sync/pair";
   actions.append(now, pairBtn);
   stat.append(actions);
+  if (status.relay_kind === "folder" || status.relay_kind === "mixed") { // 19a: the switch exists only with a folder in the list
+    const sw = el("label", "switch");
+    sw.append(el("span", "", "Sync from the folders on its own"));
+    const box = el("input") as HTMLInputElement;
+    box.type = "checkbox";
+    box.checked = autoSync.on;
+    box.onchange = () => { autoSyncSet(box.checked); if (box.checked) autoSyncSchedule(1000); redraw(); };
+    sw.append(box);
+    stat.append(sw);
+    const rule = status.relay_kind === "mixed" ? " A network relay is never polled on its own: Sync now reaches it." : "";
+    stat.append(el("p", "caption muted", autoSync.on ? (autoSync.line || `Every 5 minutes while the app is open, and when you come back to it.${rule}`) : "Off. Sync now still works."));
+  }
   if (syncRun.running || syncRun.push !== "idle") {
     stat.append(stepsList([
       { text: `Push${syncRun.pushNote ? ` · ${syncRun.pushNote}` : ""}`, state: syncRun.push },
@@ -1236,7 +1296,8 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       if (s.behind > 0) parts.push(`${s.behind} still to send`);
       if (s.rejected > 0) parts.push(`refused ${s.rejected}`);
       const word = s.error ? (SITE_WORDS[s.error] ?? "Failed") : null;
-      kv3.append(el("dt", "", `${s.label || (SITE_KINDS[s.kind] ?? "Relay")} · ${s.id}`), el("dd", word ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
+      const warn = word && s.error !== "not_auto"; // "Clicks only" is the rule for a network relay, not a failure
+      kv3.append(el("dt", "", `${s.label || (SITE_KINDS[s.kind] ?? "Relay")} · ${s.id}`), el("dd", warn ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
     }
     sites.append(kv3);
     sites.append(el("p", "caption muted", "Add or remove a relay with the command line: disconect sync relay add <folder or address>, disconect sync relay remove <id>."));
@@ -3778,6 +3839,8 @@ void (async () => {
     if (args.includes("--debug-pair-reload-on-landing")) debugPairReload = "landing"; // right after the Yes is sent (the first pull may be done by then)
     debugPairCancel = args.includes("--debug-pair-cancel"); // the Code screen's own Cancel is clicked a few seconds after it shows
     debugImportCancel = args.includes("--debug-import-cancel"); // the running import card's Cancel is clicked a moment after the import starts
+    const as = args.indexOf("--debug-auto-sync-seconds"); // 19a evidence runs: the timer's first run and period in seconds (Rust drops the flag and its operand from release argv)
+    if (as >= 0 && /^\d{1,4}$/.test(args[as + 1] ?? "")) { autoSync.first = Number(args[as + 1]) * 1000; autoSync.every = autoSync.first; }
   }
   await phoneEndStrayJoin(); // a reload mid-join ends that join before any screen is drawn (phone only; a no-op elsewhere)
   const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
@@ -3786,6 +3849,8 @@ void (async () => {
   } else {
     await route();
   }
+  autoSyncLoad();
+  autoSyncSchedule(autoSync.first); // 19a: the desktop's own timer; a no-op on the phone
   if (import.meta.env.DEV) {
     if (PHONE) {
       // evidence runs (the phone's pairing screens): a state drawn with synthetic values, never a real offer or code
