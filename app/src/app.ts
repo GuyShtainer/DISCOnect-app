@@ -3262,6 +3262,20 @@ function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTM
   const kv = el("dl", "kv");
   for (const [k, v] of rows) kv.append(el("dt", "", k), el("dd", "value-small", neutralText(v)));
   card.append(kv);
+  // 19b: what each device sent, only with two or more writers; counts only, the writer id is never drawn
+  const chains = status?.chains ?? [];
+  if (chains.length >= 2) {
+    const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+    const others = chains.filter((c) => !c.self).length;
+    let seen = 0;
+    const each = el("dl", "kv");
+    for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
+      if (!c.self) seen += 1;
+      const who = c.self ? "This phone" : others > 1 ? `Other (${seen})` : "Other";
+      each.append(el("dt", "", neutralText(who)), el("dd", "value-small", neutralText(`${one(c.bundles, "bundle")} · ${one(c.records, "record")}`)));
+    }
+    card.append(el("h3", "caption muted", neutralText("What each device sent")), each);
+  }
   return card;
 }
 
