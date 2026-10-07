@@ -711,7 +711,12 @@ type SyncStatus = {
   relay_kind?: "folder" | "lan" | "mixed" | null; // 19a: what the relay list holds; the timer runs only with a folder in it
   chains?: { chain: string; bundles: number; records: number; last_seq: number; self: boolean; last_at?: string }[]; // 19b: counts per writer chain (the random id its sync bookkeeping minted, never a hardware id); absent until the core says it
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
+  relay_list?: ListEntry[] | null; // BL-7: every entry of relay.json as configured; null with no list, [] when empty
 };
+/** One entry of the relay list as configured (BL-7): the folder's path exactly as typed (on purpose — it is this
+ * person's own setting on their own screen; the privacy walk allows it at this one key), or the network address
+ * (`http://host:port`, never a credential; null when the core refused the text). Read on the Mac only. */
+type ListEntry = { id: string; kind: string; label: string; serve: boolean; path?: string; url?: string | null };
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
 type SiteRow = { id: string; kind: string; label?: string; pushed: number; healed: number; behind: number; pulled: number; rejected: number; error: string | null };
 // The site words both cores emit (RelayError::site_word and open_sites), in plain words; anything else reads as a plain failure.
@@ -1232,6 +1237,11 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   // bad_params from relay.addresses: a relay list with no serving folder (this Mac is a joiner until one is marked --serve)
   const noServe = addrErr?.code === "bad_params";
   kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : noServe ? "relays set, none serves" : "folder relay"));
+  if (status?.relay_list && status.relay_list.length > 0) {
+    // BL-7: the folder this Mac serves to other devices, as configured ("none" while no entry is marked --serve)
+    const served = status.relay_list.find((e) => e.serve);
+    kv.append(el("dt", "", "Folder"), el("dd", "wrap", served?.path ?? "none"));
+  }
   card.append(kv);
   if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync relay add <folder> --serve"));
   if (noServe) card.append(el("p", "caption muted", "To serve your other devices from this Mac, mark one folder: disconect sync relay add <folder> --serve"));
@@ -1314,23 +1324,43 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
 
   // 19d: every relay of the list and what the last sync of this session did on it; read-only (the list is edited with
   // the command line until a folder picker is decided — pitch 19d, shape 6)
+  // BL-7: every entry of the list as configured (its path or address under the name), joined by id with what the
+  // last sync of this session did on it; a site of the last run that left the list since is shown after them.
   const sites = el("section", "card");
   sites.append(el("h2", "heading", "Relays"));
-  if (!status.relays || status.relays.length === 0) {
-    sites.append(el("p", "caption muted", "Each relay in the list shows here with what the last sync did on it. Run a sync to see them."));
+  const list = status.relay_list ?? [];
+  const ran = status.relays ?? [];
+  const siteOf = new Map(ran.map((s) => [s.id, s]));
+  const siteLine = (s: SiteRow): HTMLElement => {
+    const parts = [`sent ${s.pushed}`, `healed ${s.healed}`, `received ${s.pulled}`];
+    if (s.behind > 0) parts.push(`${s.behind} still to send`);
+    if (s.rejected > 0) parts.push(`refused ${s.rejected}`);
+    const word = s.error ? (SITE_WORDS[s.error] ?? "Failed") : null;
+    const warn = word && s.error !== "not_auto"; // "Clicks only" is the rule for a network relay, not a failure
+    return el("dd", warn ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · "));
+  };
+  const nameOf = (label: string | undefined, kind: string, id: string, where: string): HTMLElement => {
+    const dt = el("dt", "", `${label || (SITE_KINDS[kind] ?? "Relay")} · ${id}`);
+    dt.append(el("div", "caption muted wrap", where));
+    return dt;
+  };
+  if (list.length === 0 && ran.length === 0) {
+    sites.append(el("p", "caption muted", "No relays in the list yet. Each one shows here with its folder or address and what the last sync did on it."));
   } else {
     const kv3 = el("dl", "kv");
-    for (const s of status.relays) {
-      const parts = [`sent ${s.pushed}`, `healed ${s.healed}`, `received ${s.pulled}`];
-      if (s.behind > 0) parts.push(`${s.behind} still to send`);
-      if (s.rejected > 0) parts.push(`refused ${s.rejected}`);
-      const word = s.error ? (SITE_WORDS[s.error] ?? "Failed") : null;
-      const warn = word && s.error !== "not_auto"; // "Clicks only" is the rule for a network relay, not a failure
-      kv3.append(el("dt", "", `${s.label || (SITE_KINDS[s.kind] ?? "Relay")} · ${s.id}`), el("dd", warn ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
+    for (const e of list) {
+      const folder = e.path ?? "";
+      const where = e.kind === "lan" ? (e.url ?? "address refused") : /^[/~]/.test(folder) ? folder : `${folder} · relative to where the core was started`;
+      const s = siteOf.get(e.id);
+      kv3.append(nameOf(e.label, e.kind, e.id, where), s ? siteLine(s) : el("dd", "value-small muted", "Run a sync to see what moves"));
+    }
+    for (const s of ran) {
+      if (list.some((e) => e.id === s.id)) continue;
+      kv3.append(nameOf(s.label, s.kind, s.id, "removed from the list since the last sync"), siteLine(s));
     }
     sites.append(kv3);
-    sites.append(el("p", "caption muted", "Add or remove a relay with the command line: disconect sync relay add <folder or address>, disconect sync relay remove <id>."));
   }
+  sites.append(el("p", "caption muted", "Add or remove a relay with the command line: disconect sync relay add <folder or address>, disconect sync relay remove <id>."));
   out.append(sites);
 
   // 19b: what each writer sent, from the chains the store holds (counts only; the writer id is the random id the
