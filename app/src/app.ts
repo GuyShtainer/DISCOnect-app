@@ -2344,7 +2344,7 @@ async function screenKey(out: ParentNode): Promise<void> {
 // Copy is drawn through neutralText like the coach's text (no maker's name, plain score words). No screen here shows a
 // raw core code or the core's own message: a failure is one fixed sentence that says what to do.
 const PHONE_READ_FAIL = "Close and reopen the app. If this stays, your copy on the Mac is untouched.";
-const PHONE_SYNC_NOTE = "This phone talks only to your Mac, and only while both are on the same network. Nothing goes to any other server, and nothing is sent in the background.";
+const PHONE_SYNC_NOTE = "This phone syncs only with the relays listed in Settings: your Mac, while both are on the same network, and the folders you picked. Everything it sends is encrypted with your key, and nothing is sent in the background.";
 
 function pbanner(lead: string, text: string, error = false): HTMLElement {
   return bannerEl(neutralText(lead), neutralText(text), error);
@@ -3262,6 +3262,20 @@ function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTM
   const kv = el("dl", "kv");
   for (const [k, v] of rows) kv.append(el("dt", "", k), el("dd", "value-small", neutralText(v)));
   card.append(kv);
+  // 19b: what each device sent, only with two or more writers; counts only, the writer id is never drawn
+  const chains = status?.chains ?? [];
+  if (chains.length >= 2) {
+    const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+    const others = chains.filter((c) => !c.self).length;
+    let seen = 0;
+    const each = el("dl", "kv");
+    for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
+      if (!c.self) seen += 1;
+      const who = c.self ? "This phone" : others > 1 ? `Other (${seen})` : "Other";
+      each.append(el("dt", "", neutralText(who)), el("dd", "value-small", neutralText(`${one(c.bundles, "bundle")} · ${one(c.records, "record")}`)));
+    }
+    card.append(el("h3", "caption muted", neutralText("What each device sent")), each);
+  }
   return card;
 }
 
