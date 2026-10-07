@@ -21,9 +21,12 @@
 //! the code on stderr, reads the six digits the other device shows from stdin and releases the key only if they
 //! match; then it keeps serving until Ctrl-C (also when the offer ended: expired, aborted or wrong code). `--listen` must be an address the joiner can reach; port 0 is
 //! refused (the URL becomes the joiner's relay).
-//! `disconect-core --db <new db> [--relay-file <path>] pair join` reads the offer text from stdin (never argv),
-//! refuses before any request when the store, its key file, `<keys>.next`, `DISCONECT_KEYS` or a different relay
-//! file are in the way, shows its code on stderr, then writes the relay file (`relay.json` beside the db by default, where the app and the CLI read it), the
+//! `disconect-core --db <new db> [--relay-file <path>] [--i-saw-paired] pair join` reads the offer text from stdin (never argv),
+//! refuses before any request when the store, its key file, `<keys>.next`, `DISCONECT_KEYS` or a relay file of another
+//! store are in the way, shows its code on stderr, and once the offerer released asks on stderr whether the other
+//! device said Paired and reads the answer from stdin (the line after the offer; `y`/`yes` lands, anything else or
+//! EOF drops the pairing with "Not paired", exit 1, nothing written; `--i-saw-paired` answers yes for scripts — the
+//! phone's `pair.land` step, 12-G N12); then it writes the relay file (`relay.json` beside the db by default, where the app and the CLI read it), the
 //! key file (atomically), the encrypted store, and pulls; stdout is `{"paired": true, "pulled": {...}}`.
 //!
 //! `reparse` replays decoding over the retained raw records (`sources::reparse_all`, the Python `reparse`);
@@ -87,6 +90,7 @@ struct Args {
     force: bool,
     pair_action: Option<String>,
     relay_file: Option<PathBuf>,
+    i_saw_paired: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -96,7 +100,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut sync_action, mut relay, mut remember) = (None, None, false);
     let mut listen = None;
     let (mut streams, mut force) = (Vec::new(), false);
-    let (mut pair_action, mut relay_file) = (None, None);
+    let (mut pair_action, mut relay_file, mut i_saw_paired) = (None, None, false);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(it.next().ok_or("--db needs a path")?)),
@@ -115,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
             "--stream" => streams.push(it.next().ok_or("--stream needs a value")?),
             "--force" => force = true,
             "--relay-file" => relay_file = Some(PathBuf::from(it.next().ok_or("--relay-file needs a path")?)),
+            "--i-saw-paired" => i_saw_paired = true,
             "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" | "relay-serve" | "pair" if command.is_none() => command = Some(arg),
             "offer" | "join" if command.as_deref() == Some("pair") && pair_action.is_none() => pair_action = Some(arg),
             "push" | "pull" | "status" | "forget"
@@ -143,6 +148,7 @@ fn parse_args() -> Result<Args, String> {
         force,
         pair_action,
         relay_file,
+        i_saw_paired,
     })
 }
 
@@ -501,7 +507,7 @@ fn pair_failure(error: &PairError) -> (u8, String) {
 
 /// `pair offer`: `relay-serve` plus one offer slot (Bet 12-E).
 fn run_pair_offer(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String)> {
-    if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay_file.is_some() {
+    if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay_file.is_some() || args.i_saw_paired {
         return Err((EXIT_USAGE, "usage: pair offer takes --db, --passphrase-file, --relay <folder> and --listen".into()));
     }
     let listen = args.listen.as_deref().ok_or((EXIT_USAGE, "usage: pair offer needs --listen <addr:port>".to_string()))?;
@@ -580,7 +586,7 @@ fn offer_session(handle: &PairHandle, master: &[u8; 32], key_file_bytes: &[u8]) 
 /// `pair join`: the offer text comes from stdin, never argv.
 fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
     if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay.is_some() || args.listen.is_some() {
-        return Err((EXIT_USAGE, "usage: pair join takes --db <new store> and --relay-file <path>; the offer text comes on stdin".into()));
+        return Err((EXIT_USAGE, "usage: pair join takes --db <new store>, --relay-file <path> and --i-saw-paired; the offer text comes on stdin".into()));
     }
     let db = db_of(args)?;
     let mut text = Zeroizing::new(String::new());
@@ -599,9 +605,25 @@ fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
         &cancel,
     )
     .map_err(|e| pair_failure(&e))?;
+    if !args.i_saw_paired && !confirmed_on_stdin() {
+        return Err((1, "Not paired. Cancel on the other device too.".into()));
+    }
     let pulled = pair_client::land(&joined, db, &relay_file).map_err(|e| pair_failure(&e))?;
     println!("{}", json!({"paired": true, "pulled": pull_json(&pulled)}));
     if pulled.status == "ok" { Ok(()) } else { Err((1, String::new())) }
+}
+
+/// The human check the phone has as `pair.land` (12-F): the offerer released, and the landing waits for the user
+/// to say the other device showed Paired. Pasted text is exactly a planted offer's channel, and a planted offerer
+/// releases a master of its own, so without this step the CLI adopted it (12-G N12). The answer is the line after
+/// the offer on stdin: `y`/`yes` lands; anything else, EOF or a read error is a no (nothing is written).
+fn confirmed_on_stdin() -> bool {
+    eprintln!("Did the other device say Paired? Type y to keep this pairing, anything else to drop it [y/N]");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// The store a command works on: `--db` is required for everything except `serve`.

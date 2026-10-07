@@ -825,7 +825,8 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn join");
-    joiner.stdin.take().expect("stdin").write_all(format!("{offer}\n").as_bytes()).expect("offer");
+    let mut join_in = joiner.stdin.take().expect("stdin");
+    join_in.write_all(format!("{offer}\n").as_bytes()).expect("offer");
     let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
     let join_out = joiner.stdout.take().expect("stdout");
     let joiner_code = code_in(&line_with(&mut join_err, "Code on this device"));
@@ -836,6 +837,11 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "released");
     line_with(&mut offer_err, "Pairing done");
+    // the human check (12-G N12): nothing lands until the user says the other device showed Paired
+    line_with(&mut join_err, "Did the other device say Paired");
+    assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists() && !relay_file.exists(), "nothing before the answer");
+    join_in.write_all(b"y\n").expect("answer");
+    drop(join_in);
 
     let mut summary = String::new();
     BufReader::new(join_out).read_to_string(&mut summary).expect("summary");
@@ -861,6 +867,80 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
         assert_eq!(mode & 0o777, 0o700, "the key file's directory");
     }
     drop((dir, offerer));
+}
+
+/// 12-G N12: a released pairing the user does not vouch for is dropped; nothing is written, not even the folder.
+#[test]
+fn a_joiner_that_is_not_told_paired_writes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (_dir, db) = encrypted_copy();
+    let (mut offerer, mut offer_err, offer) = start_offer_process(tmp.path(), &db);
+    let joined_db = tmp.path().join("joiner").join("j.hbdb");
+    let mut joiner = cli(tmp.path())
+        .arg("--db").arg(&joined_db)
+        .args(["pair", "join"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn join");
+    let mut join_in = joiner.stdin.take().expect("stdin");
+    join_in.write_all(format!("{offer}\n").as_bytes()).expect("offer");
+    let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
+    let code = code_in(&line_with(&mut join_err, "Code on this device"));
+    lines_until(&mut offer_err, "Type the code shown on the other device");
+    offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
+    line_with(&mut offer_err, "Pairing done");
+    line_with(&mut join_err, "Did the other device say Paired");
+    join_in.write_all(b"n\n").expect("answer");
+    drop(join_in);
+    let mut rest = String::new();
+    join_err.read_to_string(&mut rest).expect("stderr");
+    let out = joiner.wait_with_output().expect("join output");
+    assert_eq!(out.status.code(), Some(1), "{rest}");
+    assert!(rest.contains("Not paired. Cancel on the other device too."), "{rest}");
+    assert!(out.stdout.is_empty(), "no summary");
+    let site = joined_db.parent().expect("parent");
+    assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists());
+    assert!(!site.join("relay.json").exists() && !site.exists(), "not even the directory");
+    drop(offerer);
+}
+
+/// `--i-saw-paired` answers the check for scripts: the landing follows the release with no prompt and no second line.
+#[test]
+fn a_joiner_told_paired_on_the_command_line_lands_without_a_prompt() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (_dir, db) = encrypted_copy();
+    let (mut offerer, mut offer_err, offer) = start_offer_process(tmp.path(), &db);
+    let joined_db = tmp.path().join("joiner").join("j.hbdb");
+    let mut joiner = cli(tmp.path())
+        .arg("--db").arg(&joined_db)
+        .args(["pair", "join", "--i-saw-paired"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn join");
+    joiner.stdin.take().expect("stdin").write_all(format!("{offer}\n").as_bytes()).expect("offer"); // then EOF
+    let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
+    let code = code_in(&line_with(&mut join_err, "Code on this device"));
+    lines_until(&mut offer_err, "Type the code shown on the other device");
+    offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
+    line_with(&mut offer_err, "Pairing done");
+    let out = joiner.wait_with_output().expect("join output");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("Did the other device say Paired"), "no prompt: {err}");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON line");
+    assert_eq!(value["paired"], true);
+    assert!(joined_db.exists() && keys::key_path_for(&joined_db).exists());
+    // and `pair offer` does not take the flag
+    let pass = tmp.path().join("pass.txt");
+    let refused = cli(tmp.path()).arg("--db").arg(&db).arg("--passphrase-file").arg(&pass)
+        .arg("--relay").arg(tmp.path().join("relay")).arg("--listen").arg("127.0.0.1:1")
+        .args(["pair", "offer", "--i-saw-paired"]).output().expect("offer");
+    assert_eq!(refused.status.code(), Some(2));
+    drop(offerer);
 }
 
 #[test]
