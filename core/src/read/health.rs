@@ -83,13 +83,18 @@ impl Late {
     }
 }
 
-/// A live sample's stored moment as the watch-local day (`ClockOffsets.local_date`); NULL stays null.
+/// A live sample's stored moment as the watch-local day (`ClockOffsets.local_date`); NULL stays null; a day the
+/// calendar cannot hold (year 9999 plus a positive offset) keeps the UTC prefix, like the Python core's `_live_day`.
 fn live_day(row: &Row<'_>, index: usize, offsets: &ClockOffsets) -> Result<Json, ReadError> {
     match row.get_ref(index)? {
         ValueRef::Null => Ok(Json::Null),
         cell => {
-            let moment = queries::parse_moment(text(cell)?)?;
-            Ok(wirejson::from_serde(&Value::from(queries::local_day(offsets, moment, false)?)))
+            let stamp = text(cell)?;
+            let moment = queries::parse_moment(stamp)?;
+            let day = offsets
+                .local_date_checked(moment, false)
+                .unwrap_or_else(|| stamp.get(..10).unwrap_or(stamp).to_string());
+            Ok(wirejson::from_serde(&Value::from(day)))
         }
     }
 }
@@ -688,5 +693,22 @@ mod tests {
         let found = live(&conn);
         assert_eq!((&found["first_day"], &found["last_day"]), (&json!("2025-06-14"), &json!("2025-06-21")));
         assert_eq!(found["samples"], 2);
+        // +3 h: 23:30Z is already the next day on the watch, so last_day moves too
+        conn.execute("UPDATE clock_offsets SET offset_s = 10800", []).expect("offset");
+        conn.execute(
+            "UPDATE metric_samples SET ts_utc = '2025-06-21T23:30:00Z' WHERE ts_utc = '2025-06-21T12:00:00Z'",
+            [],
+        )
+        .expect("move");
+        let found = live(&conn);
+        assert_eq!((&found["first_day"], &found["last_day"]), (&json!("2025-06-15"), &json!("2025-06-22")));
+        // the calendar ends at 9999: the UTC prefix is kept instead of an error (the Python core does the same)
+        conn.execute(
+            "INSERT INTO metric_samples(metric, ts_utc, value, source_scope, raw_record_id) \
+             VALUES('heart_rate', '9999-12-31T23:46:00Z', 60, 'live', 1)",
+            [],
+        )
+        .expect("insert");
+        assert_eq!(live(&conn)["last_day"], "9999-12-31");
     }
 }
