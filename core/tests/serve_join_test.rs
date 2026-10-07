@@ -299,8 +299,8 @@ fn an_already_paired_phone_is_refused_before_any_network_call() {
         ("a rotation file", Box::new(|db: &Path| {
             std::fs::write(keys::next_path_for(&keys::key_path_for(db)), b"{}").expect("next")
         })),
-        ("another relay", Box::new(|db: &Path| {
-            std::fs::write(db.parent().expect("folder").join("relay.json"), r#"{"lan": "http://10.9.9.9:1"}"#).expect("relay")
+        ("a relay file that is not a LAN relay", Box::new(|db: &Path| {
+            std::fs::write(db.parent().expect("folder").join("relay.json"), r#"{"folder": "/elsewhere"}"#).expect("relay")
         })),
     ] {
         std::fs::create_dir_all(db.parent().expect("folder")).expect("mkdir");
@@ -316,6 +316,24 @@ fn an_already_paired_phone_is_refused_before_any_network_call() {
     }
     assert!(!wire.tripped());
     drop(dir);
+}
+
+/// A LAN relay file beside no store and no key file is what a landing that failed before its commit point
+/// leaves (12-H (d)): not a pairing, so the prefix passes it (off a phone the next refusal is the transport
+/// one; on a phone the join would start) and nothing is written by the check.
+#[test]
+#[cfg(not(target_os = "ios"))]
+fn a_relay_file_left_by_a_failed_landing_is_not_a_pairing() {
+    let (_dir, db) = phone();
+    let wire = Tripwire::new();
+    std::fs::create_dir_all(db.parent().expect("folder")).expect("mkdir");
+    let relay_file = db.parent().expect("folder").join("relay.json");
+    std::fs::write(&relay_file, r#"{"lan": "http://10.9.9.9:1"}"#).expect("leftover");
+    let mut live = Live::start(&db, JoinHooks::default());
+    let reply = live.call("pair.join", json!({"offer": forged_offer(&wire.url(), now() + 600)}));
+    assert_eq!(error_of(&reply).0, "unsupported_transport", "past the prefix: {reply}");
+    assert!(!wire.tripped());
+    assert_eq!(phone_files(&db), vec!["relay.json".to_string()], "the check writes nothing and removes nothing");
 }
 
 /// Off a phone, an offer that passes the whole prefix is refused as `unsupported_transport`; so is a

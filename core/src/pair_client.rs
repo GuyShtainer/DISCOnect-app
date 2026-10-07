@@ -241,9 +241,12 @@ fn relay_file_text(url: &str) -> String {
 }
 
 /// Refuse, before any request, when joining would clobber something: the store exists, its key file
-/// (`DISCONECT_KEYS` honoured) or `<keys>.next` exists, `DISCONECT_KEYS` is set at all (one key file
-/// path would serve every store), or `relay_file` exists naming something other than `url`.
+/// (`DISCONECT_KEYS` honoured) or `<keys>.next` exists, or `DISCONECT_KEYS` is set at all (one key file
+/// path would serve every store), or `relay_file` exists with content that is not a LAN relay. A LAN relay
+/// file beside no store and no key file is what a landing that failed before its commit point leaves behind
+/// (12-H (d)), or one that already names `url`: neither refuses a join, and the landing rewrites it.
 pub fn check_landing_site(db: &Path, relay_file: &Path, url: &str) -> Result<(), PairError> {
+    let _ = url; // a LAN relay file is rewritten by `land_with`, which keeps one that already names `url`
     if std::env::var_os(keys::KEYS_ENV).is_some_and(|v| !v.is_empty()) {
         return Err(PairError::Precondition("DISCONECT_KEYS is set; unset it so the key file lands beside the store"));
     }
@@ -257,7 +260,7 @@ pub fn check_landing_site(db: &Path, relay_file: &Path, url: &str) -> Result<(),
     if keys::next_path_for(&key_path).exists() {
         return Err(PairError::Precondition("a key rotation is in progress for this store"));
     }
-    if relay_file.exists() && relay_cfg::read(relay_file) != Some(RelayConfig::Lan(url.to_string())) {
+    if relay_file.exists() && !matches!(relay_cfg::read(relay_file), Some(RelayConfig::Lan(_))) {
         return Err(PairError::Precondition("the relay file already exists with other content"));
     }
     Ok(())
@@ -283,12 +286,20 @@ pub fn land_with(
     let key_path = keys::key_path_for(db);
     let io = |what: &'static str| move |_: std::io::Error| PairError::Landing(format!("cannot write the {what}"));
 
-    // (1) the relay file
+    // (1) the relay file. Until the key file lands nothing is paired, so a failure before that point takes
+    // the relay file back out (unless it already named this url before the landing: not ours to remove)
+    let keep_relay = relay_cfg::read(relay_file) == Some(RelayConfig::Lan(joined.url.clone()));
+    let unland = |error: PairError| {
+        if !keep_relay {
+            let _ = std::fs::remove_file(relay_file);
+        }
+        error
+    };
     write_atomic(relay_file, relay_file_text(&joined.url).as_bytes()).map_err(io("relay file"))?;
-    hook(LandStep::RelayFile)?;
+    hook(LandStep::RelayFile).map_err(unland)?;
 
     // (2) the key file, verbatim and atomic: the commit point
-    write_atomic(&key_path, &joined.key_file_bytes).map_err(io("key file"))?;
+    write_atomic(&key_path, &joined.key_file_bytes).map_err(io("key file")).map_err(unland)?;
     hook(LandStep::KeyFile)?;
 
     // from here on a failure leaves a key file: a `sync pull` with the passphrase finishes the job

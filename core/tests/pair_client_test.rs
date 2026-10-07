@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use disconect_core::pair::{self, Offer, PairError};
-use disconect_core::pair_client::{self, REQUEST_TIMEOUT};
+use disconect_core::pair_client::{self, Joined, LandStep, REQUEST_TIMEOUT};
 
 /// A syntactically valid offer for `url` (a real X25519 public key; the secrets are random, so it is not
 /// joinable), expiring well after the test.
@@ -43,7 +43,7 @@ fn a_cancel_during_the_post_shows_no_code() {
     let result = pair_client::join(&forged_offer(&url), &mut |_code| {
         shown.fetch_add(1, Ordering::SeqCst);
     }, &cancel);
-    let error = result.err().expect("the join must not succeed");
+    let Err(error) = result else { panic!("the join must not succeed") };
     assert!(matches!(error, PairError::Cancelled), "{error:?}");
     assert_eq!(shown.load(Ordering::SeqCst), 0, "no code after a cancel");
 }
@@ -62,8 +62,53 @@ fn a_cancel_behind_a_hung_request_waits_one_request_timeout_at_most() {
     let started = Instant::now();
     let result = pair_client::join(&forged_offer(&url), &mut |_code| panic!("no code"), &cancel);
     let elapsed = started.elapsed();
-    let error = result.err().expect("the join must not succeed");
+    let Err(error) = result else { panic!("the join must not succeed") };
     assert!(matches!(error, PairError::Cancelled), "{error:?}");
     assert!(elapsed >= Duration::from_secs(5), "the request did time out ({elapsed:?})");
     assert!(elapsed < Duration::from_secs(20), "one request timeout, not the old 30 s ({elapsed:?})");
+}
+
+/// A joined pairing with a master and key-file bytes that are never used: the landing is stopped at its first step.
+fn joined_for(url: &str) -> Joined {
+    Joined { master: zeroize::Zeroizing::new([3u8; 32]), key_file_bytes: b"not reached".to_vec(), url: url.to_string() }
+}
+
+/// (d) A landing that fails before its commit point (the key file) takes its relay.json back out: the next
+/// offer, from any Mac, is not refused as already paired.
+#[test]
+fn a_landing_that_fails_before_the_key_file_leaves_no_relay_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("phone").join("phone.hbdb");
+    let relay_file = dir.path().join("phone").join("relay.json");
+    let joined = joined_for("http://10.0.0.2:4000");
+    let mut stop_after_relay = |step: LandStep| match step {
+        LandStep::RelayFile => Err(PairError::Landing("disk full".into())),
+        _ => Ok(()),
+    };
+    let Err(error) = pair_client::land_with(&joined, &db, &relay_file, &mut stop_after_relay) else { panic!("stopped") };
+    assert!(matches!(error, PairError::Landing(_)), "{error:?}");
+    assert!(!relay_file.exists(), "relay.json is taken back out");
+    assert!(!db.exists());
+    assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000").is_ok());
+}
+
+/// (d) A crash leftover (relay.json beside no key file and no store) never refuses the next join; a relay
+/// file that already named the url before the landing is kept when the landing fails.
+#[test]
+fn a_relay_file_leftover_does_not_refuse_the_next_join_and_a_matching_one_is_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("phone.hbdb");
+    let relay_file = dir.path().join("relay.json");
+    std::fs::write(&relay_file, "{\"lan\": \"http://10.0.0.2:4000\"}\n").expect("leftover"); // the relay file's own shape
+    assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000").is_ok(), "a leftover is not a pairing");
+    let joined = joined_for("http://10.0.0.2:4000"); // the same url the file already names
+    let mut stop_after_relay = |step: LandStep| match step {
+        LandStep::RelayFile => Err(PairError::Landing("killed".into())),
+        _ => Ok(()),
+    };
+    assert!(pair_client::land_with(&joined, &db, &relay_file, &mut stop_after_relay).is_err());
+    assert!(relay_file.exists(), "a relay file that named this url before the landing is not ours to remove");
+    let other = joined_for("http://10.0.0.9:4000");
+    assert!(pair_client::land_with(&other, &db, &relay_file, &mut stop_after_relay).is_err());
+    assert!(!relay_file.exists(), "rewritten for another url, then taken back out");
 }

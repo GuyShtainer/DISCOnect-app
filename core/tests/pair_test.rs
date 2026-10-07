@@ -684,7 +684,7 @@ fn write_order_a_failure_after_the_relay_file_leaves_no_key_file() {
     };
     let failed = land_with(&joined, &db, &relay_file, &mut stop(LandStep::RelayFile));
     assert_eq!(failed.err(), Some(PairError::Landing("injected".into())));
-    assert!(relay_file.exists());
+    assert!(!relay_file.exists(), "taken back out: nothing is paired before the key file (12-H (d))");
     assert!(!keys::key_path_for(&db).exists(), "no key file");
     assert!(!db.exists());
     // the preconditions pass again: a re-run from scratch completes

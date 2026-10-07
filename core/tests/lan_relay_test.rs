@@ -849,18 +849,21 @@ fn a_trickled_body_runs_out_of_its_total_budget() {
     let body = vec![7u8; 1000];
     let header = auth_value(&*key, "PUT", &path, wall_clock(), &body).expect("header");
     let mut stream = open_with_head(server.local_addr(), &put_head(&path, &header, 1000));
+    // set once, before the loop: the server's 408 + linger close resets the socket, and setsockopt on a reset
+    // socket is EINVAL on macOS (the row 7 review's diagnosis of this test's flake)
+    stream.set_read_timeout(Some(Duration::from_millis(1))).expect("timeout");
     let started = Instant::now();
     // one byte every 400 ms never trips the 1 s no-progress limit, only the total budget (1 s + 0)
     let mut answer = None;
     for byte in &body {
         std::thread::sleep(Duration::from_millis(400));
-        if stream.write_all(&[*byte]).is_err() {
+        // read for the 408 before each write: after the cut-off a write draws a reset
+        let mut buf = [0u8; 64];
+        if let Ok(count) = stream.read(&mut buf) && count > 0 {
+            answer = String::from_utf8_lossy(&buf[..count]).split(' ').nth(1).map(str::to_string);
             break;
         }
-        stream.set_read_timeout(Some(Duration::from_millis(1))).expect("timeout");
-        let mut buf = [0u8; 64];
-        if let Ok(count) = stream.read(&mut buf) {
-            answer = String::from_utf8_lossy(&buf[..count]).split(' ').nth(1).map(str::to_string);
+        if stream.write_all(&[*byte]).is_err() {
             break;
         }
         assert!(started.elapsed() < Duration::from_secs(6), "never cut off");
