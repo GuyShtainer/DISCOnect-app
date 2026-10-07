@@ -125,10 +125,10 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn release_args(args: Vec<String>) -> Vec<String> {
     // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
     // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 24] = [
+    const NO_OPERAND: [&str; 29] = [
         "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-unlock", "--debug-forget-open",
         "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing",
     ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
@@ -164,7 +164,7 @@ mod release_args_tests {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for flag in [
             "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-            "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today",
+            "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today",
         ] {
             assert_eq!(release_args(v(&[flag, "--theme", "dark"])), v(&["--theme", "dark"]), "{flag}");
         }

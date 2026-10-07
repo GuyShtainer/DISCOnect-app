@@ -3547,6 +3547,11 @@ void (async () => {
         ["--debug-pair-paired", { v: "error", kind: "paired", lead: "This phone is already paired", text: "It already holds a copy of your data. To pair it again, forget this phone in Settings first; that deletes its copy, and your Mac keeps everything.", exp: null }],
         ["--debug-pair-closed", { v: "error", kind: "closed", lead: "Pairing stopped", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
         ["--debug-pair-ended", { v: "error", kind: "ended", lead: "This offer has already ended", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
+        ["--debug-pair-stopping", { v: "stopping" }],
+        ["--debug-pair-landing", { v: "landing", done: ["relay"] }],
+        ["--debug-pair-joining", { v: "joining", host: "192.168.1.20", exp: soon, reached: false }],
+        ["--debug-pair-clock", { v: "error", kind: "clock", lead: "This phone's clock is off", text: "This offer is too far ahead of this phone's clock. Check the date and time on this phone.", exp: soon + 3 * 3600 }],
+        ["--debug-pair-notpaired", { v: "error", kind: "other", lead: "Pairing stopped", text: "Not paired. Nothing was saved on this phone.", exp: null }],
         ["--debug-pair-failed", { v: "error", kind: "other", lead: "Pairing did not finish", text: "Your Mac refused this request. Cancel on your Mac and start a new offer.", exp: null }],
       ];
       for (const [flag, view] of frames) if (args.includes(flag)) setPair(view);
