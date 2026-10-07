@@ -432,7 +432,6 @@ fn sweep_orphans(parent: &Path, name: &str) {
 
 /// Best effort: set class A on an open file. The result is not an error of the write (the simulator reports no
 /// classes); the landing's read-back hook looks at the key file on the device and re-applies.
-
 #[cfg(target_os = "ios")]
 fn set_class_a(file: &std::fs::File) {
     use std::os::fd::AsRawFd;

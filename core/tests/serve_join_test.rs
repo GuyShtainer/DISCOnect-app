@@ -907,7 +907,8 @@ fn a_failure_injected_after_each_landing_step_reports_what_is_left() {
             "Pairing stopped before the key was saved. Cancel on your Mac and start a new offer."
         };
         assert_eq!(message, expected, "{name}");
-        assert!(pdb.parent().expect("folder").join("relay.json").exists(), "{name}: relay.json is the first step");
+        // 12-H (d): a landing that fails before the key file takes its relay.json back out
+        assert_eq!(pdb.parent().expect("folder").join("relay.json").exists(), has_key, "{name}: relay.json stays only with the key file");
         assert_eq!(keys::key_path_for(&pdb).exists(), has_key, "{name}: key file");
         assert_eq!(pdb.exists(), has_store, "{name}: store");
         // no master reached the session: a key file with no master reads as locked, never as unlocked
