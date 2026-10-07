@@ -720,7 +720,16 @@ type SyncStatus = {
   gaps: unknown[]; last_pushed_at: string | null; last_pulled_at: string | null;
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
   relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
+  relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
+/** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
+type SiteRow = { id: string; kind: string; pushed: number; healed: number; behind: number; pulled: number; rejected: number; error: string | null };
+// The reason words a site row can carry, in plain words; anything else reads as a plain failure.
+const SITE_WORDS: Record<string, string> = {
+  unavailable: "Not reachable", same_relay: "Same as another relay", bad_url: "Bad address", unsupported_transport: "Needs the desktop core",
+  relay_unreachable: "Not reachable", relay_auth_failed: "Refused", relay_unverified: "Not verified", too_large: "Too large",
+};
+const SITE_KINDS: Record<string, string> = { folder: "Folder", lan: "Network" };
 type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
 type OfferReply = { offer: string; url: string; expires_at: number };
 type PairPhase = "idle" | "pushing" | "open" | "bound" | "released" | "done";
@@ -953,8 +962,10 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     syncRun.push = "idle"; syncRun.pull = "idle"; syncRun.pushNote = ""; syncRun.pullNote = ""; syncRun.result = "";
     redraw();
     try {
-      const r = await core.call<{ push: { bundles: number; records: number }; pull: { applied: number; records_new: number; status: string } }>("sync.run");
-      syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (partial)" : ""}.`;
+      const r = await core.call<{ push: { bundles: number; records: number }; pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run");
+      const failed = (r.sites ?? []).filter((s) => s.error).length;
+      const partial = r.status === "partial" || r.pull.status === "partial";
+      syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${partial ? " (partial)" : ""}.${failed > 0 ? ` ${failed} of ${r.sites?.length ?? 0} relays could not be used; see Relays below.` : ""}`;
     } catch (e) {
       syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
     }
@@ -1141,7 +1152,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   const noRelay = addrErr?.code === "not_found";
   kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
   card.append(kv);
-  if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync push --relay <folder> --remember"));
+  if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync relay add <folder> --serve"));
   if (statusErr) out.append(bannerEl(coreWords(statusErr).lead, coreWords(statusErr).text, true));
   if (status && addrs) {
     const sw = el("label", "switch");
@@ -1203,6 +1214,26 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   }
   if (syncRun.result) stat.append(el("p", "body", syncRun.result));
   out.append(stat);
+
+  // 19d: every relay of the list and what the last sync of this session did on it; read-only (the list is edited with
+  // the command line until a folder picker is decided — pitch 19d, shape 6)
+  const sites = el("section", "card");
+  sites.append(el("h2", "heading", "Relays"));
+  if (!status.relays || status.relays.length === 0) {
+    sites.append(el("p", "caption muted", "Each relay in the list shows here with what the last sync did on it. Run a sync to see them."));
+  } else {
+    const kv3 = el("dl", "kv");
+    for (const s of status.relays) {
+      const parts = [`sent ${s.pushed}`, `healed ${s.healed}`, `received ${s.pulled}`];
+      if (s.behind > 0) parts.push(`${s.behind} still to send`);
+      if (s.rejected > 0) parts.push(`refused ${s.rejected}`);
+      const word = s.error ? (SITE_WORDS[s.error] ?? "Failed") : null;
+      kv3.append(el("dt", "", `${SITE_KINDS[s.kind] ?? "Relay"} · ${s.id}`), el("dd", word ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
+    }
+    sites.append(kv3);
+    sites.append(el("p", "caption muted", "Add or remove a relay with the command line: disconect sync relay add <folder or address>, disconect sync relay remove <id>."));
+  }
+  out.append(sites);
 
   // design decision 7: no device list, the honest card
   const devices = el("section", "card");

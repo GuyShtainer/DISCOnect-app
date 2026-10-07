@@ -636,6 +636,20 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
     assert!(disconect_app_lib::method_refusal("data.today").is_ok());
 }
 
+/// 19d (attack finding A6): the page never names a relay. `core_call` refuses a `relays` key on `sync.run` before the
+/// core sees it, with a fixed text; a plain `sync.run` and `relays` on any other method pass (the core refuses those
+/// shapes itself).
+#[test]
+fn the_generic_core_door_refuses_a_relay_list_from_the_page() {
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let core_call = lib.split("async fn core_call(").nth(1).expect("core_call").split("\n}\n").next().expect("body");
+    assert!(core_call.contains("params_refusal(&method, &params)?"), "core_call checks the parameters before it reaches the core");
+    let err = disconect_app_lib::params_refusal("sync.run", &serde_json::json!({"relays": []})).expect_err("a relay list from the page");
+    assert_eq!((err.code.as_str(), err.message.as_str()), ("refused", "that parameter is not available to the page"));
+    assert!(disconect_app_lib::params_refusal("sync.run", &serde_json::json!({})).is_ok());
+    assert!(disconect_app_lib::params_refusal("sync.status", &serde_json::json!({"relays": []})).is_ok());
+}
+
 #[test]
 fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_only_forget_lock_join_and_land() {
     let lib = text(&manifest().join("src").join("lib.rs"));

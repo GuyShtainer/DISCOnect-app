@@ -123,6 +123,7 @@ label.choice input { width: 20px; height: 20px; margin: 0; }
 .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 var(--space-2); border: 1px solid var(--hairline); border-radius: var(--radius-sm); font-size: 12px; line-height: 16px; }
 .badge.good { color: var(--local); border-color: var(--local); }
 .badge.warn { color: var(--status-source-empty); border-color: var(--status-source-empty); }
+.kv dd.warn { color: var(--status-source-empty); } /* 19d: a relay row the last sync could not use */
 .badge.bad { color: var(--status-failed); border-color: var(--status-failed); }
 
 /* ---- Hand-off (Bet 15c): tokens only ---- */

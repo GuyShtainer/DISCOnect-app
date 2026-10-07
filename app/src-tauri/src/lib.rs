@@ -83,12 +83,24 @@ pub fn method_refusal(method: &str) -> Result<(), CoreError> {
     }
 }
 
+/// `Ok` when the page may pass `params` to `method`. 19d (attack finding A6): the relay list reaches the core from
+/// `relay.json` on the desktop and from the phone shell's bookmarks on iOS, never from the page — a `relays` key on
+/// `sync.run` is refused with a fixed text that never echoes the parameter.
+pub fn params_refusal(method: &str, params: &Value) -> Result<(), CoreError> {
+    if method == "sync.run" && params.get("relays").is_some() {
+        return Err(CoreError::new("refused", "that parameter is not available to the page"));
+    }
+    Ok(())
+}
+
 /// Generic relay, for the methods in [`ALLOWED_METHODS`] only.
 #[tauri::command]
 async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String, params: Option<Value>) -> Result<Value, CoreError> {
     method_refusal(&method)?;
+    let params = params.unwrap_or(Value::Object(Default::default()));
+    params_refusal(&method, &params)?;
     let core = core_of(&state)?;
-    let answer = core.call(&method, params.unwrap_or(Value::Object(Default::default()))).await;
+    let answer = core.call(&method, params).await;
     if method == "key.unlock" && answer.as_ref().is_ok_and(|v| v.get("unlocked").and_then(Value::as_bool) == Some(true)) {
         live::paid_on_unlock(&app);
     }
