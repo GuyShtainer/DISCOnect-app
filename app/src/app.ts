@@ -2399,9 +2399,11 @@ async function phoneEndStrayJoin(): Promise<void> {
   }
   // both busy: a landing is under way (a Yes was sent before the reload). Claim nothing until it ends.
   setPair({ v: "landing", done: [] });
-  for (let i = 0; i < 400; i++) {
+  // pair.cancel answers busy only while the landing runs; ok, not_found, locked or anything else means it has ended
+  // (the core bounds the landing, so there is no cap, and the frame claims nothing until the store says which way it went)
+  for (;;) {
     await new Promise((r) => setTimeout(r, 750));
-    try { await core.call("pair.cancel"); } catch (e) { if (core.isCoreError(e) && e.code === "not_found") break; }
+    try { await core.call("pair.cancel"); break; } catch (e) { if (!(core.isCoreError(e) && e.code === "busy")) break; }
   }
   await refreshKey();
   if (unpaired()) pairError("other", "Pairing stopped", "Pairing did not finish. Start a new offer on your Mac.");
