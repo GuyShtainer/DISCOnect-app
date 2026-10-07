@@ -2469,7 +2469,7 @@ async function phoneJoin(text: string): Promise<void> {
   try {
     const r = await core.call<{ pull: { applied: number; records_new: number; rejected: number; status: string }; key_file_protected: boolean | null }>("pair.join", { offer: text });
     joinHost = null;
-    void phone.relaysAddLan().catch(() => undefined); // the Mac just paired joins the relay list as "Your Mac" (the shell reads the address itself)
+    // the Mac just paired joins the relay list as "Your Mac" on its own: the shell reads relay.json (no page call)
     setPair({ v: "done", applied: r.pull.applied, fresh: r.pull.records_new, rejected: r.pull.rejected, partial: r.pull.status === "partial", protectedKey: r.key_file_protected });
   } catch (e) {
     pairFailure(e);
@@ -2972,7 +2972,9 @@ function saveTheme(theme: string | null): void {
 const RELAY_REFUSALS: Record<string, string> = {
   own_folder: "That is the folder this app keeps its own data in. Pick another one.",
   already_listed: "That relay is already in the list.",
-  bad_address: "That is not an address like http://192.168.1.20:8443.",
+  bad_address: "That is not an address like http://192.168.1.20:24816. Give the Mac's IP address and its port.",
+  address_name: "Use the Mac's IP address, like http://192.168.1.20:24816, not a name.",
+  not_local: "That address is not on a private or local network. Use the Mac's address on your home network.",
   busy: "Another relay change is running. Try again in a moment.",
   not_found: "That relay is no longer in the list.",
   unavailable: "The Files picker could not open. Try again.",
@@ -2985,6 +2987,20 @@ function relayClock(secs: number): string {
   const time = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
   return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} ${time}`;
 }
+// What the core says went wrong at one relay (its site words), in this phone's sentences. Nothing else is ever drawn:
+// a word not listed reads as a plain failure. `unavailable` and `same_relay` are compared in relayState, not mapped here.
+const PHONE_SITE_WORDS: Record<string, string> = {
+  unreachable: "Not answering",
+  refused: "Refused: check the date and time on both devices",
+  unverified: "Not verified: it may not be the relay this phone paired with",
+  too_large: "A file was too large to store there",
+  bad_name: "A file had a name this relay does not take",
+  missing: "Folder not found",
+  no_permission: "No permission to use it",
+  io_error: "Reading or writing failed",
+  bad_url: "That address does not work",
+  unsupported_transport: "This kind of relay is not supported on this phone",
+};
 /** The state line of one relay, from what the shell keeps of the core's last answer for it. */
 function relayState(r: phone.RelayEntry): string {
   if (!r.available || r.site?.error === "unavailable") return "Unavailable";
@@ -2992,17 +3008,25 @@ function relayState(r: phone.RelayEntry): string {
   const times: string[] = [];
   if (r.last_push_at) times.push(`Last push ${relayClock(r.last_push_at)}`);
   if (r.last_pull_at) times.push(`${times.length ? "last" : "Last"} pull ${relayClock(r.last_pull_at)}`);
+  if (r.site?.error) return [PHONE_SITE_WORDS[r.site.error] ?? "Failed at the last sync", ...times].join(" · ");
+  const notes: string[] = [];
+  const healed = r.site?.healed ?? 0;
+  if (healed > 0) notes.push(healed === 1 ? "Restored 1 file it had lost" : `Restored ${healed} files it had lost`);
   const behind = r.site?.behind ?? 0;
-  if (behind > 0) return [`Behind by ${behind}`, ...times].join(" · ");
-  if (r.site?.error) return ["Not reached at the last sync", ...times].join(" · ");
-  if (times.length) return times.join(" · ");
+  if (behind > 0) notes.push(`Behind by ${behind}`);
+  const parts = [...notes, ...times];
+  if (parts.length) return parts.join(" · ");
   return r.site ? "Synced, nothing new" : "Never synced";
+}
+/** A site that failed is drawn as a warning (a mark; the words carry the meaning). */
+function relayFailed(r: phone.RelayEntry): boolean {
+  return !r.available || !!r.site?.error;
 }
 
 async function relaysCard(out: ParentNode): Promise<void> {
   const card = pcard("Relays");
   card.append(el("h2", "heading", "Relays"));
-  card.append(ptext("p", "caption muted", "Where this phone keeps copies of what it sends and fetches. Every sync uses all of them. Pick a folder in the Files app, on this phone or in a cloud service that shows there, or add your Mac."));
+  card.append(ptext("p", "caption muted", "Where this phone keeps copies of what it sends and fetches. Every sync uses every relay here that can be reached. Pick a folder in the Files app, on this phone or in a cloud service that shows there, or add your Mac."));
   const note = el("p", "caption error");
   note.setAttribute("role", "alert");
   const redraw = (): void => { void route(); };
@@ -3010,13 +3034,14 @@ async function relaysCard(out: ParentNode): Promise<void> {
     note.textContent = "";
     try { await job(); redraw(); } catch (e) { note.textContent = relayRefusal(e); }
   };
-  let list: { relays: phone.RelayEntry[]; mac_url: string | null } | null = null;
+  let list: { relays: phone.RelayEntry[]; mac_url: string | null; unreadable?: boolean } | null = null;
   try { list = await phone.relaysList(); } catch { list = null; }
   if (!list) {
     card.append(ptext("p", "caption muted", "The relay list could not be read."));
     out.append(card);
     return;
   }
+  if (list.unreadable) card.append(ptext("p", "caption error", "The saved relay list could not be read; a copy was kept."));
   if (!list.relays.length) card.append(ptext("p", "body", "No relays yet. Add a folder or your Mac to start."));
   const rows = el("ul", "relays");
   for (const r of list.relays) {
@@ -3026,7 +3051,7 @@ async function relaysCard(out: ParentNode): Promise<void> {
     row.append(head);
     row.append(el("p", "caption muted wrap", neutralText(r.kind === "folder" ? (r.display ?? "Not found") : (r.url ?? ""))));
     const state = relayState(r);
-    const stateLine = el("p", state === "Unavailable" ? "caption error" : "caption", neutralText(state));
+    const stateLine = el("p", relayFailed(r) ? "caption error" : "caption", neutralText(state));
     row.append(stateLine);
     const actions = el("div", "actions");
     const rename = pbutton("Rename", "secondary", () => {
@@ -3053,7 +3078,7 @@ async function relaysCard(out: ParentNode): Promise<void> {
   const addFolder = pbutton("Add a folder…", "secondary", () => void attempt(async () => { await phone.relaysAddFolder(); }));
   const addMac = pbutton("Add your Mac", "secondary", () => {
     const url = el("input") as HTMLInputElement;
-    url.type = "text"; url.value = list?.mac_url ?? ""; url.placeholder = "http://192.168.1.20:8443"; url.setAttribute("aria-label", "Your Mac's address");
+    url.type = "text"; url.value = list?.mac_url ?? ""; url.placeholder = "http://192.168.1.20:24816"; url.setAttribute("aria-label", "Your Mac's address");
     url.autocapitalize = "off"; url.autocomplete = "off"; url.spellcheck = false;
     const name = el("input") as HTMLInputElement;
     name.type = "text"; name.value = "Your Mac"; name.maxLength = 60; name.setAttribute("aria-label", "Name");

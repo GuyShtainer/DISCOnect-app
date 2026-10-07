@@ -59,7 +59,7 @@ export type RelayEntry = {
 };
 
 /** iOS: the list, with the paired Mac's address from the relay setting (`mac_url`) for the Add-Mac form. */
-export function relaysList(): Promise<{ relays: RelayEntry[]; mac_url: string | null }> {
+export function relaysList(): Promise<{ relays: RelayEntry[]; mac_url: string | null; unreadable?: boolean }> {
   return invoke("relays_list");
 }
 
@@ -68,9 +68,9 @@ export function relaysAddFolder(): Promise<{ cancelled: boolean; id?: string }> 
   return invoke("relays_add_folder");
 }
 
-/** iOS: a LAN relay; with no address, the paired Mac's. */
-export function relaysAddLan(url?: string, label?: string): Promise<{ id: string }> {
-  return invoke("relays_add_lan", { url: url ?? null, label: label ?? null });
+/** iOS: a LAN relay from the Settings form: the address the person typed (the shell checks it; the paired Mac needs no call). */
+export function relaysAddLan(url: string, label?: string): Promise<{ id: string }> {
+  return invoke("relays_add_lan", { url, label: label ?? null });
 }
 
 export function relaysRemove(id: string): Promise<void> {

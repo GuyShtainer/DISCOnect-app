@@ -84,7 +84,12 @@ impl disconect_core::pair_forget::Items for ForgetItems<'_> {
 fn finish_forget(keychain: &mut dyn Keychain, dir: &Path, notes: &mut Vec<String>) {
     let db = dir.join(crate::PHONE_DB_FILE);
     let paths = disconect_core::pair_forget::Paths::beside(&db, &keys::key_path_for(&db));
-    match disconect_core::pair_forget::complete_pending(&paths, &mut ForgetItems(keychain)) {
+    let pending = disconect_core::pair_forget::complete_pending(&paths, &mut ForgetItems(keychain));
+    if pending.is_some() {
+        // the relay list names the Mac and the person's folders: it goes with the rest of the Forget (19d review #14)
+        crate::relays::remove_files(dir);
+    }
+    match pending {
         None => {}
         Some(Ok(result)) => notes.push(format!("completed an interrupted Forget; keychain {}", result.text())),
         Some(Err(e)) => notes.push(format!("an interrupted Forget could not be completed yet: {e}")),
@@ -300,6 +305,8 @@ mod tests {
             std::fs::write(dir.join("disconect.db-wal"), b"x").unwrap();
             std::fs::write(&key, format!(r#"{{"format":"hearthbeat-keys","format_version":1,"key_id":"{id}","created_at":"","wraps":[{{"purpose":"passphrase"}}]}}"#)).unwrap();
             std::fs::write(dir.join("relay.json"), b"{}").unwrap();
+            std::fs::write(dir.join(crate::relays::FILE), b"{}").unwrap();
+            std::fs::write(dir.join(format!("{}.bad-1", crate::relays::FILE)), b"{").unwrap();
             if with_marker {
                 std::fs::write(dir.join(disconect_core::pair_forget::MARKER_NAME), b"").unwrap();
             }
@@ -307,10 +314,11 @@ mod tests {
         let mut items = Items(vec![("disconect".into(), id.into())]);
         seed(false);
         let notes = prepare_in(&mut items, &dir);
-        assert!(db.exists() && key.exists() && items.0.len() == 1, "no marker: nothing is forgotten: {notes:?}");
+        assert!(db.exists() && key.exists() && items.0.len() == 1 && dir.join(crate::relays::FILE).exists(), "no marker: nothing is forgotten: {notes:?}");
         seed(true);
         let notes = prepare_in(&mut items, &dir);
         assert!(!db.exists() && !key.exists() && !dir.join("relay.json").exists() && !dir.join("disconect.db-wal").exists(), "{notes:?}");
+        assert!(!dir.join(crate::relays::FILE).exists() && !dir.join(format!("{}.bad-1", crate::relays::FILE)).exists(), "the relay list went with it: {notes:?}");
         assert!(items.0.is_empty(), "the keychain item went: {notes:?}");
         assert!(!dir.join(disconect_core::pair_forget::MARKER_NAME).exists());
         assert!(notes.iter().any(|n| n == "completed an interrupted Forget; keychain removed"), "{notes:?}");

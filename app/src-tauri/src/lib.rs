@@ -86,11 +86,10 @@ pub fn method_refusal(method: &str) -> Result<(), CoreError> {
     }
 }
 
-/// 19d (iOS): the phone's shell passes its relay list to the core as a `relays` param on `sync.run`.
-/// **Off until the core accepts the param** (the Fenix8 build that takes it); the rest of the relay list (the screen,
-/// the commands, the stored list and the per-site state) works without it. Turning it on is this one word.
+/// 19d (iOS): the phone's shell passes its relay list to the core as a `relays` param on `sync.run` (not on
+/// `sync.status`, which only echoes the last run). On since the core took the param (19d DONE, slice 2).
 #[cfg(target_os = "ios")]
-pub(crate) const RELAYS_INJECT: bool = false;
+pub(crate) const RELAYS_INJECT: bool = true;
 
 /// `Ok` when the page may pass `params` to `method`. 19d (attack finding A6): the relay list reaches the core from
 /// `relay.json` on the desktop and from the phone shell's bookmarks on iOS (built natively in `relays`), never from
@@ -162,10 +161,10 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn release_args(args: Vec<String>) -> Vec<String> {
     // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
     // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 33] = [
+    const NO_OPERAND: [&str; 34] = [
         "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
         "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed", "--debug-live-seed",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed", "--debug-relays-remove-b", "--debug-live-seed",
     ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();

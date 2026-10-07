@@ -2,7 +2,7 @@
 //! The phone's half of the relay list (Bet 19d, I5 row 4). On the phone the shell owns the list: a folder the person
 //! picked in the Files app is a security-scoped bookmark that only this container can resolve, and it must be resolved
 //! (and its scope held) around each call. So the list lives here, not in `relay.json`; the core takes it per call
-//! (`sync.run {"relays": [...]}`, the contract of `docs/pitches/19d-relay-list.md`) once it can.
+//! (`sync.run {"relays": [...]}`, the contract of `docs/pitches/19d-relay-list.md`) on since slice 2).
 //!
 //! * The list is `relays.json` in the app's data folder (mode 0600, flagged out of backups like the key file; Forget
 //!   deletes it). Entries are `{id, kind, label, bookmark (base64) | url, added_at, site, last_push_at, last_pull_at}`.
@@ -50,6 +50,9 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     pub added_at: u64,
+    /// Debug seed only: the bookmark is of a plain folder (no security scope), which a debug build may use.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub debug_unscoped: bool,
     /// The last `sites[]` row the core answered for this entry (a copy of the core's object plus `at`, seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<Value>,
@@ -66,6 +69,9 @@ pub struct Store {
     /// The Mac address the person removed on purpose; it is not adopted again from `relay.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_dismissed: Option<String>,
+    /// The saved list could not be read and a copy was kept aside; shown on the card until the next change is saved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable: bool,
 }
 
 pub fn now_secs() -> u64 {
@@ -112,9 +118,36 @@ pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
 
 // ---- the file ----
 
-/// The list, or an empty one when the file is missing or unreadable (the list is a convenience, never a gate).
+/// The list, or an empty one when there is none. A file that exists but cannot be read is never overwritten silently:
+/// it is kept aside as `relays.json.bad-<unix ts>` (mode 0600), an empty list takes its place and `unreadable` says so
+/// until the next change is saved.
 pub fn load(dir: &Path) -> Store {
-    std::fs::read_to_string(dir.join(FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    let path = dir.join(FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|_| keep_aside(dir)),
+        Err(_) if path.exists() => keep_aside(dir),
+        Err(_) => Store::default(),
+    }
+}
+
+fn keep_aside(dir: &Path) -> Store {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(FILE);
+    let aside = dir.join(format!("{FILE}.bad-{}", now_secs()));
+    if std::fs::rename(&path, &aside).is_ok() {
+        let _ = std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600));
+        #[cfg(target_os = "ios")]
+        let _ = crate::ios::exclude_from_backup(&aside);
+    }
+    let store = Store { unreadable: true, ..Store::default() };
+    let _ = save(dir, &store);
+    store
+}
+
+/// Save a change the person made: the "could not be read" line goes with it.
+pub fn commit(dir: &Path, store: &mut Store) -> Result<(), Refusal> {
+    store.unreadable = false;
+    save(dir, store)
 }
 
 /// Write the list: a temp file at mode 0600, renamed over the old one, then flagged out of backups.
@@ -156,22 +189,60 @@ pub fn clean_label(text: &str, fallback: &str) -> String {
     if t.is_empty() { fallback.to_string() } else { t }
 }
 
-/// A LAN address in the one shape the core takes: `http://host:port`, no user, path, query or fragment. `None` when it
-/// is not that. (Whether the host is a good address is the core's to say at sync time; the shell only keeps the shape.)
-pub fn clean_lan_url(text: &str) -> Option<String> {
+/// A LAN address in the one shape the core takes (`http://ip:port`) and in the address class the pairing joiner takes
+/// (`serve/join.rs`: `offer_ip`, `never_a_pairing_address`, `reachable_class`), reimplemented here because that code is
+/// the core's and private. An IP literal (v4 or v6), an explicit port, no user, path, query or fragment; unspecified,
+/// multicast, reserved and link-local addresses never; loopback only in a simulator build; otherwise a private range
+/// (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7). The core's "on-link public address" leg is left out: stricter
+/// here, and the core re-checks every address at sync time.
+///
+/// The `Err` word is what the page maps: `bad_address` (not that shape), `address_name` (a name, not an IP address),
+/// `not_local` (an address on no private or local network).
+pub fn lan_check(text: &str) -> Result<String, &'static str> {
+    lan_check_with(text, cfg!(target_abi = "sim"))
+}
+
+fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str> {
     let t = text.trim();
     if t.len() > 200 || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return None;
+        return Err("bad_address");
     }
-    let u = url::Url::parse(t).ok()?;
+    let u = url::Url::parse(t).map_err(|_| "bad_address")?;
     let plain_path = matches!(u.path(), "" | "/");
     if u.scheme() != "http" || !u.username().is_empty() || u.password().is_some() || !plain_path || u.query().is_some() || u.fragment().is_some() {
-        return None;
+        return Err("bad_address");
     }
-    let host = u.host_str()?;
-    let port = u.port_or_known_default()?;
-    let host = if host.contains(':') { format!("[{}]", host.trim_matches(|c| c == '[' || c == ']')) } else { host.to_string() };
-    Some(format!("http://{host}:{port}"))
+    // (no address types are named here: the egress guard keeps the network types in the coach module)
+    // the class of an address: (never a pairing address, loopback, private range), on its IPv4 form when it is mapped
+    let v4_class = |o: [u8; 4]| (o[0] == 0 || o[0] >= 224 || (o[0] == 169 && o[1] == 254), o[0] == 127, o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) || (o[0] == 100 && (64..=127).contains(&o[1])));
+    let (never, loopback, private, host) = match u.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            let (n, l, p) = v4_class(v4.octets());
+            (n, l, p, v4.to_string())
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            let (n, l, p) = match v6.to_ipv4_mapped() {
+                Some(m) => v4_class(m.octets()),
+                None => (v6.is_unspecified() || v6.octets()[0] == 0xff || (v6.segments()[0] & 0xffc0) == 0xfe80, v6.is_loopback(), (v6.segments()[0] & 0xfe00) == 0xfc00),
+            };
+            (n, l, p, format!("[{v6}]"))
+        }
+        Some(url::Host::Domain(_)) => return Err("address_name"),
+        None => return Err("bad_address"),
+    };
+    // an explicit port: the text after the host has to carry one (the url crate hides a spelled-out :80)
+    let authority = t.split_once("://").map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""));
+    let has_port = if authority.starts_with('[') { authority.contains("]:") } else { authority.contains(':') };
+    let port = u.port_or_known_default().filter(|_| has_port).ok_or("bad_address")?;
+    if never || !(private || (loopback && loopback_ok)) {
+        return Err("not_local");
+    }
+    Ok(format!("http://{host}:{port}"))
+}
+
+/// [`lan_check`] without the word.
+pub fn clean_lan_url(text: &str) -> Option<String> {
+    lan_check(text).ok()
 }
 
 /// The LAN address `relay.json` names (the paired Mac), in either of the file's forms: the legacy `{"lan": url}` and the
@@ -198,7 +269,7 @@ pub fn adopt_mac(dir: &Path, store: &mut Store) -> bool {
         return false;
     }
     let Ok(id) = new_id(store) else { return false };
-    store.relays.push(Entry { id, kind: "lan".into(), label: MAC_LABEL.into(), bookmark: None, url: Some(url), added_at: now_secs(), site: None, last_push_at: None, last_pull_at: None });
+    store.relays.push(Entry { id, kind: "lan".into(), label: MAC_LABEL.into(), bookmark: None, url: Some(url), added_at: now_secs(), debug_unscoped: false, site: None, last_push_at: None, last_pull_at: None });
     true
 }
 
@@ -220,7 +291,7 @@ pub fn rename(store: &mut Store, id: &str, label: &str) -> bool {
 
 /// A lan entry added by hand clears the "removed on purpose" mark for that address.
 pub fn add_lan(store: &mut Store, url: &str, label: &str) -> Result<String, Refusal> {
-    let url = clean_lan_url(url).ok_or(Refusal("bad_address"))?;
+    let url = lan_check(url).map_err(Refusal)?;
     if store.relays.iter().any(|e| e.url.as_deref() == Some(url.as_str())) {
         return Err(Refusal("already_listed"));
     }
@@ -228,7 +299,7 @@ pub fn add_lan(store: &mut Store, url: &str, label: &str) -> Result<String, Refu
     if store.mac_dismissed.as_deref() == Some(url.as_str()) {
         store.mac_dismissed = None;
     }
-    store.relays.push(Entry { id: id.clone(), kind: "lan".into(), label: clean_label(label, MAC_LABEL), bookmark: None, url: Some(url), added_at: now_secs(), site: None, last_push_at: None, last_pull_at: None });
+    store.relays.push(Entry { id: id.clone(), kind: "lan".into(), label: clean_label(label, MAC_LABEL), bookmark: None, url: Some(url), added_at: now_secs(), debug_unscoped: false, site: None, last_push_at: None, last_pull_at: None });
     Ok(id)
 }
 
@@ -238,7 +309,7 @@ pub fn add_folder(store: &mut Store, bookmark: &[u8], label: &str) -> Result<Str
         return Err(Refusal("already_listed"));
     }
     let id = new_id(store)?;
-    store.relays.push(Entry { id: id.clone(), kind: "folder".into(), label: clean_label(label, "Folder"), bookmark: Some(b64), url: None, added_at: now_secs(), site: None, last_push_at: None, last_pull_at: None });
+    store.relays.push(Entry { id: id.clone(), kind: "folder".into(), label: clean_label(label, "Folder"), bookmark: Some(b64), url: None, added_at: now_secs(), debug_unscoped: false, site: None, last_push_at: None, last_pull_at: None });
     Ok(id)
 }
 
@@ -273,10 +344,11 @@ pub fn build_param(store: &Store, store_dir: &Path, resolve: &mut dyn FnMut(&Ent
     out
 }
 
-/// `params` for the core: for `sync.run` and `sync.status` with `inject` on, `relays` is added, whole; otherwise the
-/// params are returned untouched. `inject` is `lib.rs::RELAYS_INJECT`, passed in so the test can flip it.
+/// `params` for the core: for `sync.run` (never `sync.status`, which only echoes the last run) with `inject` on and a
+/// list that has an entry, `relays` is added, whole; otherwise the params are returned untouched (an empty `relays`
+/// would be the core's `not_found`, and "no list" means the relay setting that pairing wrote). `inject` is `lib.rs::RELAYS_INJECT`, passed in so the test can flip it.
 pub fn injected(method: &str, mut params: Value, inject: bool, relays: Vec<Value>) -> Value {
-    if inject && matches!(method, "sync.run" | "sync.status") {
+    if inject && method == "sync.run" && !relays.is_empty() {
         if let Some(map) = params.as_object_mut() {
             map.insert("relays".into(), Value::Array(relays));
         }
@@ -286,11 +358,30 @@ pub fn injected(method: &str, mut params: Value, inject: bool, relays: Vec<Value
 
 /// Keep the core's per-site answer beside the list: each `sites[]` row goes onto the entry with that id, with the time
 /// of the run; a push or a pull that did something stamps its own time. Returns whether anything changed.
-pub fn record_sites(store: &mut Store, answer: &Value, now: u64) -> bool {
+pub fn record_sites(store: &mut Store, answer: &Value, now: u64, mac_url: Option<&str>) -> bool {
     let Some(sites) = answer.get("sites").and_then(Value::as_array) else { return false };
     let mut changed = false;
+    // The core's own configured relay (the paired Mac, `relay.json`) answers as id "default": it is the Mac entry's row,
+    // used when that entry has no row of its own or its own row only says "same as another relay". With no Mac entry the
+    // row is dropped.
+    let own = |id: &str| sites.iter().find(|r| r.get("id").and_then(Value::as_str) == Some(id));
+    let mac_id = mac_url.and_then(|u| store.relays.iter().find(|e| e.kind == "lan" && e.url.as_deref() == Some(u)).map(|e| e.id.clone()));
+    let default_row = own("default");
+    let mut rows: Vec<(String, &Value)> = Vec::new();
     for row in sites {
         let Some(id) = row.get("id").and_then(Value::as_str) else { continue };
+        if id != "default" {
+            rows.push((id.to_string(), row));
+        }
+    }
+    if let (Some(mac), Some(default)) = (mac_id, default_row) {
+        let weak = own(&mac).is_none_or(|r| r.get("error").and_then(Value::as_str) == Some("same_relay"));
+        if weak {
+            rows.retain(|(id, _)| *id != mac);
+            rows.push((mac, default));
+        }
+    }
+    for (id, row) in rows {
         let Some(entry) = store.relays.iter_mut().find(|e| e.id == id) else { continue };
         let count = |k: &str| row.get(k).and_then(Value::as_u64).unwrap_or(0);
         let mut site = row.clone();
@@ -341,7 +432,7 @@ fn survey(store: &mut Store) -> (Vec<(Option<String>, bool)>, bool) {
             rows.push((None, true));
             continue;
         }
-        let Some(resolved) = e.bookmark.as_deref().and_then(b64_decode).and_then(|b| native::resolve(&b)) else {
+        let Some(resolved) = e.bookmark.as_deref().and_then(b64_decode).and_then(|b| native::resolve(&b, e.debug_unscoped)) else {
             rows.push((None, false));
             continue;
         };
@@ -369,7 +460,7 @@ pub async fn relays_list(app: tauri::AppHandle) -> Result<Value, CoreError> {
         save(&dir, &store).map_err(refusal)?;
     }
     let views: Vec<Value> = store.relays.iter().zip(rows).map(|(e, (display, available))| view_of(e, display, available)).collect();
-    Ok(json!({"relays": views, "mac_url": mac_url_in(&dir)}))
+    Ok(json!({"relays": views, "mac_url": mac_url_in(&dir), "unreadable": store.unreadable}))
 }
 
 /// Show the Files picker for one folder and keep its bookmark. `{"cancelled": true}` when the person backs out.
@@ -405,24 +496,25 @@ pub async fn relays_add_folder(app: tauri::AppHandle) -> Result<Value, CoreError
     let Some((bookmark, name)) = picked else { return Ok(json!({"cancelled": true})) };
     let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
     let mut store = load(&dir);
-    if native::resolve(&bookmark).is_some_and(|r| is_store_folder(&r.path, &dir)) {
+    if native::resolve(&bookmark, false).is_some_and(|r| is_store_folder(&r.path, &dir)) {
         return Err(CoreError::new("own_folder", "that is this app's own folder"));
     }
     let id = add_folder(&mut store, &bookmark, &name).map_err(refusal)?;
-    save(&dir, &store).map_err(refusal)?;
+    commit(&dir, &mut store).map_err(refusal)?;
     Ok(json!({"cancelled": false, "id": id}))
 }
 
-/// Add a LAN relay. With no `url`, the paired Mac's address from `relay.json`.
+/// Add a LAN relay from the Settings form: the page carries the address the person typed, and it has to pass the
+/// joiner's address class here (`lan_check`) whatever the page says. There is no "no address" form: the paired Mac is
+/// adopted by the shell on its own (`adopt_mac`).
 #[cfg(target_os = "ios")]
 #[tauri::command]
-pub async fn relays_add_lan(app: tauri::AppHandle, url: Option<String>, label: Option<String>) -> Result<Value, CoreError> {
+pub async fn relays_add_lan(app: tauri::AppHandle, url: String, label: Option<String>) -> Result<Value, CoreError> {
     let dir = data_dir(&app)?;
     let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
     let mut store = load(&dir);
-    let url = url.or_else(|| mac_url_in(&dir)).ok_or_else(|| refusal(Refusal("bad_address")))?;
     let id = add_lan(&mut store, &url, label.as_deref().unwrap_or(MAC_LABEL)).map_err(refusal)?;
-    save(&dir, &store).map_err(refusal)?;
+    commit(&dir, &mut store).map_err(refusal)?;
     Ok(json!({"id": id}))
 }
 
@@ -435,7 +527,7 @@ pub async fn relays_remove(app: tauri::AppHandle, id: String) -> Result<Value, C
     if !remove(&mut store, &id) {
         return Err(refusal(Refusal("not_found")));
     }
-    save(&dir, &store).map_err(refusal)?;
+    commit(&dir, &mut store).map_err(refusal)?;
     Ok(json!({"removed": true}))
 }
 
@@ -448,17 +540,17 @@ pub async fn relays_rename(app: tauri::AppHandle, id: String, label: String) -> 
     if !rename(&mut store, &id, &label) {
         return Err(refusal(Refusal("not_found")));
     }
-    save(&dir, &store).map_err(refusal)?;
+    commit(&dir, &mut store).map_err(refusal)?;
     Ok(json!({"renamed": true}))
 }
 
 // ---- the way to the core ----
 
-/// The core's params for one call. With `inject` on, a `sync.run` or `sync.status` gets the whole list as `relays`: each
+/// The core's params for one call. With `inject` on, a `sync.run` gets the whole list as `relays`: each
 /// folder's bookmark resolved and its scope started, the guards returned so the caller holds them until the answer is
 /// back; the paired Mac is adopted first so the list carries it. With `inject` off nothing is read and nothing is held.
 pub fn params_for_call(app: &tauri::AppHandle, method: &str, params: Value, inject: bool) -> (Value, Vec<native::Scope>) {
-    if !inject || !matches!(method, "sync.run" | "sync.status") {
+    if !inject || method != "sync.run" {
         return (params, Vec::new());
     }
     let Ok(dir) = data_dir(app) else { return (params, Vec::new()) };
@@ -469,7 +561,7 @@ pub fn params_for_call(app: &tauri::AppHandle, method: &str, params: Value, inje
     }
     let mut scopes = Vec::new();
     let list = build_param(&store, &dir, &mut |e| {
-        let resolved = e.bookmark.as_deref().and_then(b64_decode).and_then(|b| native::resolve(&b))?;
+        let resolved = e.bookmark.as_deref().and_then(b64_decode).and_then(|b| native::resolve(&b, e.debug_unscoped))?;
         let path = resolved.path.clone();
         scopes.push(resolved.scope);
         Some(path)
@@ -484,7 +576,7 @@ pub fn note_answer(app: &tauri::AppHandle, method: &str, answer: &Value) {
     }
     let (Ok(dir), Ok(_guard)) = (data_dir(app), LOCK.lock()) else { return };
     let mut store = load(&dir);
-    if record_sites(&mut store, answer, now_secs()) {
+    if record_sites(&mut store, answer, now_secs(), mac_url_in(&dir).as_deref()) {
         let _ = save(&dir, &store);
     }
 }
@@ -492,37 +584,59 @@ pub fn note_answer(app: &tauri::AppHandle, method: &str, answer: &Value) {
 /// Forget this phone takes the list with it (it names the Mac and the person's folders).
 pub fn forget(app: &tauri::AppHandle) {
     if let Ok(dir) = data_dir(app) {
-        let _ = std::fs::remove_file(dir.join(FILE));
-        let _ = std::fs::remove_file(dir.join(format!(".{FILE}.tmp")));
+        remove_files(&dir);
     }
 }
 
-/// Debug iOS builds, `--debug-relays-seed`: two folders this app owns become the first two entries (the Files picker
-/// cannot be driven on the simulator), the first with a made-up last result so the Settings words can be seen. Only
-/// when the list is empty. Synthetic values only.
+/// The list, its temp file and any copy kept aside from a corrupt one (they hold the same bookmarks). Also the start-up
+/// hook's part of a Forget that did not end (`ios::finish_forget`).
+pub fn remove_files(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(FILE));
+    let _ = std::fs::remove_file(dir.join(format!(".{FILE}.tmp")));
+    if let Ok(read) = std::fs::read_dir(dir) {
+        for item in read.flatten() {
+            if item.file_name().to_string_lossy().starts_with(&format!("{FILE}.bad-")) {
+                let _ = std::fs::remove_file(item.path());
+            }
+        }
+    }
+}
+
+/// Debug iOS builds. `--debug-relays-seed`: two plain folders become the first two entries (the Files picker cannot be
+/// driven on the simulator); they sit under `DEBUG_RELAYS_BASE` when that is set (the simulator's host path), else under
+/// this app's Documents. The paired Mac joins by itself when `relay.json` names one. Only when the list is empty.
+/// `--debug-relays-remove-b`: drop the second folder entry (the Remove button's effect, for the evidence run).
+/// Synthetic values only.
 #[cfg(debug_assertions)]
 pub fn debug_seed(app: &tauri::AppHandle) {
-    if !std::env::args().any(|a| a == "--debug-relays-seed") {
+    let args: Vec<String> = std::env::args().collect();
+    let (seed, drop_b) = (args.iter().any(|a| a == "--debug-relays-seed"), args.iter().any(|a| a == "--debug-relays-remove-b"));
+    if !seed && !drop_b {
         return;
     }
     let (Ok(dir), Ok(_guard)) = (data_dir(app), LOCK.lock()) else { return };
     let mut store = load(&dir);
+    if drop_b {
+        if let Some(b) = store.relays.iter().filter(|e| e.kind == "folder").nth(1).map(|e| e.id.clone()) {
+            remove(&mut store, &b);
+            let _ = commit(&dir, &mut store);
+        }
+        return;
+    }
     if !store.relays.is_empty() {
         return;
     }
-    let base = app.path().document_dir().unwrap_or_else(|_| dir.clone());
+    let base = std::env::var_os("DEBUG_RELAYS_BASE").map(std::path::PathBuf::from).or_else(|| app.path().document_dir().ok()).unwrap_or_else(|| dir.clone());
     for (name, label) in [("FolderA", "Folder A"), ("FolderB", "Folder B")] {
         let folder = base.join(name);
         let _ = std::fs::create_dir_all(&folder);
         if let Some(bytes) = native::bookmark_for_path(&folder) {
-            let _ = add_folder(&mut store, &bytes, label);
+            if let Ok(id) = add_folder(&mut store, &bytes, label) {
+                if let Some(e) = store.relays.iter_mut().find(|e| e.id == id) {
+                    e.debug_unscoped = true;
+                }
+            }
         }
-    }
-    let now = now_secs();
-    if let Some(first) = store.relays.first_mut() {
-        first.site = Some(json!({"id": first.id, "kind": "folder", "pushed": 3, "healed": 0, "behind": 0, "pulled": 2, "rejected": 0, "error": null, "at": now - 60}));
-        first.last_push_at = Some(now - 120);
-        first.last_pull_at = Some(now - 60);
     }
     let _ = save(&dir, &store);
 }
@@ -543,7 +657,7 @@ mod tests {
         let mut s = Store::default();
         add_folder(&mut s, b"bookmark-one", "Cloud A").unwrap();
         add_folder(&mut s, b"bookmark-two", "Cloud B").unwrap();
-        add_lan(&mut s, "http://192.168.1.20:8443", "Your Mac").unwrap();
+        add_lan(&mut s, "http://192.168.1.20:24816", "Your Mac").unwrap();
         s
     }
 
@@ -584,7 +698,7 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert_eq!(list[0], json!({"id": store.relays[0].id, "kind": "folder", "path": "/Volumes/A"}));
         assert_eq!(list[1], json!({"id": store.relays[1].id, "kind": "folder", "unavailable": true}));
-        assert_eq!(list[2], json!({"id": store.relays[2].id, "kind": "lan", "url": "http://192.168.1.20:8443"}));
+        assert_eq!(list[2], json!({"id": store.relays[2].id, "kind": "lan", "url": "http://192.168.1.20:24816"}));
         let text = serde_json::to_string(&list).unwrap();
         assert!(!text.contains("Cloud") && !text.contains("bookmark") && !text.contains("Your Mac"), "{text}");
     }
@@ -601,29 +715,27 @@ mod tests {
     }
 
     #[test]
-    fn injection_is_absent_when_off_and_present_and_well_formed_when_on() {
+    fn injection_is_absent_when_off_and_present_and_well_formed_on_sync_run_only() {
         let dir = scratch("inject");
         let store = two();
         let list = build_param(&store, &dir, &mut |_| Some("/Volumes/X".into()));
         let base = json!({"keep": 1});
-        // off: the params are untouched, for either method
         for m in ["sync.run", "sync.status"] {
-            assert_eq!(injected(m, base.clone(), false, list.clone()), base, "{m}");
+            assert_eq!(injected(m, base.clone(), false, list.clone()), base, "off: {m}");
         }
-        // on: `relays` is the whole list, for the two methods only
-        for m in ["sync.run", "sync.status"] {
-            let p = injected(m, base.clone(), true, list.clone());
-            assert_eq!(p["keep"], json!(1));
-            let relays = p["relays"].as_array().unwrap();
-            assert_eq!(relays.len(), 3);
-            for r in relays {
-                let id = r["id"].as_str().unwrap();
-                assert!(id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()));
-                match r["kind"].as_str().unwrap() {
-                    "folder" => assert!(r["path"].is_string() || r["unavailable"] == json!(true)),
-                    "lan" => assert!(r["url"].as_str().unwrap().starts_with("http://")),
-                    other => panic!("{other}"),
-                }
+        assert_eq!(injected("sync.status", base.clone(), true, list.clone()), base, "sync.status only echoes the last run: never injected");
+        assert_eq!(injected("sync.run", base.clone(), true, Vec::new()), base, "an empty list is not sent (the core would answer not_found)");
+        let p = injected("sync.run", base.clone(), true, list.clone());
+        assert_eq!(p["keep"], json!(1));
+        let relays = p["relays"].as_array().unwrap();
+        assert_eq!(relays.len(), 3);
+        for r in relays {
+            let id = r["id"].as_str().unwrap();
+            assert!(id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+            match r["kind"].as_str().unwrap() {
+                "folder" => assert!(r["path"].is_string() || r["unavailable"] == json!(true)),
+                "lan" => assert!(r["url"].as_str().unwrap().starts_with("http://")),
+                other => panic!("{other}"),
             }
         }
         assert_eq!(injected("data.today", base.clone(), true, list), base, "other methods never get it");
@@ -634,14 +746,14 @@ mod tests {
         let dir = scratch("mac");
         let mut store = Store::default();
         assert!(!adopt_mac(&dir, &mut store), "no relay.json, nothing to adopt");
-        std::fs::write(dir.join("relay.json"), r#"{"lan": "http://192.168.1.20:8443"}"#).unwrap();
+        std::fs::write(dir.join("relay.json"), r#"{"lan": "http://192.168.1.20:24816"}"#).unwrap();
         assert!(adopt_mac(&dir, &mut store));
         assert_eq!((store.relays[0].label.as_str(), store.relays[0].kind.as_str()), (MAC_LABEL, "lan"));
         assert!(!adopt_mac(&dir, &mut store), "adopted once");
         let id = store.relays[0].id.clone();
         assert!(remove(&mut store, &id));
         assert!(!adopt_mac(&dir, &mut store), "removed on purpose: not brought back");
-        add_lan(&mut store, "http://192.168.1.20:8443", "Your Mac").unwrap();
+        add_lan(&mut store, "http://192.168.1.20:24816", "Your Mac").unwrap();
         assert_eq!(store.mac_dismissed, None);
         // the list form of the file reads too
         std::fs::write(dir.join("relay.json"), r#"{"relays": [{"id": "x", "kind": "folder", "path": "/f"}, {"id": "y", "kind": "lan", "url": "http://10.0.0.2:9"}]}"#).unwrap();
@@ -651,9 +763,10 @@ mod tests {
 
     #[test]
     fn addresses_keep_one_shape_and_labels_stay_short_text() {
-        assert_eq!(clean_lan_url(" http://192.168.1.20:8443/ ").as_deref(), Some("http://192.168.1.20:8443"));
-        assert_eq!(clean_lan_url("http://[fe80::1]:80").as_deref(), Some("http://[fe80::1]:80"));
-        for bad in ["https://x:1", "http://u:p@x:1", "http://x:1/path", "http://x:1?q=1", "ftp://x:1", "x:1", "http://a b:1", ""] {
+        assert_eq!(clean_lan_url(" http://192.168.1.20:24816/ ").as_deref(), Some("http://192.168.1.20:24816"));
+        assert_eq!(clean_lan_url("http://[fd00::1]:24816").as_deref(), Some("http://[fd00::1]:24816"));
+        assert_eq!(clean_lan_url("http://192.168.1.20:80").as_deref(), Some("http://192.168.1.20:80"), "a spelled-out port 80 is explicit");
+        for bad in ["https://192.168.1.2:1", "http://u:p@192.168.1.2:1", "http://192.168.1.2:1/path", "http://192.168.1.2:1?q=1", "ftp://192.168.1.2:1", "x:1", "http://a b:1", ""] {
             assert_eq!(clean_lan_url(bad), None, "{bad}");
         }
         assert_eq!(clean_label("  Dropbox\n ", "Folder"), "Dropbox");
@@ -661,10 +774,85 @@ mod tests {
         assert_eq!(clean_label(&"x".repeat(200), "Folder").len(), LABEL_MAX);
         let mut s = Store::default();
         assert_eq!(add_lan(&mut s, "nope", "x"), Err(Refusal("bad_address")));
-        add_lan(&mut s, "http://1.2.3.4:5", "x").unwrap();
-        assert_eq!(add_lan(&mut s, "http://1.2.3.4:5/", "y"), Err(Refusal("already_listed")));
+        add_lan(&mut s, "http://10.1.2.3:5", "x").unwrap();
+        assert_eq!(add_lan(&mut s, "http://10.1.2.3:5/", "y"), Err(Refusal("already_listed")));
         add_folder(&mut s, b"b", "f").unwrap();
         assert_eq!(add_folder(&mut s, b"b", "g"), Err(Refusal("already_listed")));
+    }
+
+    /// 19d review #3: the joiner's address class (an IP literal, an explicit port, private or on-link; loopback only in a
+    /// simulator build) on the Mac's address.
+    #[test]
+    fn the_mac_address_must_pass_the_joiners_address_class() {
+        // a private v4 with a port, and a ULA v6 with a port: accepted
+        for ok in ["http://192.168.1.20:24816", "http://10.0.0.5:9", "http://172.16.0.1:24816", "http://100.64.1.1:24816", "http://[fd12::5]:24816"] {
+            assert!(lan_check_with(ok, false).is_ok(), "{ok}");
+        }
+        // a name, a public address, no port, loopback (outside a simulator build), link-local, multicast, unspecified
+        assert_eq!(lan_check_with("http://mac.local:24816", false), Err("address_name"));
+        assert_eq!(lan_check_with("http://example.com:24816", false), Err("address_name"));
+        assert_eq!(lan_check_with("http://8.8.8.8:24816", false), Err("not_local"));
+        assert_eq!(lan_check_with("http://[2001:4860::1]:24816", false), Err("not_local"));
+        assert_eq!(lan_check_with("http://192.168.1.20", false), Err("bad_address"));
+        assert_eq!(lan_check_with("http://[fd12::5]", false), Err("bad_address"));
+        assert_eq!(lan_check_with("http://127.0.0.1:24816", false), Err("not_local"));
+        assert_eq!(lan_check_with("http://[::1]:24816", false), Err("not_local"));
+        assert_eq!(lan_check_with("http://127.0.0.1:24816", true).as_deref(), Ok("http://127.0.0.1:24816"));
+        for never in ["http://169.254.1.1:1", "http://[fe80::1]:1", "http://224.0.0.1:1", "http://0.0.0.0:1", "http://255.255.255.255:1"] {
+            assert_eq!(lan_check_with(never, true), Err("not_local"), "{never}");
+        }
+        // the adopted Mac and a hand-typed one go through the same rule
+        let mut s = Store::default();
+        assert_eq!(add_lan(&mut s, "http://example.com:24816", "x"), Err(Refusal("address_name")));
+        assert_eq!(add_lan(&mut s, "http://8.8.8.8:24816", "x"), Err(Refusal("not_local")));
+        assert_eq!(add_lan(&mut s, "http://192.168.1.20", "x"), Err(Refusal("bad_address")));
+        assert!(s.relays.is_empty());
+        let dir = scratch("macclass");
+        std::fs::write(dir.join("relay.json"), r#"{"lan": "http://mac.local:24816"}"#).unwrap();
+        assert!(!adopt_mac(&dir, &mut s), "a name is never adopted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 19d review #17b: a list that cannot be read is kept aside, never overwritten, and says so until a change is saved.
+    #[test]
+    fn a_corrupt_list_is_kept_aside_at_0600_and_the_notice_stays_until_a_change_is_saved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("corrupt");
+        std::fs::write(dir.join(FILE), b"{ this is not json").unwrap();
+        let store = load(&dir);
+        assert!(store.unreadable && store.relays.is_empty());
+        let asides: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with("relays.json.bad-")).collect();
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        assert_eq!(std::fs::read(dir.join(&asides[0])).unwrap(), b"{ this is not json");
+        assert_eq!(std::fs::metadata(dir.join(&asides[0])).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(load(&dir).unreadable, "the next read still says so");
+        let mut store = load(&dir);
+        add_folder(&mut store, b"b", "f").unwrap();
+        commit(&dir, &mut store).unwrap();
+        assert!(!load(&dir).unreadable, "a saved change clears it");
+        remove_files(&dir);
+        assert!(!dir.join(FILE).exists() && !dir.join(&asides[0]).exists(), "Forget takes the copy too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cores_default_row_is_the_mac_entrys_row_and_dropped_without_one() {
+        let mut store = Store::default();
+        let mac = add_lan(&mut store, "http://192.168.1.20:24816", "Your Mac").unwrap();
+        let answer = json!({"sites": [{"id": "default", "kind": "lan", "pushed": 2, "healed": 0, "behind": 0, "pulled": 1, "rejected": 0, "error": null}]});
+        assert!(record_sites(&mut store, &answer, 5, Some("http://192.168.1.20:24816")));
+        assert_eq!(store.relays[0].site.as_ref().unwrap()["pushed"], json!(2), "the default row lands on {mac}");
+        // its own row wins unless that only says same_relay
+        let both = json!({"sites": [
+            {"id": mac, "kind": "lan", "pushed": 0, "healed": 0, "behind": 0, "pulled": 0, "rejected": 0, "error": "same_relay"},
+            {"id": "default", "kind": "lan", "pushed": 7, "healed": 0, "behind": 0, "pulled": 0, "rejected": 0, "error": null}]});
+        assert!(record_sites(&mut store, &both, 6, Some("http://192.168.1.20:24816")));
+        assert_eq!(store.relays[0].site.as_ref().unwrap()["pushed"], json!(7));
+        // no Mac entry: nothing to put it on
+        let mut folders = Store::default();
+        add_folder(&mut folders, b"b", "f").unwrap();
+        assert!(!record_sites(&mut folders, &answer, 7, Some("http://192.168.1.20:24816")));
+        assert_eq!(folders.relays[0].site, None);
     }
 
     #[test]
@@ -676,13 +864,13 @@ mod tests {
             {"id": b, "kind": "folder", "pushed": 0, "healed": 0, "behind": 3, "pulled": 0, "rejected": 0, "error": null},
             {"id": "ffffffff", "kind": "folder", "pushed": 9}
         ]});
-        assert!(record_sites(&mut store, &answer, 1000));
+        assert!(record_sites(&mut store, &answer, 1000, None));
         assert_eq!((store.relays[0].last_push_at, store.relays[0].last_pull_at), (Some(1000), Some(1000)));
         assert_eq!((store.relays[1].last_push_at, store.relays[1].last_pull_at), (None, None));
         assert_eq!(store.relays[1].site.as_ref().unwrap()["behind"], json!(3));
         assert_eq!(store.relays[1].site.as_ref().unwrap()["at"], json!(1000));
         assert_eq!(store.relays[2].site, None);
-        assert!(!record_sites(&mut store, &json!({"pull": {}}), 2000), "no sites, no change");
+        assert!(!record_sites(&mut store, &json!({"pull": {}}), 2000, None), "no sites, no change");
         let view = view_of(&store.relays[0], Some("Cloud".into()), true);
         let text = view.to_string();
         assert!(!text.contains("bookmark"), "{text}");
