@@ -112,16 +112,6 @@ fn mask(node: Json) -> Json {
             }
         }
     }
-    // 19d: `sync.status` gained `relays` (the last run's sites). The committed oracle predates it; the Python slice
-    // regenerates the fixtures with it and this drop goes then.
-    for (key, value) in &mut pairs {
-        if key.equals("result")
-            && let Json::Object(inner) = value
-            && inner.iter().any(|(name, _)| name.equals("relay_url"))
-        {
-            inner.retain(|(name, _)| !name.equals("relays"));
-        }
-    }
     Json::Object(pairs)
 }
 
