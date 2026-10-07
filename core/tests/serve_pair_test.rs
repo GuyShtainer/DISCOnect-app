@@ -250,8 +250,29 @@ fn http_status(addr: &str, path: &str) -> Option<u16> {
     text.split(' ').nth(1)?.parse().ok()
 }
 
+/// The listener is gone: a refused connect, a reset, or an empty reply. A timeout — a live but
+/// starved server — is "not yet", never refused, so `wait_until(.., refused)` never ends on one.
 fn refused(addr: &str) -> bool {
-    http_status(addr, "/v1/health").is_none()
+    use std::io::ErrorKind;
+    let Ok(sock) = addr.parse::<std::net::SocketAddr>() else { return false };
+    let mut stream = match TcpStream::connect_timeout(&sock, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(err) => return err.kind() == ErrorKind::ConnectionRefused,
+    };
+    if stream.set_read_timeout(Some(Duration::from_secs(3))).is_err() {
+        return false;
+    }
+    if write!(stream, "GET /v1/health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").is_err() {
+        return true; // the acceptor took the connection and closed it
+    }
+    let mut text = String::new();
+    match stream.read_to_string(&mut text) {
+        Ok(_) => text.is_empty(),
+        Err(err) => matches!(
+            err.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+        ),
+    }
 }
 
 /// A joiner on a thread: the six digits come through `sas`, the result is the first pull's counts.
