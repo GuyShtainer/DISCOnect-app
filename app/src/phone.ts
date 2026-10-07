@@ -40,3 +40,43 @@ export function debugOfferFromFile(): Promise<string> {
 export function coverRelease(): Promise<void> {
   return invoke("cover_release");
 }
+
+// ---- the relay list (19d, I5 row 4): the phone's shell owns it. The page gets words and numbers only: never a folder's location or the saved handle that reopens it. The
+// core's own `relays` param is refused when the page sends it; the shell builds it.
+
+export type RelaySite = { pushed?: number; healed?: number; behind?: number; pulled?: number; rejected?: number; error?: string | null; at?: number };
+export type RelayEntry = {
+  id: string;
+  kind: "folder" | "lan";
+  label: string;
+  available: boolean;
+  display: string | null; // a folder's last two path parts
+  url: string | null;
+  added_at: number;
+  site: RelaySite | null;
+  last_push_at: number | null;
+  last_pull_at: number | null;
+};
+
+/** iOS: the list, with the paired Mac's address from the relay setting (`mac_url`) for the Add-Mac form. */
+export function relaysList(): Promise<{ relays: RelayEntry[]; mac_url: string | null }> {
+  return invoke("relays_list");
+}
+
+/** iOS: the Files picker for one folder. Resolves `{ cancelled: true }` when the person backs out. */
+export function relaysAddFolder(): Promise<{ cancelled: boolean; id?: string }> {
+  return invoke("relays_add_folder");
+}
+
+/** iOS: a LAN relay; with no address, the paired Mac's. */
+export function relaysAddLan(url?: string, label?: string): Promise<{ id: string }> {
+  return invoke("relays_add_lan", { url: url ?? null, label: label ?? null });
+}
+
+export function relaysRemove(id: string): Promise<void> {
+  return invoke("relays_remove", { id });
+}
+
+export function relaysRename(id: string, label: string): Promise<void> {
+  return invoke("relays_rename", { id, label });
+}

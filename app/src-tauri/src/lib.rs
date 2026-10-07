@@ -18,6 +18,8 @@ pub mod inproc;
 mod cover;
 #[cfg(target_os = "ios")]
 mod ios;
+#[cfg(target_os = "ios")]
+mod relays;
 pub mod live;
 pub mod sidecar;
 
@@ -83,12 +85,40 @@ pub fn method_refusal(method: &str) -> Result<(), CoreError> {
     }
 }
 
+/// 19d (iOS): the phone's shell passes its relay list to the core as a `relays` param on `sync.run` and `sync.status`.
+/// **Off until the core accepts the param** (the Fenix8 build that takes it); the rest of the relay list (the screen,
+/// the commands, the stored list and the per-site state) works without it. Turning it on is this one word.
+#[cfg(target_os = "ios")]
+pub(crate) const RELAYS_INJECT: bool = false;
+
+/// Whether the page's params name `relays` (see [`core_call`]).
+fn params_name_relays(params: &Option<Value>) -> bool {
+    params.as_ref().and_then(Value::as_object).is_some_and(|m| m.contains_key("relays"))
+}
+
 /// Generic relay, for the methods in [`ALLOWED_METHODS`] only.
 #[tauri::command]
 async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String, params: Option<Value>) -> Result<Value, CoreError> {
     method_refusal(&method)?;
+    // 19d, the attack's A6: the relay list is the shell's, built natively below. A page cannot name a folder, so a
+    // `relays` param from the page is refused, on every platform and for every method.
+    if params_name_relays(&params) {
+        return Err(CoreError::new("refused", "that parameter is not available to the page"));
+    }
     let core = core_of(&state)?;
-    let answer = core.call(&method, params.unwrap_or(Value::Object(Default::default()))).await;
+    let params = params.unwrap_or(Value::Object(Default::default()));
+    // iOS: the whole relay list rides on `sync.run` and `sync.status` (once `RELAYS_INJECT` is on); the folders' scopes
+    // are held until the answer is back and stop when `_scopes` drops at the end of this function.
+    #[cfg(target_os = "ios")]
+    let (params, _scopes) = relays::params_for_call(&app, &method, params, RELAYS_INJECT);
+    let answer = core.call(&method, params).await;
+    #[cfg(target_os = "ios")]
+    if let Ok(value) = &answer {
+        relays::note_answer(&app, &method, value);
+        if method == "pair.forget" {
+            relays::forget(&app);
+        }
+    }
     if method == "key.unlock" && answer.as_ref().is_ok_and(|v| v.get("unlocked").and_then(Value::as_bool) == Some(true)) {
         live::paid_on_unlock(&app);
     }
@@ -126,10 +156,10 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn release_args(args: Vec<String>) -> Vec<String> {
     // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
     // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 31] = [
+    const NO_OPERAND: [&str; 32] = [
         "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
         "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed",
     ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
@@ -156,6 +186,23 @@ mod release_args_tests {
         assert_eq!(release_args(v(&["--debug-listen", "127.0.0.1:9", "--debug-drop-over"])), v(&[]));
         assert_eq!(release_args(v(&["--screen", "sync", "--debug-sync-run", "--theme", "dark"])), v(&["--screen", "sync", "--theme", "dark"]));
         assert_eq!(release_args(v(&["--screen", "trend", "--debug-tip", "2025-06-20", "--trend", "steps"])), v(&["--screen", "trend", "--trend", "steps"]));
+    }
+
+    /// 19d row 4: the relay seed flag takes no operand, so a release build drops it and keeps what follows.
+    #[test]
+    fn a_release_build_drops_the_relay_seed_flag_and_keeps_what_follows() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(release_args(v(&["--debug-relays-seed", "--screen", "settings"])), v(&["--screen", "settings"]));
+    }
+
+    /// 19d (the attack's A6): the page may not name `relays`; the shell builds the list natively.
+    #[test]
+    fn a_relays_param_from_the_page_is_seen() {
+        let named = |v: serde_json::Value| super::params_name_relays(&Some(v));
+        assert!(named(serde_json::json!({"relays": []})));
+        assert!(named(serde_json::json!({"a": 1, "relays": null})));
+        assert!(!named(serde_json::json!({"a": 1})));
+        assert!(!super::params_name_relays(&None));
     }
 
     /// 12-F row 4: every pairing evidence flag takes no operand, so a release build drops the flag and keeps the
@@ -645,6 +692,8 @@ pub fn run() {
             // store opens and before the page asks `key.unlock`. Its notes reach the core's diagnostics below.
             #[cfg(target_os = "ios")]
             let ios_notes = ios::prepare(app.handle());
+            #[cfg(all(debug_assertions, target_os = "ios"))]
+            relays::debug_seed(app.handle());
             // iOS only: the app-switcher cover (`cover.rs`): a plain view over the windows while the app is not active
             #[cfg(target_os = "ios")]
             if let Some(mtm) = objc2::MainThreadMarker::new() {
@@ -716,9 +765,11 @@ pub fn run() {
     // the phone), so the phone binary registers none of them. `live_*` stay until Bet 14 decides the phone's link.
     #[cfg(all(debug_assertions, mobile, target_os = "ios"))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file, debug_offer_from_file, keep_awake, cover_release,
+        relays::relays_list, relays::relays_add_folder, relays::relays_add_lan, relays::relays_remove, relays::relays_rename,
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(not(debug_assertions), mobile, target_os = "ios"))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, keep_awake, cover_release,
+        relays::relays_list, relays::relays_add_folder, relays::relays_add_lan, relays::relays_remove, relays::relays_rename,
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(debug_assertions, mobile, not(target_os = "ios")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,

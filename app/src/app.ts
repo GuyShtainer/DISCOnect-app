@@ -2369,6 +2369,7 @@ async function phoneJoin(text: string): Promise<void> {
   try {
     const r = await core.call<{ pull: { applied: number; records_new: number; rejected: number; status: string }; key_file_protected: boolean | null }>("pair.join", { offer: text });
     joinHost = null;
+    void phone.relaysAddLan().catch(() => undefined); // the Mac just paired joins the relay list as "Your Mac" (the shell reads the address itself)
     setPair({ v: "done", applied: r.pull.applied, fresh: r.pull.records_new, rejected: r.pull.rejected, partial: r.pull.status === "partial", protectedKey: r.key_file_protected });
   } catch (e) {
     pairFailure(e);
@@ -2865,6 +2866,109 @@ function saveTheme(theme: string | null): void {
   try { if (theme) localStorage.setItem(THEME_STORE, theme); else localStorage.removeItem(THEME_STORE); } catch { /* storage is optional */ }
 }
 
+// ---- The phone's relay list (19d, I5 row 4): the Relays card on Settings. The shell owns the list (`phone.ts`); the page
+// draws what it is told in words and never names a path. Each row says what the last sync did there, from the core's
+// per-site answer the shell keeps. The core's own words (`unavailable`, `same_relay`, `behind`) are mapped here, never drawn.
+const RELAY_REFUSALS: Record<string, string> = {
+  own_folder: "That is the folder this app keeps its own data in. Pick another one.",
+  already_listed: "That relay is already in the list.",
+  bad_address: "That is not an address like http://192.168.1.20:8443.",
+  busy: "Another relay change is running. Try again in a moment.",
+  not_found: "That relay is no longer in the list.",
+  unavailable: "The Files picker could not open. Try again.",
+};
+function relayRefusal(e: unknown): string {
+  return neutralText((core.isCoreError(e) ? RELAY_REFUSALS[e.code] : undefined) ?? "That did not work. Try again.");
+}
+function relayClock(secs: number): string {
+  const d = new Date(secs * 1000);
+  const time = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} ${time}`;
+}
+/** The state line of one relay, from what the shell keeps of the core's last answer for it. */
+function relayState(r: phone.RelayEntry): string {
+  if (!r.available || r.site?.error === "unavailable") return "Unavailable";
+  if (r.site?.error === "same_relay") return "Same as another relay";
+  const times: string[] = [];
+  if (r.last_push_at) times.push(`Last push ${relayClock(r.last_push_at)}`);
+  if (r.last_pull_at) times.push(`${times.length ? "last" : "Last"} pull ${relayClock(r.last_pull_at)}`);
+  const behind = r.site?.behind ?? 0;
+  if (behind > 0) return [`Behind by ${behind}`, ...times].join(" · ");
+  if (r.site?.error) return ["Not reached at the last sync", ...times].join(" · ");
+  if (times.length) return times.join(" · ");
+  return r.site ? "Synced, nothing new" : "Never synced";
+}
+
+async function relaysCard(out: ParentNode): Promise<void> {
+  const card = pcard("Relays");
+  card.append(el("h2", "heading", "Relays"));
+  card.append(ptext("p", "caption muted", "Where this phone keeps copies of what it sends and fetches. Every sync uses all of them. Pick a folder in the Files app, on this phone or in a cloud service that shows there, or add your Mac."));
+  const note = el("p", "caption error");
+  note.setAttribute("role", "alert");
+  const redraw = (): void => { void route(); };
+  const attempt = async (job: () => Promise<unknown>): Promise<void> => {
+    note.textContent = "";
+    try { await job(); redraw(); } catch (e) { note.textContent = relayRefusal(e); }
+  };
+  let list: { relays: phone.RelayEntry[]; mac_url: string | null } | null = null;
+  try { list = await phone.relaysList(); } catch { list = null; }
+  if (!list) {
+    card.append(ptext("p", "caption muted", "The relay list could not be read."));
+    out.append(card);
+    return;
+  }
+  if (!list.relays.length) card.append(ptext("p", "body", "No relays yet. Add a folder or your Mac to start."));
+  const rows = el("ul", "relays");
+  for (const r of list.relays) {
+    const row = el("li", "relay");
+    const head = el("div", "relay-head");
+    head.append(el("span", "relay-name", neutralText(r.label)), el("span", "caption muted", r.kind === "folder" ? "Folder" : "On your network"));
+    row.append(head);
+    row.append(el("p", "caption muted wrap", neutralText(r.kind === "folder" ? (r.display ?? "Not found") : (r.url ?? ""))));
+    const state = relayState(r);
+    const stateLine = el("p", state === "Unavailable" ? "caption error" : "caption", neutralText(state));
+    row.append(stateLine);
+    const actions = el("div", "actions");
+    const rename = pbutton("Rename", "secondary", () => {
+      const field = el("input") as HTMLInputElement;
+      field.type = "text"; field.value = r.label; field.maxLength = 60; field.setAttribute("aria-label", `Name for ${r.label}`);
+      const save = pbutton("Save", "", () => void attempt(() => phone.relaysRename(r.id, field.value)));
+      const cancel = pbutton("Cancel", "secondary", () => { actions.replaceChildren(rename, remove); });
+      actions.replaceChildren(field, save, cancel);
+      field.focus();
+    });
+    const remove = pbutton("Remove", "danger", () => {
+      const ask = el("span", "caption", neutralText(`Remove ${r.label}? What is already stored in it stays there.`));
+      const yes = pbutton("Remove", "danger", () => void attempt(() => phone.relaysRemove(r.id)));
+      const keep = pbutton("Keep", "secondary", () => actions.replaceChildren(rename, remove));
+      actions.replaceChildren(ask, yes, keep);
+      keep.focus();
+    });
+    actions.append(rename, remove);
+    row.append(actions);
+    rows.append(row);
+  }
+  card.append(rows);
+  const adds = el("div", "actions");
+  const addFolder = pbutton("Add a folder…", "secondary", () => void attempt(async () => { await phone.relaysAddFolder(); }));
+  const addMac = pbutton("Add your Mac", "secondary", () => {
+    const url = el("input") as HTMLInputElement;
+    url.type = "text"; url.value = list?.mac_url ?? ""; url.placeholder = "http://192.168.1.20:8443"; url.setAttribute("aria-label", "Your Mac's address");
+    url.autocapitalize = "off"; url.autocomplete = "off"; url.spellcheck = false;
+    const name = el("input") as HTMLInputElement;
+    name.type = "text"; name.value = "Your Mac"; name.maxLength = 60; name.setAttribute("aria-label", "Name");
+    const save = pbutton("Add", "", () => void attempt(() => phone.relaysAddLan(url.value, name.value)));
+    const cancel = pbutton("Cancel", "secondary", () => redraw());
+    const form = el("div", "field");
+    form.append(url, name, stackOf(save, cancel));
+    adds.replaceWith(form);
+    url.focus();
+  });
+  adds.append(addFolder, addMac);
+  card.append(adds, note);
+  out.append(card);
+}
+
 async function screenPhoneSettings(out: ParentNode): Promise<void> {
   const info = await core.call<AppInfo>("app.info");
   header(out, "Settings", "");
@@ -2921,6 +3025,8 @@ async function screenPhoneSettings(out: ParentNode): Promise<void> {
   cap.id = "kc2";
   key.append(cap);
   out.append(key);
+
+  await relaysCard(out);
 
   const mine = pcard("This phone");
   mine.append(el("h2", "heading", "This phone"));
