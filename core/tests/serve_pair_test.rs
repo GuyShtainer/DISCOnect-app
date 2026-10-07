@@ -345,7 +345,7 @@ fn the_first_pull_succeeds_with_keep_off_and_the_server_stops_at_expiry() {
 
     // it serves until the offer's expiry, then stops
     assert!(wait_until(25, || live.serving().is_null()), "the server stops at expiry");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
     let states: Vec<String> = live
         .events("pair")
         .iter()
@@ -378,7 +378,7 @@ fn wrong_digits_abort_with_codes_differ_and_the_joiner_reads_410_within_the_ling
     let again = live.call("pair.confirm", json!({"digits": digits}));
     assert_eq!(error_of(&again), ("pair_failed", "the offer ended"));
     assert!(wait_until(15, || live.serving().is_null()), "the server stops after the linger");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
     let aborts: Vec<Value> = live.events("pair").into_iter().filter(|e| e["state"] == "aborted").collect();
     assert_eq!(aborts.len(), 1, "aborted exactly once");
 }
@@ -416,7 +416,7 @@ fn cancel_ends_the_offer_once_and_is_idempotent() {
     assert_eq!(live.event("pair", "aborted")["reason"], "cancelled");
     assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
     assert!(wait_until(15, || live.serving().is_null()), "keep is off: the server stops after the linger");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
     let aborts = live.events("pair").into_iter().filter(|e| e["state"] == "aborted").count();
     assert_eq!(aborts, 1);
     // the offer's text is dead: confirm says it ended (the record stays until the next offer)
@@ -805,7 +805,7 @@ fn a_cancel_after_delivery_stops_the_server_after_the_linger_with_no_pair_event(
     deliver(&mut live, &offer_text(&reply));
     assert_eq!(live.call("pair.cancel", json!({}))["result"], json!({"state": "aborted"}));
     assert!(wait_until(15, || live.serving().is_null()), "keep is off: the server stops after the linger");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(pair_states(&mut live), ["bound", "delivered"], "no aborted event after a delivery");
     assert_eq!(live.event("relay", "stopped")["reason"], "offer_ended");
@@ -822,7 +822,7 @@ fn a_cancel_stops_the_server_after_the_linger_and_says_offer_ended_once() {
     let stopped = live.event("relay", "stopped");
     assert_eq!(stopped["reason"], "offer_ended");
     assert!(wait_until(15, || live.serving().is_null()), "the event comes with the stop");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(live.events("relay").len(), 1, "one stop, one event");
 }
@@ -910,12 +910,20 @@ fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifeti
     // the stop lands a tick after the event under full-suite load: wait, never assert the instant
     assert!(wait_until(5, || live.serving().is_null()), "the server left with its address");
     present.store(true, Ordering::SeqCst);
-    let reply = live.call("pair.offer", json!({"listen": listen}));
-    assert!(reply["result"]["offer"].is_string());
+    // sync.status reads the server gone the moment it is taken; its stop (the acceptor's join, behind `stopping`)
+    // completes a tick later, and under full-suite load the next offer on the same port meets "the relay is
+    // stopping" or the port still held: retry until the old server is really gone, never assert the instant
+    let mut reply = Value::Null;
+    let started = wait_until(10, || {
+        reply = live.call("pair.offer", json!({"listen": listen}));
+        reply["result"]["offer"].is_string()
+            || !matches!(reply["error"]["code"].as_str(), Some("busy") | Some("internal"))
+    });
+    assert!(started && reply["result"]["offer"].is_string(), "the next offer's server starts once the old one stopped: {reply}");
     assert_eq!(live.serving()["keep"], false, "the switch and the core agree: keep is off");
     live.call("pair.cancel", json!({}));
     assert!(wait_until(15, || live.serving().is_null()), "the server stops after the linger");
-    assert!(refused(&listen));
+    assert!(wait_until(5, || refused(&listen)), "the listener closes as the stop completes");
 }
 
 #[test]
