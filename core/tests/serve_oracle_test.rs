@@ -234,11 +234,11 @@ fn replay(store_file: &str, oracle_file: &str) {
             }
             continue;
         }
-        // the phone refuses the five server roles (12-D): every other entry is still compared
+        // the phone refuses the four server roles (12-D; `pair.cancel` is the joiner's since 12-F row 3): every other entry is still compared
         #[cfg(target_os = "ios")]
         if matches!(
             method,
-            "relay.addresses" | "relay.serve" | "pair.offer" | "pair.confirm" | "pair.cancel"
+            "relay.addresses" | "relay.serve" | "pair.offer" | "pair.confirm"
         ) {
             let ok = got.len() == 1
                 && got[0].get("error").and_then(|e| e.get("code"))
