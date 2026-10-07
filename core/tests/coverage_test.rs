@@ -235,3 +235,52 @@ fn completeness_follows_the_watch_clock() {
         [("2025-05-31".to_string(), None), ("2025-06-01".to_string(), Some(100)), ("2025-06-02".to_string(), None)]
     );
 }
+
+#[test]
+fn completeness_pins_the_worn_gap_boundary() {
+    // readings exactly WORN_GAP_S apart bridge; one second more does not: 300 + 60 + 60 = 420 of 3600 -> 11
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = writable(dir.path());
+    let conn = store.conn();
+    let raw_id = raw(conn, "fit:monitoring_b", "2025-06-01T00:00:00Z", "2025-06-01T01:00:00Z");
+    for stamp in ["2025-06-01T00:00:00Z", "2025-06-01T00:05:00Z", "2025-06-01T00:10:01Z"] {
+        conn.execute(
+            "INSERT INTO metric_samples(metric, ts_utc, value, source_scope, raw_record_id) VALUES('heart_rate', ?1, 60, 'device', ?2)",
+            rusqlite::params![stamp, raw_id],
+        )
+        .expect("sample");
+    }
+    assert_eq!(shares(conn, "heart_rate", "device", "2025-06-01", "2025-06-01"), [("2025-06-01".to_string(), Some(11))]);
+}
+
+#[test]
+fn completeness_day_bounds_never_step_back() {
+    // a stated offset that jumps by more than a day (a watch clock never set) empties the day it swallows
+    // instead of crediting a fully worn day's seconds elsewhere or going negative (unordered bounds made
+    // bisect_right and partition_point disagree); an absurd offset is OverflowError, as on the Python side
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = writable(dir.path());
+    let conn = store.conn();
+    let raw_id = raw(conn, "fit:monitoring_b", "2025-06-01T00:00:00Z", "2025-06-05T00:00:00Z");
+    for (day, offset) in [(1, 0), (2, 0), (3, 200_000), (4, 0), (5, 0)] {
+        conn.execute(
+            "INSERT INTO clock_offsets(ts_utc, offset_s, raw_record_id) VALUES(?1, ?2, ?3)",
+            rusqlite::params![format!("2025-06-{day:02}T00:00:00Z"), offset, raw_id],
+        )
+        .expect("offset");
+    }
+    minutes(conn, raw_id, "heart_rate", "device", utc(1, 0, 0), utc(5, 0, 0), 60);
+    assert_eq!(
+        shares(conn, "heart_rate", "device", "2025-06-01", "2025-06-04"),
+        [
+            ("2025-06-01".to_string(), Some(100)),
+            ("2025-06-02".to_string(), None),
+            ("2025-06-03".to_string(), Some(100)),
+            ("2025-06-04".to_string(), Some(100)),
+        ]
+    );
+    conn.execute("UPDATE clock_offsets SET offset_s=?1 WHERE ts_utc='2025-06-03T00:00:00Z'", [i64::MIN])
+        .expect("absurd offset");
+    let absurd = coverage::day_completeness(conn, Contract::get().expect("contract"), "heart_rate", "device", "2025-06-01", "2025-06-04");
+    assert!(matches!(absurd, Err(disconect_core::read::ReadError::Overflow)), "{absurd:?}");
+}

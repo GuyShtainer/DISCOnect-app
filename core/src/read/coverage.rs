@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::NaiveDate;
+use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
@@ -607,13 +607,21 @@ pub fn ledger_ordered(
 
 /// `_day_bounds`: epoch seconds each window day starts at, plus the end of the last one
 /// (`window.days + 1` entries). Local midnight is read under the offset nearest to it; UTC is
-/// assumed where no offset is known.
+/// assumed where no offset is known. The bounds never step back (an offset jump of more than a day
+/// leaves the day between empty, so `partition_point` searches a sorted slice and no piece is
+/// negative); an offset that puts a midnight outside years 1-9999 is Python's `OverflowError`.
 fn day_bounds(window: &Window, offsets: &ClockOffsets) -> Result<Vec<i64>, ReadError> {
-    let mut bounds = Vec::with_capacity(window.days + 1);
+    let mut bounds: Vec<i64> = Vec::with_capacity(window.days + 1);
     for position in 0..=window.days {
         let date = shift(window.first, i64::try_from(position).map_err(|_| ReadError::Overflow)?)?;
         let midnight: Instant = date.and_hms_opt(0, 0, 0).ok_or(ReadError::Overflow)?.and_utc();
-        bounds.push(midnight.timestamp() - offsets.offset_at(midnight).unwrap_or(0));
+        // `midnight - timedelta(seconds=offset)`
+        let bound = Duration::try_seconds(offsets.offset_at(midnight).unwrap_or(0))
+            .and_then(|by| midnight.checked_sub_signed(by))
+            .filter(|moment| (1..=9999).contains(&moment.year()))
+            .ok_or(ReadError::Overflow)?
+            .timestamp();
+        bounds.push(bounds.last().map_or(bound, |previous| bound.max(*previous)));
     }
     Ok(bounds)
 }
@@ -691,8 +699,8 @@ fn covered_seconds(
     Ok(seconds)
 }
 
-/// `_worn_seconds`: per window day, the seconds a reading accounts for: its own minute, and the gap to
-/// the next reading when that is at most `WORN_GAP_S`.
+/// `_worn_seconds`: per window day, the seconds a reading accounts for: the gap to the next reading when
+/// that is at most `WORN_GAP_S`, else its own minute (`READING_S`).
 fn worn_seconds(
     conn: &Connection,
     metric: &str,
@@ -724,7 +732,7 @@ fn worn_seconds(
 }
 
 /// `day_completeness`: per local day, oldest first, the share (0-100) of the covered seconds a reading
-/// accounts for (its minute, and the gap to the next reading when at most `WORN_GAP_S`); None for a pair
+/// accounts for (the gap to the next reading when at most `WORN_GAP_S`, else its minute); None for a pair
 /// that is not per-minute, for a session scope, and for a day no file of the pair's streams spans.
 pub fn day_completeness(
     conn: &Connection,

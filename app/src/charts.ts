@@ -97,12 +97,14 @@ function seriesWords(series: Series[], i: number): string[] {
 }
 
 /** The dot a non-live day draws: hollow and faded when its mean rests on less than LOW_COMPLETENESS of the day,
- * a full dot when it is isolated (both neighbours missing, so a line would not show it), else none. */
-function dayPoint(days: Series["days"], i: number): number | null | { value: number; symbol: string; symbolSize: number; itemStyle?: { opacity: number } } {
+ * a full dot when it is isolated (both neighbours missing, so a line would not show it), else none. Hollow is a
+ * ring in the scope's colour around the card's own colour: ECharts's "emptyCircle" always fills white, which on
+ * the dark themes is a pale disc, not a hollow one. */
+function dayPoint(days: Series["days"], i: number, scope: string): number | null | { value: number; symbol: string; symbolSize: number; itemStyle?: { color: string; borderColor: string; borderWidth: number; opacity: number } } {
   const d = days[i];
   if (d.value === null) return null;
   if (typeof d.completeness === "number" && d.completeness < LOW_COMPLETENESS) {
-    return { value: d.value, symbol: "emptyCircle", symbolSize: 6, itemStyle: { opacity: 0.45 } };
+    return { value: d.value, symbol: "circle", symbolSize: 6, itemStyle: { color: token("--surface-raised"), borderColor: token(SCOPE_TOKEN[scope] ?? "--ink"), borderWidth: 2, opacity: 0.45 } };
   }
   if (days[i - 1]?.value == null && days[i + 1]?.value == null) return { value: d.value, symbol: "circle", symbolSize: 5 };
   return d.value;
@@ -247,7 +249,7 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       // vendor cloud is dashed: when it agrees with device the two lines overlap exactly and both must stay visible
       lineStyle: { width: 1.5, type: s.scope === "vendor_cloud" ? "dashed" : "solid" },
       itemStyle: { color: token(SCOPE_TOKEN[s.scope] ?? "--ink") },
-      data: s.scope === "live" ? s.days.map((d) => d.value) : s.days.map((_d, i) => dayPoint(s.days, i)),
+      data: s.scope === "live" ? s.days.map((d) => d.value) : s.days.map((_d, i) => dayPoint(s.days, i, s.scope)),
       markArea: i === series.findIndex((t) => t.scope !== "live")
         ? {
             silent: true,
