@@ -1550,6 +1550,49 @@ pub struct StatusReport {
     pub last_pushed_at: Option<String>,
     /// The same for pulled bundles: "last data received".
     pub last_pulled_at: Option<String>,
+    /// One row per writer id among the applied bundles (pushed and pulled), sorted by id (19b).
+    pub chains: Vec<Chain>,
+}
+
+/// One writer's chain as this store holds it: counts only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chain {
+    pub device_id: String,
+    pub bundles: i64,
+    pub records: i64,
+    pub last_seq: i64,
+    /// The id is this store's own (`relay_device`); false for every row while it has pushed nothing.
+    pub is_self: bool,
+}
+
+fn chains(conn: &Connection) -> Result<Vec<Chain>, SyncError> {
+    let own: Option<String> = conn
+        .query_row("SELECT device_id FROM relay_device WHERE id=1", [], |r| r.get(0))
+        .optional()?;
+    let mut stmt = conn.prepare(
+        "SELECT device_id, count(*), sum(records), max(device_seq) FROM relay_bundles \
+         WHERE status='applied' AND device_id IS NOT NULL GROUP BY device_id ORDER BY device_id",
+    )?;
+    let mapped = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in mapped {
+        let (device_id, bundles, records, last_seq) = row?;
+        out.push(Chain {
+            is_self: own.as_deref() == Some(device_id.as_str()),
+            device_id,
+            bundles,
+            records: records.unwrap_or(0),
+            last_seq: last_seq.unwrap_or(0),
+        });
+    }
+    Ok(out)
 }
 
 pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
@@ -1587,6 +1630,7 @@ pub fn status(conn: &Connection) -> Result<StatusReport, SyncError> {
         gaps: gaps(conn)?,
         last_pushed_at: last_applied(conn, "pushed")?,
         last_pulled_at: last_applied(conn, "pulled")?,
+        chains: chains(conn)?,
     })
 }
 
@@ -1619,6 +1663,7 @@ pub fn status_or_fresh(conn: &Connection) -> Result<StatusReport, SyncError> {
         gaps: Vec::new(),
         last_pushed_at: None,
         last_pulled_at: None,
+        chains: Vec::new(),
     })
 }
 
@@ -1634,6 +1679,14 @@ pub fn status_value(report: &StatusReport) -> serde_json::Value {
         .iter()
         .map(|g| serde_json::json!({"chain": g.chain, "device_seq": g.device_seq, "missing": g.missing}))
         .collect();
+    let chains: Vec<serde_json::Value> = report
+        .chains
+        .iter()
+        .map(|c| {
+            serde_json::json!({"device_id": c.device_id, "bundles": c.bundles, "records": c.records,
+                "last_seq": c.last_seq, "self": c.is_self})
+        })
+        .collect();
     serde_json::json!({
         "bundles": bundles,
         "records_unsent": report.records_unsent,
@@ -1643,6 +1696,7 @@ pub fn status_value(report: &StatusReport) -> serde_json::Value {
         "gaps": gaps,
         "last_pushed_at": report.last_pushed_at,
         "last_pulled_at": report.last_pulled_at,
+        "chains": chains,
     })
 }
 

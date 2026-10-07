@@ -363,6 +363,12 @@ fn late_bundles_are_applied_and_rejected_ones_retried() {
     assert_eq!(report.bundles.get("pulled_applied"), Some(&2));
     assert_eq!(report.bundles.get("pulled_rejected"), Some(&1));
     assert!(report.gaps.is_empty());
+    // 19b: the rejected object adds no chain row; A's chain is the one row, and it is not B's own
+    assert_eq!(report.chains.len(), 1);
+    assert_eq!(
+        (report.chains[0].bundles, report.chains[0].last_seq, report.chains[0].is_self),
+        (2, 2, false)
+    );
     // the relay import run of a pull that rejected something is partial (both pulls did)
     assert_eq!(
         count(
@@ -1594,4 +1600,100 @@ fn a_stream_scoped_reparse_rebuilds_only_that_stream() {
         "the rebuilt rows equal the imported ones"
     );
     assert_eq!(stats.status(), "ok");
+}
+
+#[test]
+fn chains_follow_the_applied_bundles_and_self_is_this_stores_own_id() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    assert!(sync::status(a.conn()).expect("status").chains.is_empty());
+    import(&a, &fit_drop(tmp.path(), "d1", &["monitoring_timestamp16"]));
+    let relay = relay_in(tmp.path());
+    // nothing pushed yet: no row, and status never mints an id
+    assert!(sync::status(a.conn()).expect("status").chains.is_empty());
+    push(&a, &relay);
+    pull(&b, &relay);
+    let (ca, cb) = (
+        sync::status(a.conn()).expect("status").chains,
+        sync::status(b.conn()).expect("status").chains,
+    );
+    assert_eq!(ca.len(), 1);
+    assert_eq!(ca[0].bundles, 1);
+    assert_eq!(ca[0].last_seq, 1);
+    assert!(ca[0].records > 0);
+    assert!(ca[0].is_self);
+    assert_eq!(cb.len(), 1);
+    assert_eq!((cb[0].device_id.clone(), cb[0].records), (ca[0].device_id.clone(), ca[0].records));
+    assert!(!cb[0].is_self);
+    // B publishes something of its own; A pulls: two rows sorted by id, each store's own flagged
+    import(&b, &fit_drop(tmp.path(), "d2", &["monitoring_cycles_resolution"]));
+    push(&b, &relay);
+    pull(&a, &relay);
+    let (ca, cb) = (
+        sync::status(a.conn()).expect("status").chains,
+        sync::status(b.conn()).expect("status").chains,
+    );
+    for chains in [&ca, &cb] {
+        assert_eq!(chains.len(), 2);
+        assert!(chains[0].device_id < chains[1].device_id);
+    }
+    assert_eq!(
+        ca.iter().map(|c| (c.device_id.clone(), c.records)).collect::<Vec<_>>(),
+        cb.iter().map(|c| (c.device_id.clone(), c.records)).collect::<Vec<_>>()
+    );
+    assert_eq!(ca.iter().filter(|c| c.is_self).count(), 1);
+    assert_eq!(cb.iter().filter(|c| c.is_self).count(), 1);
+    assert_ne!(
+        ca.iter().find(|c| c.is_self).expect("a").device_id,
+        cb.iter().find(|c| c.is_self).expect("b").device_id
+    );
+    // the JSON key is `self`
+    let value = sync::status_value(&sync::status(a.conn()).expect("status"));
+    assert!(value["chains"][0].get("self").is_some());
+}
+
+type LiveRawRow = (String, String, String, String, Option<String>, Option<String>, Option<String>, String, Vec<u8>, String);
+
+fn live_raw_rows(conn: &Connection) -> Vec<LiveRawRow> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT stream, source_key, source_scope, transport, device_id, start_utc, end_utc, payload_kind, payload, payload_hash \
+             FROM raw_records ORDER BY stream, source_key",
+        )
+        .expect("prepare");
+    stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+    })
+    .expect("query")
+    .map(|r| r.expect("row"))
+    .collect()
+}
+
+#[test]
+fn a_live_record_born_on_the_phone_lands_on_the_mac_byte_for_byte() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (phone, mac) = (device(), device());
+    let file = tmp.path().join("live/live-20250615T150640Z.jsonl");
+    write(
+        tmp.path(),
+        "live/live-20250615T150640Z.jsonl",
+        "{\"status\": \"scanning\"}\n{\"t\": 1750000002.0, \"metric\": \"steps\", \"value\": 40}\n\
+         {\"t\": 1750000001.0, \"metric\": \"heart_rate\", \"value\": 71}\n{\"status\": \"stopped\", \"stop\": \"LinkClosed\"}\n",
+    );
+    import_path(phone.conn(), &file, Some("ble"), None).expect("import");
+    let born = live_raw_rows(phone.conn());
+    assert_eq!(born.len(), 1);
+    assert_eq!((born[0].0.as_str(), born[0].3.as_str()), ("json:live", "ble"));
+    let relay = relay_in(tmp.path());
+    let pushed = push(&phone, &relay);
+    assert_eq!(pushed.records, 1);
+    let pulled = pull(&mac, &relay);
+    assert_eq!(pulled.records_new, 1);
+    assert_eq!(live_raw_rows(mac.conn()), born);
+    // the bundle travelled as `relay`, the record kept the transport it was born under
+    assert_eq!(
+        count(mac.conn(), "SELECT count(*) FROM import_runs WHERE transport='relay'"),
+        1
+    );
+    assert_eq!(count(mac.conn(), "SELECT count(*) FROM raw_records WHERE transport='ble'"), 1);
 }

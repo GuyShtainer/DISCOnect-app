@@ -117,7 +117,7 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
     assert_eq!(code(&status), 0);
     let line = stdout(&status).trim().to_string();
     assert!(line.starts_with(
-        "relay: pushed 0, pulled 1, rejected 0; records unsent 0, seen 2; conflicts 0; gaps 0; last push never, last pull 20"
+        "relay: pushed 0, pulled 1, rejected 0; records unsent 0, seen 2; conflicts 0; gaps 0; chains 1; last push never, last pull 20"
     ));
     assert!(line.ends_with('Z'));
     let report: Value =
@@ -125,6 +125,13 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
     assert_eq!(report["bundles"]["pulled_applied"], 1);
     assert_eq!(report["records_unsent"], 0);
     assert_eq!(report["gaps"], Value::Array(Vec::new()));
+    // 19b: A's chain, counts only, not this store's own
+    let chains = report["chains"].as_array().expect("chains");
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0]["bundles"], 1);
+    assert_eq!(chains[0]["records"], 2);
+    assert_eq!(chains[0]["last_seq"], 1);
+    assert_eq!(chains[0]["self"], false);
 
     // a rejected object makes the pull partial: exit 1, and the line says so
     let account = std::fs::read_dir(&relay)

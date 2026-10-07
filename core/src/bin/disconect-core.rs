@@ -430,7 +430,7 @@ fn pull_json(result: &PullResult) -> Value {
 fn status_text(report: &StatusReport) -> String {
     let count = |key: &str| report.bundles.get(key).copied().unwrap_or(0);
     format!(
-        "relay: pushed {}, pulled {}, rejected {}; records unsent {}, seen {}; conflicts {}; gaps {}; last push {}, last pull {}",
+        "relay: pushed {}, pulled {}, rejected {}; records unsent {}, seen {}; conflicts {}; gaps {}; chains {}; last push {}, last pull {}",
         count("pushed_applied"),
         count("pulled_applied"),
         count("pulled_rejected"),
@@ -438,6 +438,7 @@ fn status_text(report: &StatusReport) -> String {
         report.records_seen,
         report.conflicts,
         report.gaps.len(),
+        report.chains.len(),
         report.last_pushed_at.as_deref().unwrap_or("never"),
         report.last_pulled_at.as_deref().unwrap_or("never")
     )

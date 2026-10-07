@@ -177,7 +177,7 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
                "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
-               "serving": null, "relay_url": null, "relay_kind": null, "relays": null})
+               "chains": [], "serving": null, "relay_url": null, "relay_kind": null, "relays": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");
@@ -292,6 +292,70 @@ fn a_folder_relay_pushes_then_pulls_with_events_and_counts_only() {
     let status = rig_b.send(22, "sync.status", json!({}));
     assert_eq!(status[0]["result"]["bundles"], json!({"pulled_applied": 1}));
     assert_eq!(status[0]["result"]["records_seen"], 2);
+}
+
+fn chains_of(rig: &mut Rig, id: i64) -> Vec<Value> {
+    let lines = rig.send(id, "sync.status", json!({}));
+    lines[0]["result"]["chains"].as_array().expect("chains").clone()
+}
+
+#[test]
+fn sync_status_chains_name_each_writer_with_counts_and_a_self_flag() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let relay = tmp.path().join("relay");
+    let (_da, a) = encrypted_store(true);
+    let (_db, b) = encrypted_store(false);
+    for db in [&a, &b] {
+        relay_json(db, json!({"folder": relay}));
+    }
+    let (mut rig_a, mut rig_b) = (Rig::new(&a), Rig::new(&b));
+    rig_a.unlock();
+    rig_b.unlock();
+    // a fresh store: no chains
+    assert_eq!(chains_of(&mut rig_b, 2), Vec::<Value>::new());
+    rig_a.send(10, "sync.run", json!({}));
+    rig_b.send(11, "sync.run", json!({}));
+    let (ca, cb) = (chains_of(&mut rig_a, 12), chains_of(&mut rig_b, 13));
+    assert_eq!(ca.len(), 1);
+    let row = &ca[0];
+    assert_eq!((row["bundles"].as_i64(), row["records"].as_i64(), row["last_seq"].as_i64()), (Some(1), Some(2), Some(1)));
+    assert_eq!(row["self"], true);
+    assert_eq!(row["device_id"].as_str().expect("id").len(), 16);
+    assert_eq!(cb.len(), 1);
+    assert_eq!(cb[0]["self"], false);
+    assert_eq!(
+        (&cb[0]["device_id"], &cb[0]["bundles"], &cb[0]["records"], &cb[0]["last_seq"]),
+        (&row["device_id"], &row["bundles"], &row["records"], &row["last_seq"])
+    );
+    // B now holds something of its own (a different file), pushes; A pulls
+    let drop = tmp.path().join("b-drop");
+    std::fs::create_dir_all(&drop).expect("mkdir");
+    std::fs::copy(
+        fixtures().join("synthetic").join("hrv_status.fit.bin"),
+        drop.join("hrv_status.fit"),
+    )
+    .expect("copy");
+    let lines = rig_b.send(14, "import.run", json!({"path": drop}));
+    assert!(lines.last().expect("response").get("result").is_some());
+    rig_b.send(15, "sync.run", json!({}));
+    rig_a.send(16, "sync.run", json!({}));
+    let (ca, cb) = (chains_of(&mut rig_a, 17), chains_of(&mut rig_b, 18));
+    for chains in [&ca, &cb] {
+        assert_eq!(chains.len(), 2);
+        assert!(chains[0]["device_id"].as_str() < chains[1]["device_id"].as_str());
+        assert_eq!(chains.iter().filter(|c| c["self"] == true).count(), 1);
+    }
+    let strip = |chains: &Vec<Value>| -> Vec<Value> {
+        chains.iter().map(|c| {
+            let mut c = c.clone();
+            c.as_object_mut().expect("obj").remove("self");
+            c
+        }).collect()
+    };
+    assert_eq!(strip(&ca), strip(&cb));
+    // each store's own row is the other's non-self row
+    let own = |chains: &Vec<Value>| chains.iter().find(|c| c["self"] == true).expect("own")["device_id"].clone();
+    assert_ne!(own(&ca), own(&cb));
 }
 
 #[test]
