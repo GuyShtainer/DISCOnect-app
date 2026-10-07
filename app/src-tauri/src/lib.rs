@@ -61,16 +61,16 @@ pub const ALLOWED_METHODS: &[&str] = &[
 ];
 
 /// The phone's list (12-F, S5): the four server-side methods are gone, because a phone serves nothing and the core
-/// refuses them anyway (`unsupported_transport`). `pair.cancel` stays until the joiner's own cancel replaces it.
-/// `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy. `key.lock` (row 5c) is too: the
-/// phone drops its master after five minutes away (see [`AwayClock`]); the app calls it in-process, the list says the
-/// page may too. `pair.join` and `pair.land` join it
-/// when those methods exist (12-F row 3).
+/// refuses them anyway (`unsupported_transport`). `pair.cancel` stays: on the phone it reaches only the joiner's cancel
+/// flag, never the relay's offer. `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy.
+/// `key.lock` (row 5c) is too: the phone drops its master after five minutes away (see [`AwayClock`]); the app calls it
+/// in-process, the list says the page may too. `pair.join` and `pair.land` (12-F row 3) are the phone as the pairing
+/// joiner; every other core refuses them after the shared prefix.
 /// `tests/egress_guards.rs` reads the first list above for the page's calls and this one for the four.
 #[cfg(target_os = "ios")]
 pub const ALLOWED_METHODS: &[&str] = &[
     "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "key.lock", "import.last",
-    "sync.status", "sync.run", "pair.cancel", "pair.forget",
+    "sync.status", "sync.run", "pair.cancel", "pair.forget", "pair.join", "pair.land",
 ];
 
 /// `Ok` when the page may call `method`; otherwise a fixed refusal that never echoes the method.

@@ -192,10 +192,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct Sidecar(Arc<Inner>);
 
-/// Timeout per method family. Imports and `sync.run` (a pull over the LAN can be long) run as long as they need; key operations may wait on a
+/// Timeout per method family. Imports, `sync.run` (a pull over the LAN can be long), `pair.offer` and `pair.join` (both wait for a person) run as long as they need; key operations may wait on a
 /// keychain prompt; everything else is a read.
 pub fn timeout_for(method: &str) -> Option<Duration> {
-    if method.starts_with("import.") || method == "sync.run" || method == "pair.offer" {
+    if method.starts_with("import.") || method == "sync.run" || method == "pair.offer" || method == "pair.join" {
         None
     } else if method.starts_with("key.") {
         Some(Duration::from_secs(60))
@@ -791,6 +791,8 @@ mod tests {
         assert_eq!(timeout_for("sync.run"), None);
         assert_eq!(timeout_for("sync.status"), Some(Duration::from_secs(30)));
         assert_eq!(timeout_for("pair.offer"), None);
+        assert_eq!(timeout_for("pair.join"), None, "a join waits for the Mac's owner, like an offer");
+        assert_eq!(timeout_for("pair.land"), Some(Duration::from_secs(30)));
         assert_eq!(timeout_for("pair.confirm"), Some(Duration::from_secs(30)));
     }
 
