@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/iOS-schema.json",
+  "identifier": "phone-scan",
+  "description": "The phone's pairing screen: the camera scan, its cancel and its two permission calls. iOS only; the Mac app never gets this capability.",
+  "windows": ["main"],
+  "platforms": ["iOS"],
+  "permissions": [
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "barcode-scanner:allow-check-permissions",
+    "barcode-scanner:allow-request-permissions"
+  ]
+}
