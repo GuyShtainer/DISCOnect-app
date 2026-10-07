@@ -3588,5 +3588,12 @@ void (async () => {
         button?.click();
       }, 800);
     }
+    // evidence runs: a real click on the Sync screen's own "Pair a device" button (the offer and the
+    // relay start from a click, as for a person; `--debug-listen` picks the address)
+    if (args.includes("--debug-pair-start")) {
+      const press = (label: string): void => { Array.from(document.querySelectorAll<HTMLElement>("a.button, button")).find((b) => b.textContent === label)?.click(); };
+      setTimeout(() => press("Pair a device"), 1500);
+      setTimeout(() => press("Start an offer"), 4000);
+    }
   }
 })();
