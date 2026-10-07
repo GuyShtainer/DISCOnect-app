@@ -155,6 +155,9 @@ fn join_with(
     on_sas: &mut dyn FnMut(&str),
     cancel: &AtomicBool,
 ) -> Result<Joined, PairError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(PairError::Cancelled);
+    }
     if wall_clock() > offer.exp {
         return Err(PairError::Expired);
     }
@@ -162,7 +165,7 @@ fn join_with(
     let route = format!("{}{PAIR}/{}", offer.url, hex::encode(offer.id));
     // the same 64 bytes again after a network error: the offerer answers the same key with the same 202
     let mut attempt = 1;
-    let (status, reply) = loop {
+    let sent = loop {
         let sent = agent
             .post(&route)
             .header("Content-Type", "application/octet-stream")
@@ -177,13 +180,16 @@ fn join_with(
                     return Err(PairError::Cancelled);
                 }
             }
-            other => break other?,
+            other => break other,
         }
     };
-    // a cancel that landed during the POST ends here, on every caller: no reply is opened, no code is shown
+    // a cancel that landed during the POST ends here, on every caller, before the reply is read (so a cancelled
+    // join never shows a code): the flag is read between requests, not inside one, and the caller's own check
+    // before this call (join.rs) is one layer; this one holds for every caller
     if cancel.load(Ordering::SeqCst) {
         return Err(PairError::Cancelled);
     }
+    let (status, reply) = sent?;
     match status {
         202 => {}
         410 => return Err(PairError::OfferEnded),
@@ -242,11 +248,13 @@ fn relay_file_text(url: &str) -> String {
 
 /// Refuse, before any request, when joining would clobber something: the store exists, its key file
 /// (`DISCONECT_KEYS` honoured) or `<keys>.next` exists, or `DISCONECT_KEYS` is set at all (one key file
-/// path would serve every store), or `relay_file` exists with content that is not a LAN relay. A LAN relay
-/// file beside no store and no key file is what a landing that failed before its commit point leaves behind
-/// (12-H (d)), or one that already names `url`: neither refuses a join, and the landing rewrites it.
+/// path would serve every store), or `relay_file` exists with content that is not a LAN relay, or it names
+/// another LAN relay while its folder holds any key file (`*.keys.json` or `*.keys.json.next`: another store's
+/// pairing lives here; a phone's `disconect pair` on a desktop store folder would otherwise rewrite it). A LAN
+/// relay file beside no key file at all is what a landing that failed before its commit point leaves behind
+/// (12-H (d)), and one that already names `url` is this pairing's: neither refuses a join, and the landing
+/// rewrites it.
 pub fn check_landing_site(db: &Path, relay_file: &Path, url: &str) -> Result<(), PairError> {
-    let _ = url; // a LAN relay file is rewritten by `land_with`, which keeps one that already names `url`
     if std::env::var_os(keys::KEYS_ENV).is_some_and(|v| !v.is_empty()) {
         return Err(PairError::Precondition("DISCONECT_KEYS is set; unset it so the key file lands beside the store"));
     }
@@ -260,10 +268,28 @@ pub fn check_landing_site(db: &Path, relay_file: &Path, url: &str) -> Result<(),
     if keys::next_path_for(&key_path).exists() {
         return Err(PairError::Precondition("a key rotation is in progress for this store"));
     }
-    if relay_file.exists() && !matches!(relay_cfg::read(relay_file), Some(RelayConfig::Lan(_))) {
-        return Err(PairError::Precondition("the relay file already exists with other content"));
+    if relay_file.exists() {
+        match relay_cfg::read(relay_file) {
+            Some(RelayConfig::Lan(named)) if named == url => {}
+            Some(RelayConfig::Lan(_)) => {
+                if relay_file.parent().is_some_and(folder_holds_a_key_file) {
+                    return Err(PairError::Precondition("the relay file already names another relay for a store in this folder"));
+                }
+            }
+            _ => return Err(PairError::Precondition("the relay file already exists with other content")),
+        }
     }
     Ok(())
+}
+
+/// Any `*.keys.json` or `*.keys.json.next` in `folder`: some store's pairing lives there. A read failure counts
+/// as none (the landing's own writes report their errors).
+fn folder_holds_a_key_file(folder: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(folder) else { return false };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        name.ends_with(keys::KEY_FILE_SUFFIX) || name.ends_with(&format!("{}{}", keys::KEY_FILE_SUFFIX, keys::NEXT_SUFFIX))
+    })
 }
 
 /// The steps of [`land`], in order; a hook sees each one after it completed.
@@ -379,9 +405,7 @@ const F_SETPROTECTIONCLASS: libc::c_int = 64;
 #[cfg(target_os = "ios")]
 const PROTECTION_CLASS_A: libc::c_int = 1;
 
-/// Best effort: set class A on an open file. The result is not an error of the write (the simulator reports no
-/// classes); the landing's read-back hook looks at the key file on the device and re-applies.
-/// Remove `.<name>.tmp*` siblings a crashed writer left (older than [`ORPHAN_AGE`]; a live writer's temp is
+/// Remove `.<name>.tmp<pid>` siblings a crashed writer left (older than [`ORPHAN_AGE`]; a live writer's temp is
 /// seconds old). Only that pattern, never `name` itself, never another name; every failure is ignored.
 fn sweep_orphans(parent: &Path, name: &str) {
     let prefix = format!(".{name}.tmp");
@@ -389,7 +413,9 @@ fn sweep_orphans(parent: &Path, name: &str) {
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if !file_name.starts_with(&prefix) || file_name.len() == prefix.len() {
+        // `.<name>.tmp<pid>`: digits after the prefix, nothing else (never `.key.json.tmp.bak` or a hand-made name)
+        let Some(suffix) = file_name.strip_prefix(&prefix) else { continue };
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
         let stale = entry
@@ -403,6 +429,9 @@ fn sweep_orphans(parent: &Path, name: &str) {
         }
     }
 }
+
+/// Best effort: set class A on an open file. The result is not an error of the write (the simulator reports no
+/// classes); the landing's read-back hook looks at the key file on the device and re-applies.
 
 #[cfg(target_os = "ios")]
 fn set_class_a(file: &std::fs::File) {
@@ -471,11 +500,13 @@ mod write_atomic_tests {
         let stale = dir.path().join(".key.json.tmp424242");
         let fresh = dir.path().join(".key.json.tmp777");
         let other = dir.path().join(".other.json.tmp1");
-        for path in [&stale, &fresh, &other] {
+        let hand_made = dir.path().join(".key.json.tmp.bak"); // not `<pid>`: digits only after the prefix
+        let bare = dir.path().join(".key.json.tmp");
+        for path in [&stale, &fresh, &other, &hand_made, &bare] {
             std::fs::write(path, b"leftover").expect("seed");
         }
         let two_minutes_back = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-        for path in [&stale, &other] {
+        for path in [&stale, &other, &hand_made, &bare] {
             std::fs::File::options().write(true).open(path).expect("open").set_modified(two_minutes_back).expect("mtime");
         }
         write_atomic(&target, b"new").expect("write");
@@ -483,5 +514,7 @@ mod write_atomic_tests {
         assert!(!stale.exists(), "the old orphan of this name is swept");
         assert!(fresh.exists(), "a fresh temp may be a live writer's");
         assert!(other.exists(), "another name's temp is not ours to sweep");
+        assert!(hand_made.exists(), "a suffix that is not digits is not ours to sweep");
+        assert!(bare.exists(), "the bare prefix is not a temp of ours");
     }
 }

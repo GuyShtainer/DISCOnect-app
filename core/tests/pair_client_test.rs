@@ -31,13 +31,42 @@ fn a_cancel_during_the_post_shows_no_code() {
     let (listener, url) = listener();
     let cancel = Arc::new(AtomicBool::new(false));
     let server_cancel = Arc::clone(&cancel);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let server_connections = Arc::clone(&connections);
     std::thread::spawn(move || {
+        listener.set_nonblocking(false).expect("blocking");
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf); // the request head and the 64-byte body, enough of it
+        server_connections.fetch_add(1, Ordering::SeqCst);
+        stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+        // the whole request: the head up to the blank line, then the 64-byte body it announces
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let body_at = loop {
+            let Ok(count) = stream.read(&mut buf) else { break None };
+            if count == 0 {
+                break None;
+            }
+            got.extend_from_slice(&buf[..count]);
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                break Some(end + 4);
+            }
+        };
+        let body_at = body_at.expect("a request head");
+        while got.len() < body_at + 64 {
+            let count = stream.read(&mut buf).expect("body");
+            assert!(count > 0, "the body ends early");
+            got.extend_from_slice(&buf[..count]);
+        }
+        assert_eq!(got.len(), body_at + 64, "exactly the 64-byte join body");
         server_cancel.store(true, Ordering::SeqCst); // the user cancelled while the request was in flight
         let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let _ = stream.flush();
+        // a second connection would be a retry after the cancel: count it
+        listener.set_nonblocking(true).expect("nonblocking");
+        std::thread::sleep(Duration::from_millis(300));
+        if listener.accept().is_ok() {
+            server_connections.fetch_add(1, Ordering::SeqCst);
+        }
     });
     let shown = AtomicUsize::new(0);
     let result = pair_client::join(&forged_offer(&url), &mut |_code| {
@@ -46,6 +75,21 @@ fn a_cancel_during_the_post_shows_no_code() {
     let Err(error) = result else { panic!("the join must not succeed") };
     assert!(matches!(error, PairError::Cancelled), "{error:?}");
     assert_eq!(shown.load(Ordering::SeqCst), 0, "no code after a cancel");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "one request, no retry and no payload poll after the cancel");
+}
+
+/// A cancel set before the join starts sends nothing at all.
+#[test]
+fn a_cancel_before_the_join_sends_no_request() {
+    let (listener, url) = listener();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let cancel = AtomicBool::new(true);
+    let result = pair_client::join(&forged_offer(&url), &mut |_code| panic!("no code"), &cancel);
+    let Err(error) = result else { panic!("the join must not succeed") };
+    assert!(matches!(error, PairError::Cancelled), "{error:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(listener.accept().is_err(), "no connection was opened");
 }
 
 /// (b) A hung offerer holds the POST; the cancel waits at most one request timeout, which is 10 s now, not 30.
@@ -53,12 +97,14 @@ fn a_cancel_during_the_post_shows_no_code() {
 fn a_cancel_behind_a_hung_request_waits_one_request_timeout_at_most() {
     assert!(REQUEST_TIMEOUT <= Duration::from_secs(10));
     let (listener, url) = listener();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let server_cancel = Arc::clone(&cancel);
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("accept");
+        server_cancel.store(true, Ordering::SeqCst); // cancelled once the (first and only) request is in flight
         std::thread::sleep(Duration::from_secs(40)); // never answers; the connection stays open
         drop(stream);
     });
-    let cancel = AtomicBool::new(true); // cancelled before the (first and only) request even returns
     let started = Instant::now();
     let result = pair_client::join(&forged_offer(&url), &mut |_code| panic!("no code"), &cancel);
     let elapsed = started.elapsed();
@@ -101,6 +147,18 @@ fn a_relay_file_leftover_does_not_refuse_the_next_join_and_a_matching_one_is_kep
     let relay_file = dir.path().join("relay.json");
     std::fs::write(&relay_file, "{\"lan\": \"http://10.0.0.2:4000\"}\n").expect("leftover"); // the relay file's own shape
     assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000").is_ok(), "a leftover is not a pairing");
+    // the same file beside another store's key file is that store's pairing (a desktop folder, say): refused
+    let sibling_key = dir.path().join("desktop.hbdb.keys.json");
+    std::fs::write(&sibling_key, b"{}").expect("sibling key");
+    let Err(error) = pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000") else { panic!("refused") };
+    assert!(matches!(error, PairError::Precondition(text) if text.contains("another relay")), "{error:?}");
+    assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.2:4000").is_ok(), "the url it names is this pairing's");
+    std::fs::remove_file(&sibling_key).expect("rm");
+    let sibling_next = dir.path().join("desktop.hbdb.keys.json.next");
+    std::fs::write(&sibling_next, b"{}").expect("sibling next");
+    assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000").is_err(), "a rotation in progress counts too");
+    std::fs::remove_file(&sibling_next).expect("rm");
+    assert!(pair_client::check_landing_site(&db, &relay_file, "http://10.0.0.9:4000").is_ok(), "alone again, a leftover");
     let joined = joined_for("http://10.0.0.2:4000"); // the same url the file already names
     let mut stop_after_relay = |step: LandStep| match step {
         LandStep::RelayFile => Err(PairError::Landing("killed".into())),
