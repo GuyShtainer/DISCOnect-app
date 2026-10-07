@@ -20,6 +20,7 @@ use serde_json::{Map, Value, json};
 use super::ReadError;
 use super::coverage::{self, has_table};
 use super::queries::{self, iso, json_number, number, text};
+use crate::clock::ClockOffsets;
 use crate::contract::Contract;
 use crate::model::Instant;
 use crate::redact::redact_text;
@@ -79,6 +80,17 @@ impl Late {
 
     fn finish(self) -> Result<(), ReadError> {
         self.0.map_or(Ok(()), Err)
+    }
+}
+
+/// A live sample's stored moment as the watch-local day (`ClockOffsets.local_date`); NULL stays null.
+fn live_day(row: &Row<'_>, index: usize, offsets: &ClockOffsets) -> Result<Json, ReadError> {
+    match row.get_ref(index)? {
+        ValueRef::Null => Ok(Json::Null),
+        cell => {
+            let moment = queries::parse_moment(text(cell)?)?;
+            Ok(wirejson::from_serde(&Value::from(queries::local_day(offsets, moment, false)?)))
+        }
     }
 }
 
@@ -396,16 +408,17 @@ pub fn data_health_ordered(
         conn.query_row("SELECT COUNT(*) FROM raw_records WHERE stream='json:live'", [], |row| row.get(0))?;
     let live = {
         let mut statement = conn.prepare(
-            "SELECT COUNT(*), MIN(substr(ts_utc,1,10)), MAX(substr(ts_utc,1,10)) FROM metric_samples \
-             WHERE source_scope='live'",
+            "SELECT COUNT(*), MIN(ts_utc), MAX(ts_utc) FROM metric_samples WHERE source_scope='live'",
         )?;
+        // BL-9: the days are the watch's local days, like every other day in the product
+        let offsets = queries::load_offsets(conn)?;
         let mut rows = statement.query([])?;
         let Some(row) = rows.next()? else { return Err(ReadError::Unexpected("TypeError")) };
         Json::object([
             ("records", Json::int(live_records)),
             ("samples", late.json(row, 0)?),
-            ("first_day", late.json(row, 1)?),
-            ("last_day", late.json(row, 2)?),
+            ("first_day", live_day(row, 1, &offsets)?),
+            ("last_day", live_day(row, 2, &offsets)?),
         ])
     };
     let activities: i64 =
@@ -651,5 +664,29 @@ mod tests {
             thin["window"],
             json!({"days": 1, "from": "2025-07-01", "to": "2025-07-02"})
         );
+    }
+
+    #[test]
+    fn the_live_days_are_the_watchs_local_days() {
+        let conn = store_with_daily(&[]);
+        let now = crate::time::parse_iso_utc("2025-07-02T09:30:00Z").expect("pin");
+        let live = |conn: &Connection| data_health(conn, contract(), 90, now).expect("health")["live"].clone();
+        assert_eq!(live(&conn), json!({"records": 0, "samples": 0, "first_day": null, "last_day": null}));
+        for ts in ["2025-06-15T02:30:00Z", "2025-06-21T12:00:00Z"] {
+            conn.execute(
+                "INSERT INTO metric_samples(metric, ts_utc, value, source_scope, raw_record_id) \
+                 VALUES('heart_rate', ?, 60, 'live', 1)",
+                [ts],
+            )
+            .expect("insert");
+        }
+        // no stored offset: assumed UTC
+        assert_eq!(live(&conn)["first_day"], "2025-06-15");
+        conn.execute("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-01T12:00:00Z', -18000)", [])
+            .expect("offset");
+        // -5 h: 02:30Z is the previous evening on the watch
+        let found = live(&conn);
+        assert_eq!((&found["first_day"], &found["last_day"]), (&json!("2025-06-14"), &json!("2025-06-21")));
+        assert_eq!(found["samples"], 2);
     }
 }
