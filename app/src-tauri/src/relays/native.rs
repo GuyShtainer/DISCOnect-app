@@ -4,7 +4,6 @@
 //! Tauri plugin), and a delegate class is the whole of what the picker needs.
 
 use std::cell::RefCell;
-use std::path::Path;
 use std::sync::{mpsc, Mutex};
 
 use objc2::rc::Retained;
@@ -76,8 +75,9 @@ fn scope_allows(started: bool, unscoped_ok: bool) -> bool {
 }
 
 /// A bookmark for a folder this app already owns (the debug seed and the tests); the picker's own bookmarks come from
-/// [`pick`].
-pub fn bookmark_for_path(path: &Path) -> Option<Vec<u8>> {
+/// [`pick`]. Not in a release: its only callers are `debug_seed` (debug builds) and the tests.
+#[cfg(any(debug_assertions, test))]
+pub fn bookmark_for_path(path: &std::path::Path) -> Option<Vec<u8>> {
     let text = path.to_str()?;
     let url = NSURL::fileURLWithPath(&NSString::from_str(text));
     bookmark_of(&url)
