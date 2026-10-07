@@ -2344,7 +2344,7 @@ async function screenKey(out: ParentNode): Promise<void> {
 // Copy is drawn through neutralText like the coach's text (no maker's name, plain score words). No screen here shows a
 // raw core code or the core's own message: a failure is one fixed sentence that says what to do.
 const PHONE_READ_FAIL = "Close and reopen the app. If this stays, your copy on the Mac is untouched.";
-const PHONE_SYNC_NOTE = "This phone talks only to your Mac, and only while both are on the same network. Nothing goes to any other server, and nothing is sent in the background.";
+const PHONE_SYNC_NOTE = "This phone syncs only with the relays listed in Settings: your Mac, while both are on the same network, and the folders you picked. Everything it sends is encrypted with your key, and nothing is sent in the background.";
 
 function pbanner(lead: string, text: string, error = false): HTMLElement {
   return bannerEl(neutralText(lead), neutralText(text), error);
