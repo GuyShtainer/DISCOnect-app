@@ -723,11 +723,12 @@ type SyncStatus = {
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
-type SiteRow = { id: string; kind: string; pushed: number; healed: number; behind: number; pulled: number; rejected: number; error: string | null };
-// The reason words a site row can carry, in plain words; anything else reads as a plain failure.
+type SiteRow = { id: string; kind: string; label?: string; pushed: number; healed: number; behind: number; pulled: number; rejected: number; error: string | null };
+// The site words both cores emit (RelayError::site_word and open_sites), in plain words; anything else reads as a plain failure.
 const SITE_WORDS: Record<string, string> = {
   unavailable: "Not reachable", same_relay: "Same as another relay", bad_url: "Bad address", unsupported_transport: "Needs the desktop core",
-  relay_unreachable: "Not reachable", relay_auth_failed: "Refused", relay_unverified: "Not verified", too_large: "Too large",
+  unreachable: "Not reachable", refused: "Refused", unverified: "Not verified", too_large: "Too large", bad_name: "Bad name",
+  missing: "Folder missing", no_permission: "No permission", io_error: "Read or write failed",
 };
 const SITE_KINDS: Record<string, string> = { folder: "Folder", lan: "Network" };
 type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
@@ -1150,9 +1151,12 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   const kv = el("dl", "kv");
   // sync.status answers on a store with no relay; only relay.addresses says not_found (review S1)
   const noRelay = addrErr?.code === "not_found";
-  kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : addrErr?.code === "bad_params" ? "another device's relay" : "folder relay"));
+  // bad_params from relay.addresses: a relay list with no serving folder (this Mac is a joiner until one is marked --serve)
+  const noServe = addrErr?.code === "bad_params";
+  kv.append(el("dt", "", "Kind"), el("dd", "", noRelay ? "none set" : noServe ? "relays set, none serves" : "folder relay"));
   card.append(kv);
   if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync relay add <folder> --serve"));
+  if (noServe) card.append(el("p", "caption muted", "To serve your other devices from this Mac, mark one folder: disconect sync relay add <folder> --serve"));
   if (statusErr) out.append(bannerEl(coreWords(statusErr).lead, coreWords(statusErr).text, true));
   if (status && addrs) {
     const sw = el("label", "switch");
@@ -1228,7 +1232,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       if (s.behind > 0) parts.push(`${s.behind} still to send`);
       if (s.rejected > 0) parts.push(`refused ${s.rejected}`);
       const word = s.error ? (SITE_WORDS[s.error] ?? "Failed") : null;
-      kv3.append(el("dt", "", `${SITE_KINDS[s.kind] ?? "Relay"} · ${s.id}`), el("dd", word ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
+      kv3.append(el("dt", "", `${s.label || (SITE_KINDS[s.kind] ?? "Relay")} · ${s.id}`), el("dd", word ? "value-small warn" : "value-small", word ? `${word} · ${parts.join(" · ")}` : parts.join(" · ")));
     }
     sites.append(kv3);
     sites.append(el("p", "caption muted", "Add or remove a relay with the command line: disconect sync relay add <folder or address>, disconect sync relay remove <id>."));
