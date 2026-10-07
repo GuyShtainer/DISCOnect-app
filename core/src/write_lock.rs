@@ -39,20 +39,33 @@ fn busy_message(holder: &Option<Value>) -> String {
     }
 }
 
-/// The store's path with symlinks resolved, when it exists: a symlinked store *name* then gets the same lock
-/// file as the name it points to (7b-10 review N6; the Python core resolves the same way). A store that does not
-/// exist yet (init, a landing) is taken as spelled; a symlinked folder needs no resolving (both spellings open
-/// the one lock file); a hard link is another name for the same inode and cannot be resolved by path.
+/// The store's path with symlinks resolved: a symlinked store *name* then gets the same lock file as the name it
+/// points to (7b-10 review N6; the Python core resolves the same way). A dangling link is followed too (SQLite
+/// follows it and creates the target, so the lock must already sit beside the target); a store that does not
+/// exist yet and is no link (init, a landing) is taken as spelled; a symlinked folder needs no resolving (both
+/// spellings open the one lock file); a hard link is another name for the same inode and cannot be resolved.
 fn resolved(db_path: &Path) -> PathBuf {
-    std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf())
+    if let Ok(real) = std::fs::canonicalize(db_path) {
+        return real;
+    }
+    // the target is missing: follow the links by hand (bounded), then canonicalize what exists of the parent
+    let mut path = db_path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&path) else { break };
+        path = if target.is_absolute() { target } else { path.parent().map_or(target.clone(), |p| p.join(target)) };
+    }
+    match (path.parent().filter(|p| !p.as_os_str().is_empty()), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent).map_or(path.clone(), |p| p.join(name)),
+        _ => path,
+    }
 }
 
 pub fn lock_path_for(db_path: &Path) -> PathBuf {
     sibling_with_suffix(&resolved(db_path), ".write-lock")
 }
 
-fn holder_path_for(db_path: &Path) -> PathBuf {
-    sibling_with_suffix(&resolved(db_path), ".write-lock.holder")
+fn holder_path_for(resolved_db: &Path) -> PathBuf {
+    sibling_with_suffix(resolved_db, ".write-lock.holder")
 }
 
 fn read_holder(path: &Path) -> Option<Value> {
@@ -68,8 +81,9 @@ pub struct WriteLock {
 
 /// Take the exclusive write lock for `db_path`, waiting up to `timeout`.
 pub fn acquire(db_path: &Path, purpose: &str, timeout: Duration) -> Result<WriteLock, LockError> {
-    let lock_path = lock_path_for(db_path);
-    let holder_path = holder_path_for(db_path);
+    let db_path = resolved(db_path);
+    let lock_path = sibling_with_suffix(&db_path, ".write-lock");
+    let holder_path = holder_path_for(&db_path);
     if let Some(moved) = home::moved_legacy_home(&lock_path) {
         return Err(moved.into());
     }

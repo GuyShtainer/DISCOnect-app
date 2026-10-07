@@ -23,10 +23,12 @@
 //! refused (the URL becomes the joiner's relay).
 //! `disconect-core --db <new db> [--relay-file <path>] [--i-saw-paired] pair join` reads the offer text from stdin (never argv),
 //! refuses before any request when the store, its key file, `<keys>.next`, `DISCONECT_KEYS` or a relay file of another
-//! store are in the way, shows its code on stderr, and once the offerer released asks on stderr whether the other
-//! device said Paired and reads the answer from stdin (the line after the offer; `y`/`yes` lands, anything else or
-//! EOF drops the pairing with "Not paired", exit 1, nothing written; `--i-saw-paired` answers yes for scripts — the
-//! phone's `pair.land` step, 12-G N12); then it writes the relay file (`relay.json` beside the db by default, where the app and the CLI read it), the
+//! store are in the way, shows its code on stderr, and once the offerer released asks on the terminal (`/dev/tty`
+//! when the offer came on a pipe; stdin when stdin is the terminal, its stray input flushed first) whether the other
+//! device says the pairing is done, naming the relay host: `y`/`yes` lands, a blank line asks again, anything
+//! else, EOF, no terminal at all or the offer's expiry drops the pairing with "Not paired; nothing was written"
+//! (exit 1); `--i-saw-paired` answers yes for scripts; `DISCONECT_ASK_ON_STDIN=1` reads the answer from stdin
+//! for test harnesses — the phone's `pair.land` step, 12-G N12. Then it writes the relay file (`relay.json` beside the db by default, where the app and the CLI read it), the
 //! key file (atomically), the encrypted store, and pulls; stdout is `{"paired": true, "pulled": {...}}`.
 //!
 //! `reparse` replays decoding over the retained raw records (`sources::reparse_all`, the Python `reparse`);
@@ -586,7 +588,7 @@ fn offer_session(handle: &PairHandle, master: &[u8; 32], key_file_bytes: &[u8]) 
 /// `pair join`: the offer text comes from stdin, never argv.
 fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
     if args.remember || args.sync_action.is_some() || args.import_path.is_some() || args.relay.is_some() || args.listen.is_some() {
-        return Err((EXIT_USAGE, "usage: pair join takes --db <new store>, --relay-file <path> and --i-saw-paired; the offer text comes on stdin".into()));
+        return Err((EXIT_USAGE, "usage: pair join takes --db <new store> [--relay-file <path>] [--i-saw-paired]; the offer text comes on stdin".into()));
     }
     let db = db_of(args)?;
     let mut text = Zeroizing::new(String::new());
@@ -605,8 +607,8 @@ fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
         &cancel,
     )
     .map_err(|e| pair_failure(&e))?;
-    if !args.i_saw_paired && !confirmed_on_stdin() {
-        return Err((1, "Not paired. Cancel on the other device too.".into()));
+    if !args.i_saw_paired && !confirmed(&offer) {
+        return Err((1, "Not paired; nothing was written. If the other device says the pairing is done, start a new offer there; if it never showed a device answering, cancel its offer.".into()));
     }
     let pulled = pair_client::land(&joined, db, &relay_file).map_err(|e| pair_failure(&e))?;
     println!("{}", json!({"paired": true, "pulled": pull_json(&pulled)}));
@@ -614,17 +616,88 @@ fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
 }
 
 /// The human check the phone has as `pair.land` (12-F): the offerer released, and the landing waits for the user
-/// to say the other device showed Paired. Pasted text is exactly a planted offer's channel, and a planted offerer
-/// releases a master of its own, so without this step the CLI adopted it (12-G N12). The answer is the line after
-/// the offer on stdin: `y`/`yes` lands; anything else, EOF or a read error is a no (nothing is written).
-fn confirmed_on_stdin() -> bool {
-    eprintln!("Did the other device say Paired? Type y to keep this pairing, anything else to drop it [y/N]");
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
+/// to say the other device shows the pairing as done. Pasted text is exactly a planted offer's channel, and a
+/// planted offerer releases a master of its own, so without this step the CLI adopted it (12-G N12). The question
+/// names the relay host (what the store would trust) and goes to the terminal: stdin when stdin is a terminal
+/// (stray input typed during the wait is flushed first), else `/dev/tty` (the offer came on a pipe); with no
+/// terminal the answer is no. `y`/`yes` lands; a blank line asks again; anything else, EOF, a read error or the
+/// offer's expiry (the master would otherwise sit in memory for ever) is a no. `DISCONECT_ASK_ON_STDIN=1` reads
+/// from stdin whatever it is (test harnesses).
+fn confirmed(offer: &disconect_core::pair::Offer) -> bool {
+    use std::io::{BufRead, IsTerminal, Write};
+    let on_stdin = std::env::var_os("DISCONECT_ASK_ON_STDIN").is_some_and(|v| v == "1");
+    let (mut out, input): (Box<dyn Write>, Box<dyn BufRead + Send>) = if on_stdin || std::io::stdin().is_terminal() {
+        if !on_stdin {
+            flush_terminal_input(0);
+        }
+        (Box::new(std::io::stderr()), Box::new(std::io::BufReader::new(std::io::stdin())))
+    } else {
+        match (std::fs::OpenOptions::new().write(true).open("/dev/tty"), std::fs::File::open("/dev/tty")) {
+            (Ok(writer), Ok(reader)) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    flush_terminal_input(reader.as_raw_fd());
+                }
+                (Box::new(writer), Box::new(std::io::BufReader::new(reader)))
+            }
+            _ => {
+                eprintln!("No terminal to ask on: the offer came on a pipe and /dev/tty is not open. Pass --i-saw-paired once the other device shows the pairing as done.");
+                return false;
+            }
+        }
+    };
+    let host = offer.url.trim_start_matches("http://").to_string();
+    let (sender, lines) = std::sync::mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut input = input;
+        loop {
+            let mut line = String::new();
+            match input.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = sender.send(None);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(Some(line)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    loop {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let left = std::time::Duration::from_secs(offer.exp.saturating_sub(now));
+        if left.is_zero() {
+            return false;
+        }
+        let _ = writeln!(out, "This store would use the relay at {host}.");
+        let _ = writeln!(out, "Did the other device say the pairing is done? Type y to keep this pairing, anything else to drop it [y/N]");
+        let _ = out.flush();
+        match lines.recv_timeout(left) {
+            Ok(Some(line)) => match line.trim().to_ascii_lowercase().as_str() {
+                "" => continue,
+                "y" | "yes" => return true,
+                _ => return false,
+            },
+            Ok(None) | Err(_) => return false,
+        }
     }
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
+
+/// Drop whatever was typed on the terminal before the question (an extra Enter after the paste, digits typed
+/// into the wrong window during the wait), so it cannot be read as the answer.
+#[cfg(unix)]
+fn flush_terminal_input(fd: i32) {
+    // SAFETY: tcflush on a file descriptor this process holds; a failure (not a terminal) is ignored
+    unsafe {
+        libc::tcflush(fd, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn flush_terminal_input(_fd: i32) {}
 
 /// The store a command works on: `--db` is required for everything except `serve`.
 fn db_of(args: &Args) -> Result<&PathBuf, (u8, String)> {

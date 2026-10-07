@@ -94,7 +94,15 @@ fn a_symlinked_store_name_shares_the_write_lock() {
     drop(held);
     assert!(write_lock::acquire(&link, "after", Duration::from_millis(100)).is_ok());
     let missing = dir.path().join("not-yet.hbdb");
-    assert_eq!(write_lock::lock_path_for(&missing), missing.with_file_name("not-yet.hbdb.write-lock"), "as spelled until it exists");
+    let real_dir = std::fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(write_lock::lock_path_for(&missing), real_dir.join("not-yet.hbdb.write-lock"), "as spelled (folder resolved) until it exists");
+    // a dangling link: SQLite would create the target, so the lock already sits beside the target
+    let dangling = dir.path().join("dangling.hbdb");
+    std::os::unix::fs::symlink(dir.path().join("target.hbdb"), &dangling).unwrap();
+    assert_eq!(write_lock::lock_path_for(&dangling), real_dir.join("target.hbdb.write-lock"));
+    let held = write_lock::acquire(&dangling, "via the link", Duration::from_secs(1)).unwrap();
+    assert!(matches!(write_lock::acquire(&dir.path().join("target.hbdb"), "via the target", Duration::from_millis(100)), Err(LockError::Busy { .. })));
+    drop(held);
 }
 
 #[test]

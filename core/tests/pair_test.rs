@@ -801,6 +801,11 @@ fn line_with(reader: &mut BufReader<std::process::ChildStderr>, needle: &str) ->
     }
 }
 
+/// `host:port` of an offer text's URL (what the human check names).
+fn offer_host(offer_text: &str) -> String {
+    Offer::parse(offer_text).expect("offer").url.trim_start_matches("http://").to_string()
+}
+
 fn code_in(line: &str) -> String {
     line.split(':').nth(1).expect("a code").trim().chars().take(6).collect()
 }
@@ -818,6 +823,7 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     // the default relay file is the one the app and the CLI read: relay.json in the db's folder
     let relay_file = tmp.path().join("joiner").join("relay.json");
     let mut joiner = cli(&joiner_home)
+        .env("DISCONECT_ASK_ON_STDIN", "1") // the harness answers the human check on the pipe
         .arg("--db").arg(&joined_db)
         .args(["pair", "join"])
         .stdin(Stdio::piped())
@@ -837,9 +843,13 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "released");
     line_with(&mut offer_err, "Pairing done");
-    // the human check (12-G N12): nothing lands until the user says the other device showed Paired
-    line_with(&mut join_err, "Did the other device say Paired");
+    // the human check (12-G N12): nothing lands until the user says the other device shows the pairing as done;
+    // the question names the relay host; a blank line asks again
+    assert!(line_with(&mut join_err, "This store would use the relay at ").contains(&offer_host(&offer)));
+    line_with(&mut join_err, "Did the other device say the pairing is done");
     assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists() && !relay_file.exists(), "nothing before the answer");
+    join_in.write_all(b"\n").expect("a stray Enter");
+    line_with(&mut join_err, "Did the other device say the pairing is done");
     join_in.write_all(b"y\n").expect("answer");
     drop(join_in);
 
@@ -877,6 +887,7 @@ fn a_joiner_that_is_not_told_paired_writes_nothing() {
     let (mut offerer, mut offer_err, offer) = start_offer_process(tmp.path(), &db);
     let joined_db = tmp.path().join("joiner").join("j.hbdb");
     let mut joiner = cli(tmp.path())
+        .env("DISCONECT_ASK_ON_STDIN", "1")
         .arg("--db").arg(&joined_db)
         .args(["pair", "join"])
         .stdin(Stdio::piped())
@@ -891,18 +902,62 @@ fn a_joiner_that_is_not_told_paired_writes_nothing() {
     lines_until(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "Pairing done");
-    line_with(&mut join_err, "Did the other device say Paired");
+    line_with(&mut join_err, "Did the other device say the pairing is done");
     join_in.write_all(b"n\n").expect("answer");
     drop(join_in);
     let mut rest = String::new();
     join_err.read_to_string(&mut rest).expect("stderr");
     let out = joiner.wait_with_output().expect("join output");
     assert_eq!(out.status.code(), Some(1), "{rest}");
-    assert!(rest.contains("Not paired. Cancel on the other device too."), "{rest}");
+    assert!(rest.contains("Not paired; nothing was written."), "{rest}");
     assert!(out.stdout.is_empty(), "no summary");
     let site = joined_db.parent().expect("parent");
     assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists());
     assert!(!site.join("relay.json").exists() && !site.exists(), "not even the directory");
+    assert!(offerer.0.try_wait().expect("try_wait").is_none(), "the offerer keeps serving; it was never told");
+    drop(offerer);
+}
+
+/// With the offer on a pipe and no terminal to ask on, the answer is no: nothing lands, and stderr says what to pass.
+#[cfg(unix)]
+#[test]
+fn a_joiner_with_no_terminal_to_ask_on_writes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (_dir, db) = encrypted_copy();
+    let (mut offerer, mut offer_err, offer) = start_offer_process(tmp.path(), &db);
+    let joined_db = tmp.path().join("joiner").join("j.hbdb");
+    // a new session (setsid) has no controlling terminal, so /dev/tty cannot be opened; stdin is the pipe
+    let mut command = cli(tmp.path());
+    command.env_remove("DISCONECT_ASK_ON_STDIN").arg("--db").arg(&joined_db).args(["pair", "join"]);
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches nothing shared with the parent
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let mut joiner = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn join in a new session");
+    joiner.stdin.take().expect("stdin").write_all(format!("{offer}\ny\n").as_bytes()).expect("offer and a y on the pipe");
+    let mut join_err = BufReader::new(joiner.stderr.take().expect("stderr"));
+    let code = code_in(&line_with(&mut join_err, "Code on this device"));
+    lines_until(&mut offer_err, "Type the code shown on the other device");
+    offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
+    line_with(&mut offer_err, "Pairing done");
+    let mut rest = String::new();
+    join_err.read_to_string(&mut rest).expect("stderr");
+    let out = joiner.wait_with_output().expect("join output");
+    assert_eq!(out.status.code(), Some(1), "{rest}");
+    assert!(rest.contains("No terminal to ask on") && rest.contains("--i-saw-paired"), "{rest}");
+    assert!(!rest.contains("Did the other device say"), "the pipe's y is never read as the answer: {rest}");
+    assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists());
     drop(offerer);
 }
 
@@ -930,7 +985,7 @@ fn a_joiner_told_paired_on_the_command_line_lands_without_a_prompt() {
     let out = joiner.wait_with_output().expect("join output");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
-    assert!(!err.contains("Did the other device say Paired"), "no prompt: {err}");
+    assert!(!err.contains("Did the other device say"), "no prompt: {err}");
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON line");
     assert_eq!(value["paired"], true);
     assert!(joined_db.exists() && keys::key_path_for(&joined_db).exists());
