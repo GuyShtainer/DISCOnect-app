@@ -49,8 +49,8 @@ fn non_empty_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Exclusive upper bound of a reading's `t` (unix seconds, 10000-01-01Z): a millisecond stamp falls outside.
-const T_LIMIT: i64 = 253_402_300_800;
+/// Exclusive upper bound of a reading's `t` (unix seconds, 9999-01-01Z): a millisecond stamp falls outside, and a year of headroom keeps every local-day conversion inside the calendar whatever the clock offset.
+const T_LIMIT: i64 = 253_370_764_800;
 
 /// A number (never a bool) in `0 <= t < T_LIMIT`.
 fn is_time(value: &Value) -> bool {

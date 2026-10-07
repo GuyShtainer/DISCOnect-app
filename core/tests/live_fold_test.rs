@@ -11,6 +11,7 @@ use chrono::{TimeZone, Utc};
 use disconect_core::contract::Contract;
 use disconect_core::keys::PassphraseSource;
 use disconect_core::read::health::data_health;
+use disconect_core::read::queries::live_day;
 use disconect_core::read::insight::{FactsQuery, period_facts};
 use disconect_core::wirejson::PyStr;
 use disconect_core::sources::{import_path, reparse_all};
@@ -241,4 +242,29 @@ fn health_keeps_live_apart() {
         })
         .collect();
     assert_eq!(rows, vec![("heart_rate".to_string(), "live".to_string(), 1)]);
+}
+
+#[test]
+fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
+    // T_LIMIT = 9999-01-01T00:00:00Z (the number the Python twin derives); the last reading is 9998-12-31T23:59:59Z
+    const T_LIMIT: i64 = 253_370_764_800;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("late");
+    fs::create_dir_all(&folder).expect("mkdir");
+    write_session(&folder.join("live-late.jsonl"), &[json!({"t": T_LIMIT - 1, "metric": "heart_rate", "value": 61})]);
+    let store = open(&dir.path().join("s.db"));
+    import_path(store.conn(), &folder, None, None).expect("import");
+    store
+        .conn()
+        .execute("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-01T12:00:00Z', 50400)", [])
+        .expect("offset");
+    let contract = Contract::get().expect("contract");
+    let day = live_day(store.conn(), contract, &PyStr::from_text("9999-01-01")).expect("data.live");
+    assert_eq!(day["sessions"][0]["start_utc"], json!("9998-12-31T23:59:59Z"));
+    assert_eq!(day["sessions"][0]["end_local"], json!("9999-01-01T13:59"));
+    let heart = day["metrics"].as_array().unwrap().iter().find(|m| m["metric"] == "heart_rate").unwrap();
+    assert_eq!(heart["minutes"], json!(1));
+    let now = Utc.with_ymd_and_hms(2025, 6, 16, 12, 0, 0).unwrap();
+    let report = data_health(store.conn(), contract, 30, now).expect("health");
+    assert_eq!(report["live"]["last_day"], json!("9999-01-01"));
 }

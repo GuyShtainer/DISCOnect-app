@@ -191,10 +191,10 @@ fn detection_rule() {
 #[test]
 fn t_is_bounded_so_a_millisecond_stamp_is_not_a_live_file() {
     let line = |t: &str| format!(r#"{{"t": {t}, "metric": "steps", "value": 1}}"#);
-    for ok in ["0", "0.0", "253402300799", "1750000000.5"] {
+    for ok in ["0", "0.0", "253370764799", "253370764799.5", "1750000000.5"] {
         assert_eq!(parse_live_file(line(ok).as_bytes()).map(|r| r.len()), Some(1), "{ok}");
     }
-    for bad in ["253402300800", "253402300800.0", "1750000000123", "-1", "-0.5", "1e300"] {
+    for bad in ["253370764800", "253370764800.0", "253402300800", "253402300800.0", "1750000000123", "-1", "-0.5", "1e300"] {
         assert!(parse_live_file(line(bad).as_bytes()).is_none(), "{bad}");
     }
 }
