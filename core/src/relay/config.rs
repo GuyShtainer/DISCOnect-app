@@ -327,9 +327,20 @@ mod tests {
             r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": NaN}]}"#,
             r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": -Infinity}]}"#,
             r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": 1e400}]}"#,
+            &format!(r#"{{"relays": [{{"id": "ab", "kind": "folder", "path": "/a", "x": 1{}}}]}}"#, "0".repeat(400)),
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "\ud800"}], "relays": [{"id": "cd", "kind": "folder", "path": "/b"}]}"#,
+            &format!(r#"{{"relays": [{{"id": "ab", "kind": "folder", "path": "/a", "x": {}{}}}]}}"#, "[".repeat(126), "]".repeat(126)),
         ] {
             std::fs::write(&path, bad).expect("write");
             assert_eq!(read_list(&path), None, "{bad}");
+        }
+        // an extra key serde can hold is no reason to refuse (u64::MAX, 1e300); nesting 127 deep in all (3 + 124) still reads
+        for ok in [
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": 18446744073709551615, "y": 1e300}]}"#.to_string(),
+            format!(r#"{{"relays": [{{"id": "ab", "kind": "folder", "path": "/a", "x": {}{}}}]}}"#, "[".repeat(124), "]".repeat(124)),
+        ] {
+            std::fs::write(&path, &ok).expect("write");
+            assert_eq!(read_list(&path), Some(vec![entry("ab", RelayConfig::Folder("/a".into()), "", false)]), "{ok}");
         }
     }
 
