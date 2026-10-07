@@ -1098,6 +1098,15 @@ fn privacy_walk(lines: &[Value], sas: &str) {
     let mut walked = 0;
     for line in lines {
         let mut copy = line.clone();
+        // BL-7: `sync.status.relay_list[N].path` is the one other place a folder may ride the wire (only that method
+        // answers a `relay_list`); every other `/relay` text is still refused
+        if let Some(rows) = copy.get_mut("result").and_then(|r| r.get_mut("relay_list")).and_then(Value::as_array_mut) {
+            for row in rows {
+                if let Some(object) = row.as_object_mut() {
+                    object.remove("path");
+                }
+            }
+        }
         for path in ALLOWED_PATHS {
             let parts: Vec<&str> = path.split('.').collect();
             strip(&mut copy, &parts);
