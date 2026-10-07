@@ -76,6 +76,27 @@ fn rotation_in_progress_is_refused_never_promoted() {
     assert!(next.exists() && key.exists(), "nothing promoted or removed");
 }
 
+/// 7b-10 review N6: a second name for the store (a symlink) must meet the same lock, not a lock of its own.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_store_name_shares_the_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("real.hbdb");
+    std::fs::write(&db, b"").unwrap();
+    let link = dir.path().join("link.hbdb");
+    std::os::unix::fs::symlink(&db, &link).unwrap();
+    assert_eq!(write_lock::lock_path_for(&link), write_lock::lock_path_for(&db));
+    let held = write_lock::acquire(&db, "first", Duration::from_secs(1)).unwrap();
+    match write_lock::acquire(&link, "second", Duration::from_millis(100)) {
+        Err(LockError::Busy { holder }) => assert_eq!(holder.unwrap()["purpose"], "first"),
+        other => panic!("the link must meet the real store's lock: {other:?}"),
+    }
+    drop(held);
+    assert!(write_lock::acquire(&link, "after", Duration::from_millis(100)).is_ok());
+    let missing = dir.path().join("not-yet.hbdb");
+    assert_eq!(write_lock::lock_path_for(&missing), missing.with_file_name("not-yet.hbdb.write-lock"), "as spelled until it exists");
+}
+
 #[test]
 fn busy_write_lock_reports_holder() {
     let dir = tempfile::tempdir().unwrap();

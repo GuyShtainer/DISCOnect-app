@@ -39,12 +39,20 @@ fn busy_message(holder: &Option<Value>) -> String {
     }
 }
 
+/// The store's path with symlinks resolved, when it exists: a symlinked store *name* then gets the same lock
+/// file as the name it points to (7b-10 review N6; the Python core resolves the same way). A store that does not
+/// exist yet (init, a landing) is taken as spelled; a symlinked folder needs no resolving (both spellings open
+/// the one lock file); a hard link is another name for the same inode and cannot be resolved by path.
+fn resolved(db_path: &Path) -> PathBuf {
+    std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf())
+}
+
 pub fn lock_path_for(db_path: &Path) -> PathBuf {
-    sibling_with_suffix(db_path, ".write-lock")
+    sibling_with_suffix(&resolved(db_path), ".write-lock")
 }
 
 fn holder_path_for(db_path: &Path) -> PathBuf {
-    sibling_with_suffix(db_path, ".write-lock.holder")
+    sibling_with_suffix(&resolved(db_path), ".write-lock.holder")
 }
 
 fn read_holder(path: &Path) -> Option<Value> {
