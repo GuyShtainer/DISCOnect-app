@@ -499,10 +499,8 @@ pub fn metric_calendar(
         first_day,
         last_day,
     )?;
-    let statuses = coverage::day_statuses(conn, contract, &metric_text, &scope_text, first_day, last_day)?;
-    let completeness = coverage::day_completeness(conn, contract, &metric_text, &scope_text, first_day, last_day)?;
     let mut days = Vec::new();
-    for ((day, status), (_, share)) in statuses.into_iter().zip(completeness) {
+    for (day, status, share) in coverage::calendar(conn, contract, &metric_text, &scope_text, first_day, last_day)? {
         let value = values.remove(&day).unwrap_or(Ok(Value::Null))?;
         days.push(json!({"day": day, "value": value, "status": status, "completeness": share}));
     }

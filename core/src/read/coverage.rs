@@ -402,6 +402,7 @@ struct Analysis {
     undatable: i64,
     unattributed: i64,
     refinements: bool,
+    offsets: ClockOffsets,
 }
 
 /// Declared streams per (metric, scope), plus any observed stream the declaration lacks.
@@ -478,6 +479,7 @@ fn analyse(
         undatable,
         unattributed,
         refinements,
+        offsets,
     })
 }
 
@@ -731,9 +733,73 @@ fn worn_seconds(
     Ok(seconds)
 }
 
-/// `day_completeness`: per local day, oldest first, the share (0-100) of the covered seconds a reading
-/// accounts for (the gap to the next reading when at most `WORN_GAP_S`, else its minute); None for a pair
-/// that is not per-minute, for a session scope, and for a day no file of the pair's streams spans.
+/// Per window position, the completeness share of one (metric, scope) from an analysis's offsets and stream
+/// map (`COMPLETENESS_CONVENTION`): None for a pair that is not per-minute, for a session scope, and for a day
+/// no file of the pair's streams spans.
+fn completeness_from(
+    conn: &Connection,
+    contract: &Contract,
+    metric: &str,
+    scope: &str,
+    window: &Window,
+    offsets: &ClockOffsets,
+    streams_for: &Declared,
+) -> Result<Vec<Option<i64>>, ReadError> {
+    let session_scope = contract.session_streams_for.iter().any(|entry| entry.source_scope == scope);
+    if !contract.per_minute_metrics.iter().any(|m| m == metric) || session_scope {
+        return Ok(vec![None; window.days]);
+    }
+    let streams = streams_for
+        .get(&(metric.to_string(), scope.to_string()))
+        .cloned()
+        .unwrap_or_default();
+    let bounds = day_bounds(window, offsets)?;
+    let refinements = has_table(conn, "export_ranges")?;
+    let covered = covered_seconds(conn, window, &streams, &contract.session_streams, &bounds, refinements)?;
+    let worn = worn_seconds(conn, metric, scope, window, &bounds)?;
+    Ok((0..window.days)
+        .map(|position| (covered[position] > 0).then(|| (100 * worn[position] / covered[position]).min(100)))
+        .collect())
+}
+
+/// One `calendar` row: the local day, its coverage status, its completeness share.
+pub type CalendarDay = (String, &'static str, Option<i64>);
+
+/// `(day, status, completeness)` for every local day from `first_day` to `last_day`, oldest first, in one
+/// coverage pass: the status as `day_statuses` gives it, the completeness as `day_completeness` gives it
+/// (7b-13: `metric_calendar` used to pay for the store-wide stream map twice).
+pub fn calendar(
+    conn: &Connection,
+    contract: &Contract,
+    metric: &str,
+    scope: &str,
+    first_day: &str,
+    last_day: &str,
+) -> Result<Vec<CalendarDay>, ReadError> {
+    let analysis = analyse(conn, contract, first_day, last_day)?;
+    let statuses = analysis
+        .statuses
+        .get(&(metric.to_string(), scope.to_string()))
+        .filter(|found| !found.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![NOT_COVERED; analysis.window.days]);
+    let shares = completeness_from(
+        conn,
+        contract,
+        metric,
+        scope,
+        &analysis.window,
+        &analysis.offsets,
+        &analysis.streams_for,
+    )?;
+    (0..analysis.window.days)
+        .map(|position| Ok((analysis.window.day(position)?, statuses[position], shares[position])))
+        .collect()
+}
+
+/// Per local day, the share (0-100) of the covered seconds a reading accounts for (the gap to the next reading
+/// when at most `WORN_GAP_S`, else its minute; `COMPLETENESS_CONVENTION`); None for a pair that is not
+/// per-minute, for a session scope, and for a day no file of the pair's streams spans. A projection of `calendar`.
 pub fn day_completeness(
     conn: &Connection,
     contract: &Contract,
@@ -742,29 +808,9 @@ pub fn day_completeness(
     first_day: &str,
     last_day: &str,
 ) -> Result<Vec<(String, Option<i64>)>, ReadError> {
-    let window = Window::new(first_day, last_day)?;
-    let days = (0..window.days).map(|position| window.day(position)).collect::<Result<Vec<_>, _>>()?;
-    let session_scope = contract.session_streams_for.iter().any(|entry| entry.source_scope == scope);
-    if !contract.per_minute_metrics.iter().any(|m| m == metric) || session_scope {
-        return Ok(days.into_iter().map(|day| (day, None)).collect());
-    }
-    let offsets = load_offsets(conn)?;
-    let (streams_for, _drift) = declared_and_drift(conn, contract)?;
-    let streams = streams_for
-        .get(&(metric.to_string(), scope.to_string()))
-        .cloned()
-        .unwrap_or_default();
-    let bounds = day_bounds(&window, &offsets)?;
-    let refinements = has_table(conn, "export_ranges")?;
-    let covered = covered_seconds(conn, &window, &streams, &contract.session_streams, &bounds, refinements)?;
-    let worn = worn_seconds(conn, metric, scope, &window, &bounds)?;
-    Ok(days
+    Ok(calendar(conn, contract, metric, scope, first_day, last_day)?
         .into_iter()
-        .enumerate()
-        .map(|(position, day)| {
-            let share = (covered[position] > 0).then(|| (100 * worn[position] / covered[position]).min(100));
-            (day, share)
-        })
+        .map(|(day, _status, share)| (day, share))
         .collect())
 }
 

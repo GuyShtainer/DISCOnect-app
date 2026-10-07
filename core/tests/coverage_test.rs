@@ -284,3 +284,20 @@ fn completeness_day_bounds_never_step_back() {
     let absurd = coverage::day_completeness(conn, Contract::get().expect("contract"), "heart_rate", "device", "2025-06-01", "2025-06-04");
     assert!(matches!(absurd, Err(disconect_core::read::ReadError::Overflow)), "{absurd:?}");
 }
+
+#[test]
+fn calendar_is_one_pass_of_statuses_and_completeness() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = writable(dir.path());
+    let conn = store.conn();
+    let first = raw(conn, "fit:monitoring_b", "2025-06-01T00:00:00Z", "2025-06-03T00:00:00Z");
+    minutes(conn, first, "heart_rate", "device", utc(1, 0, 0), utc(1, 12, 0), 60);
+    let contract = Contract::get().expect("contract");
+    let rows = coverage::calendar(conn, contract, "heart_rate", "device", "2025-05-31", "2025-06-04").expect("calendar");
+    let statuses = coverage::day_statuses(conn, contract, "heart_rate", "device", "2025-05-31", "2025-06-04").expect("statuses");
+    let shares = coverage::day_completeness(conn, contract, "heart_rate", "device", "2025-05-31", "2025-06-04").expect("shares");
+    let zipped: Vec<_> = statuses.into_iter().zip(shares).map(|((day, status), (_, share))| (day, status, share)).collect();
+    assert_eq!(rows, zipped);
+    assert_eq!(rows[1].1, "present");
+    assert_eq!(rows.iter().map(|row| row.2).collect::<Vec<_>>(), [None, Some(50), Some(0), None, None]);
+}
