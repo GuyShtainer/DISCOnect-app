@@ -1322,6 +1322,24 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   }
   out.append(sites);
 
+  // 19b: what each writer sent, from the chains the store holds (counts only; the writer id is the random id the
+  // device's sync bookkeeping minted, never a hardware id or a key — decision 7's honest card below still holds)
+  const chains = status.chains ?? [];
+  const sent = el("section", "card");
+  sent.append(el("h2", "heading", "What each device sent"));
+  if (chains.length === 0) {
+    sent.append(el("p", "caption muted", "Each device that synced through a relay shows here with what it sent. Nothing has been synced yet."));
+  } else {
+    const kv4 = el("dl", "kv");
+    for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
+      const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+      kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.device_id.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}`));
+    }
+    sent.append(kv4);
+    sent.append(el("p", "caption muted", "A device is known by the id its sync bookkeeping made up at its first push; after a forget on that device it shows up here as a new one."));
+  }
+  out.append(sent);
+
   // design decision 7: no device list, the honest card
   const devices = el("section", "card");
   devices.append(el("h2", "heading", "Devices that hold your key"));
