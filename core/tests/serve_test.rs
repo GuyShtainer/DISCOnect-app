@@ -457,6 +457,27 @@ fn sleep_night_bad_date_is_bad_params() {
     }
 }
 
+/// 7b-4 review N6 (BACKLOG), twin of the Python test: each stage instant is read under the offset nearest to
+/// it; a +1 h change at 22:30Z inside the 06-15 night.
+#[test]
+fn sleep_night_stages_across_a_clock_change_show_the_watchs_wall_clock() {
+    let (_dir, db) = live_copy();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "INSERT INTO clock_offsets(ts_utc, offset_s, raw_record_id) VALUES('2025-06-14T22:30:00Z', 14400, \
+         (SELECT raw_record_id FROM clock_offsets LIMIT 1))",
+        [],
+    )
+    .expect("offset");
+    let mut rig = Rig::new(&db);
+    let night = rig.send("data.sleep", json!({"date": "2025-06-15"}))["result"].clone();
+    assert_eq!(night["sessions"][0]["utc_offset_s"], 14400);
+    assert_eq!(
+        stages_local(&night["sessions"][0]),
+        [pair("23:00", "00:00"), pair("00:00", "03:00"), pair("03:00", "07:00")]
+    );
+}
+
 #[test]
 fn sleep_night_without_an_offset_has_no_local_keys_and_a_stage_can_cross_midnight() {
     let (_dir, db) = live_copy();

@@ -386,7 +386,7 @@ fn sleep_detail_in(conn: &Connection, date: Option<&PyStr>, local: bool) -> Resu
         if let Some(seconds) = offset {
             entry.set("utc_offset_s", Json::int(seconds));
         }
-        let stages = stage_timeline(conn, sleep_id, offset)?;
+        let stages = stage_timeline(conn, sleep_id, offsets.as_ref().filter(|_| offset.is_some()))?;
         if !stages.is_empty() {
             entry.set("stages", Json::Array(stages));
         }
@@ -426,12 +426,13 @@ fn hhmm(moment: Instant, offset: i64) -> Result<String, ReadError> {
     Ok(moved.format("%H:%M").to_string())
 }
 
-/// The stage rows of one night, oldest first, each with its length in minutes and, when `offset` (the
-/// session's, in seconds) is known, its local start and end.
+/// The stage rows of one night, oldest first, each with its length in minutes and, when `offsets` is given
+/// (the session has an offset), its local start and end — each instant under the offset nearest to it, so a
+/// stage across a clock change shows the wall-clock times the watch showed.
 fn stage_timeline(
     conn: &Connection,
     sleep_id: &str,
-    offset: Option<i64>,
+    offsets: Option<&crate::clock::ClockOffsets>,
 ) -> Result<Vec<Json>, ReadError> {
     let mut statement = conn.prepare(
         "SELECT stage, start_utc, end_utc FROM sleep_stages WHERE sleep_id=? ORDER BY start_utc",
@@ -454,9 +455,12 @@ fn stage_timeline(
             ("end_utc", end),
             ("minutes", Json::Float(py_round(seconds as f64 / 60.0, 1))),
         ]);
-        if let Some(offset) = offset {
-            item.set("start_local", Json::text(&hhmm(started, offset)?));
-            item.set("end_local", Json::text(&hhmm(ended, offset)?));
+        if let Some(offsets) = offsets {
+            for (key, moment) in [("start_local", started), ("end_local", ended)] {
+                if let Some(offset) = offsets.offset_at(moment) {
+                    item.set(key, Json::text(&hhmm(moment, offset)?));
+                }
+            }
         }
         stages.push(item);
     }
