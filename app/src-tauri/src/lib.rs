@@ -21,6 +21,7 @@ mod ios;
 #[cfg(target_os = "ios")]
 mod relays;
 pub mod live;
+pub mod live_phone;
 pub mod sidecar;
 
 use std::sync::Arc;
@@ -119,6 +120,9 @@ async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String
         relays::note_answer(&app, &method, value);
         if method == "pair.forget" {
             relays::forget(&app);
+            if let Ok(dir) = app.path().app_data_dir() {
+                live_phone::forget_in(&dir);
+            }
         }
     }
     if method == "key.unlock" && answer.as_ref().is_ok_and(|v| v.get("unlocked").and_then(Value::as_bool) == Some(true)) {
@@ -158,10 +162,10 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn release_args(args: Vec<String>) -> Vec<String> {
     // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
     // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 32] = [
+    const NO_OPERAND: [&str; 33] = [
         "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
         "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
-        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed",
+        "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing", "--debug-relays-seed", "--debug-live-seed",
     ];
     let mut out = Vec::new();
     let mut it = args.into_iter().peekable();
@@ -195,6 +199,13 @@ mod release_args_tests {
     fn a_release_build_drops_the_relay_seed_flag_and_keeps_what_follows() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(release_args(v(&["--debug-relays-seed", "--screen", "settings"])), v(&["--screen", "settings"]));
+    }
+
+    /// 19b row 3: the live-session seed flag takes no operand, so a release build drops it and keeps what follows.
+    #[test]
+    fn a_release_build_drops_the_live_seed_flag_and_keeps_what_follows() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(release_args(v(&["--debug-live-seed", "--screen", "sync"])), v(&["--screen", "sync"]));
     }
 
     /// 19d (the attack's A6): the page may not name `relays` on any method; the shell builds the list natively.
@@ -768,10 +779,12 @@ pub fn run() {
     #[cfg(all(debug_assertions, mobile, target_os = "ios"))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file, debug_offer_from_file, keep_awake, cover_release,
         relays::relays_list, relays::relays_add_folder, relays::relays_add_lan, relays::relays_remove, relays::relays_rename,
+        live_phone::live_import, live_phone::live_produced, live_phone::live_debug_seed,
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(not(debug_assertions), mobile, target_os = "ios"))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, keep_awake, cover_release,
         relays::relays_list, relays::relays_add_folder, relays::relays_add_lan, relays::relays_remove, relays::relays_rename,
+        live_phone::live_import, live_phone::live_produced, 
         live::live_start, live::live_stop, live::live_state]);
     #[cfg(all(debug_assertions, mobile, not(target_os = "ios")))]
     let builder = builder.invoke_handler(tauri::generate_handler![core_call, core_unlock, core_stderr, launch_args, mcp_command, debug_unlock_from_file, debug_pair_digits_from_file,

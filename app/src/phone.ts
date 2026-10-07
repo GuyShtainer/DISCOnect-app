@@ -80,3 +80,23 @@ export function relaysRemove(id: string): Promise<void> {
 export function relaysRename(id: string, label: string): Promise<void> {
   return invoke("relays_rename", { id, label });
 }
+
+// ---- the phone as a producer (19b, I5 row 3): the shell imports session files from its own folder; the page names no path.
+
+/** What this phone has produced: counts and a span (unix seconds), never a reading. */
+export type Produced = { sessions: number; readings: number; last_from: number | null; last_to: number | null; last_at: number | null };
+
+/** iOS: import the session files waiting in the phone's own folder (the shell builds the path; this passes nothing). */
+export function liveImport(): Promise<{ files: number; ok: number; duplicate: number; failed: number; refused: number; readings: number; sessions: number }> {
+  return invoke("live_import");
+}
+
+/** iOS: the Sync screen's "From this phone" counts. */
+export function liveProduced(): Promise<Produced> {
+  return invoke("live_produced");
+}
+
+/** Debug iOS builds only (`--debug-live-seed`): write one synthetic session and import it, once per start. */
+export function liveDebugSeed(): Promise<unknown> {
+  return invoke("live_debug_seed");
+}
