@@ -66,9 +66,6 @@ pub struct Entry {
 pub struct Store {
     #[serde(default)]
     pub relays: Vec<Entry>,
-    /// The Mac address the person removed on purpose; it is not adopted again from `relay.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mac_dismissed: Option<String>,
     /// The saved list could not be read and a copy was kept aside; shown on the card until the next change is saved.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unreadable: bool,
@@ -193,16 +190,85 @@ pub fn clean_label(text: &str, fallback: &str) -> String {
 /// (`serve/join.rs`: `offer_ip`, `never_a_pairing_address`, `reachable_class`), reimplemented here because that code is
 /// the core's and private. An IP literal (v4 or v6), an explicit port, no user, path, query or fragment; unspecified,
 /// multicast, reserved and link-local addresses never; loopback only in a simulator build; otherwise a private range
-/// (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7). The core's "on-link public address" leg is left out: stricter
-/// here, and the core re-checks every address at sync time.
+/// (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) or, as `reachable_class` has it, an address inside the subnet
+/// of one of this phone's up interfaces (`on_link`: same family, a prefix of 0 counts for nothing, an IPv4-mapped
+/// IPv6 address is judged as the IPv4 address it carries). Off iOS the interface list is empty, as in the core.
 ///
 /// The `Err` word is what the page maps: `bad_address` (not that shape), `address_name` (a name, not an IP address),
 /// `not_local` (an address on no private or local network).
 pub fn lan_check(text: &str) -> Result<String, &'static str> {
-    lan_check_with(text, cfg!(target_abi = "sim"))
+    lan_check_with(text, cfg!(target_abi = "sim"), &up_interfaces())
 }
 
-fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str> {
+/// One up interface address and prefix, in the form `on_link` compares: the family, the address as an integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Iface {
+    v6: bool,
+    bits: u128,
+    prefix: u8,
+}
+
+/// Source: `disconect_core::serve::join::on_link` (same rule, copied; that function is private to the core).
+fn on_link(v6: bool, bits: u128, ifaces: &[Iface]) -> bool {
+    ifaces.iter().any(|i| {
+        if i.prefix == 0 || i.v6 != v6 {
+            return false;
+        }
+        let width: u32 = if v6 { 128 } else { 32 };
+        if u32::from(i.prefix) > width {
+            return false;
+        }
+        let mask = u128::MAX << (128 - u32::from(i.prefix)) >> (128 - width);
+        bits & mask == i.bits & mask
+    })
+}
+
+/// The up interfaces of this phone with their prefix lengths (`getifaddrs`), as the core's `up_interfaces` reads them.
+/// Empty when the call fails and off iOS (the same as the core, which only reads them on iOS).
+#[cfg(target_os = "ios")]
+fn up_interfaces() -> Vec<Iface> {
+    let mut found = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `head` with a list that stays valid until `freeifaddrs` below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return found;
+    }
+    let mut node = head;
+    while !node.is_null() {
+        // SAFETY: `node` is a live element of the list `getifaddrs` returned.
+        let ifa = unsafe { &*node };
+        node = ifa.ifa_next;
+        if ifa.ifa_flags & (libc::IFF_UP as u32) == 0 || ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
+            continue;
+        }
+        // SAFETY: both sockaddrs are non-null and of the family their `sa_family` names; each cast is to that family's struct.
+        unsafe {
+            match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let mask = &*(ifa.ifa_netmask as *const libc::sockaddr_in);
+                    found.push(Iface { v6: false, bits: u128::from(u32::from_be(addr.sin_addr.s_addr)), prefix: u32::from_be(mask.sin_addr.s_addr).leading_ones() as u8 });
+                }
+                libc::AF_INET6 => {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    let mask = &*(ifa.ifa_netmask as *const libc::sockaddr_in6);
+                    found.push(Iface { v6: true, bits: u128::from_be_bytes(addr.sin6_addr.s6_addr), prefix: u128::from_be_bytes(mask.sin6_addr.s6_addr).leading_ones() as u8 });
+                }
+                _ => {}
+            }
+        }
+    }
+    // SAFETY: `head` came from `getifaddrs` and nothing points into the list any more.
+    unsafe { libc::freeifaddrs(head) };
+    found
+}
+
+#[cfg(not(target_os = "ios"))]
+fn up_interfaces() -> Vec<Iface> {
+    Vec::new()
+}
+
+fn lan_check_with(text: &str, loopback_ok: bool, ifaces: &[Iface]) -> Result<String, &'static str> {
     let t = text.trim();
     if t.len() > 200 || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("bad_address");
@@ -215,17 +281,25 @@ fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str>
     // (no address types are named here: the egress guard keeps the network types in the coach module)
     // the class of an address: (never a pairing address, loopback, private range), on its IPv4 form when it is mapped
     let v4_class = |o: [u8; 4]| (o[0] == 0 || o[0] >= 224 || (o[0] == 169 && o[1] == 254), o[0] == 127, o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) || (o[0] == 100 && (64..=127).contains(&o[1])));
-    let (never, loopback, private, host) = match u.host() {
+    let (never, loopback, private, linked, host) = match u.host() {
         Some(url::Host::Ipv4(v4)) => {
             let (n, l, p) = v4_class(v4.octets());
-            (n, l, p, v4.to_string())
+            (n, l, p, on_link(false, u128::from(u32::from_be_bytes(v4.octets())), ifaces), v4.to_string())
         }
         Some(url::Host::Ipv6(v6)) => {
-            let (n, l, p) = match v6.to_ipv4_mapped() {
-                Some(m) => v4_class(m.octets()),
-                None => (v6.is_unspecified() || v6.octets()[0] == 0xff || (v6.segments()[0] & 0xffc0) == 0xfe80, v6.is_loopback(), (v6.segments()[0] & 0xfe00) == 0xfc00),
+            let (n, l, p, linked) = match v6.to_ipv4_mapped() {
+                Some(m) => {
+                    let (n, l, p) = v4_class(m.octets());
+                    (n, l, p, on_link(false, u128::from(u32::from_be_bytes(m.octets())), ifaces))
+                }
+                None => (
+                    v6.is_unspecified() || v6.octets()[0] == 0xff || (v6.segments()[0] & 0xffc0) == 0xfe80,
+                    v6.is_loopback(),
+                    (v6.segments()[0] & 0xfe00) == 0xfc00,
+                    on_link(true, u128::from_be_bytes(v6.octets()), ifaces),
+                ),
             };
-            (n, l, p, format!("[{v6}]"))
+            (n, l, p, linked, format!("[{v6}]"))
         }
         Some(url::Host::Domain(_)) => return Err("address_name"),
         None => return Err("bad_address"),
@@ -234,20 +308,21 @@ fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str>
     let authority = t.split_once("://").map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""));
     let has_port = if authority.starts_with('[') { authority.contains("]:") } else { authority.contains(':') };
     let port = u.port_or_known_default().filter(|_| has_port).ok_or("bad_address")?;
-    if never || !(private || (loopback && loopback_ok)) {
+    // `reachable_class`: loopback only when the build allows it; otherwise private or on-link
+    let reachable = if loopback { loopback_ok } else { private || linked };
+    if never || !reachable {
         return Err("not_local");
     }
     Ok(format!("http://{host}:{port}"))
 }
 
-/// [`lan_check`] without the word.
-pub fn clean_lan_url(text: &str) -> Option<String> {
-    lan_check(text).ok()
-}
-
 /// The LAN address `relay.json` names (the paired Mac), in either of the file's forms: the legacy `{"lan": url}` and the
 /// list form `{"relays": [{"kind": "lan", "url": ...}]}`.
 pub fn mac_url_in(dir: &Path) -> Option<String> {
+    mac_url_in_with(dir, &up_interfaces())
+}
+
+fn mac_url_in_with(dir: &Path, ifaces: &[Iface]) -> Option<String> {
     let value: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("relay.json")).ok()?).ok()?;
     let found = value
         .get("lan")
@@ -258,14 +333,19 @@ pub fn mac_url_in(dir: &Path) -> Option<String> {
                 (r.get("kind")?.as_str()? == "lan").then(|| r.get("url")?.as_str().map(str::to_string)).flatten()
             })
         })?;
-    clean_lan_url(&found)
+    lan_check_with(&found, cfg!(target_abi = "sim"), ifaces).ok()
 }
 
-/// Add the paired Mac as "Your Mac" when `relay.json` names one that no entry holds and the person has not removed.
+/// Add the paired Mac as "Your Mac" when `relay.json` names one that no entry holds. (The paired Mac cannot be
+/// removed, so there is no "removed on purpose" memory: it would only trap a later pairing at a hand-added address.)
 /// Returns whether the list changed.
 pub fn adopt_mac(dir: &Path, store: &mut Store) -> bool {
-    let Some(url) = mac_url_in(dir) else { return false };
-    if store.mac_dismissed.as_deref() == Some(url.as_str()) || store.relays.iter().any(|e| e.url.as_deref() == Some(url.as_str())) {
+    adopt_mac_with(dir, store, &up_interfaces())
+}
+
+fn adopt_mac_with(dir: &Path, store: &mut Store, ifaces: &[Iface]) -> bool {
+    let Some(url) = mac_url_in_with(dir, ifaces) else { return false };
+    if store.relays.iter().any(|e| e.url.as_deref() == Some(url.as_str())) {
         return false;
     }
     let Ok(id) = new_id(store) else { return false };
@@ -274,18 +354,14 @@ pub fn adopt_mac(dir: &Path, store: &mut Store) -> bool {
 }
 
 /// Remove an entry. The paired Mac (the LAN entry `relay.json` names, `paired`) cannot be removed: the Mac is the
-/// pairing, and "Forget this phone" is the way out of it. Any other removed LAN entry is remembered so `relay.json`
-/// does not bring it back.
+/// pairing, and "Forget this phone" is the way out of it.
 pub fn remove(store: &mut Store, id: &str, paired: Option<&str>) -> Result<(), Refusal> {
     let Some(at) = store.relays.iter().position(|e| e.id == id) else { return Err(Refusal("not_found")) };
     let e = &store.relays[at];
     if e.kind == "lan" && paired.is_some() && e.url.as_deref() == paired {
         return Err(Refusal("paired_mac"));
     }
-    let gone = store.relays.remove(at);
-    if gone.kind == "lan" {
-        store.mac_dismissed = gone.url;
-    }
+    store.relays.remove(at);
     Ok(())
 }
 
@@ -295,16 +371,13 @@ pub fn rename(store: &mut Store, id: &str, label: &str) -> bool {
     true
 }
 
-/// A lan entry added by hand clears the "removed on purpose" mark for that address.
+/// A LAN entry added by hand.
 pub fn add_lan(store: &mut Store, url: &str, label: &str) -> Result<String, Refusal> {
     let url = lan_check(url).map_err(Refusal)?;
     if store.relays.iter().any(|e| e.url.as_deref() == Some(url.as_str())) {
         return Err(Refusal("already_listed"));
     }
     let id = new_id(store)?;
-    if store.mac_dismissed.as_deref() == Some(url.as_str()) {
-        store.mac_dismissed = None;
-    }
     store.relays.push(Entry { id: id.clone(), kind: "lan".into(), label: clean_label(label, MAC_LABEL), bookmark: None, url: Some(url), added_at: now_secs(), debug_unscoped: false, site: None, last_push_at: None, last_pull_at: None });
     Ok(id)
 }
@@ -420,6 +493,12 @@ pub fn view_of(e: &Entry, display: Option<String>, available: bool) -> Value {
 /// One writer at a time: a command, a sync's record of sites and the debug seed all read, change and write the file.
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The list's lock. A poisoned lock (a panic while it was held) is taken over with `into_inner`: the guard holds no
+/// data, and falling back to an unlocked read of `relays.json` would race the next writer.
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn refusal(r: Refusal) -> CoreError {
     CoreError::new(r.0, "the relay list could not do that")
 }
@@ -457,7 +536,7 @@ fn survey(store: &mut Store) -> (Vec<(Option<String>, bool)>, bool) {
 #[tauri::command]
 pub async fn relays_list(app: tauri::AppHandle) -> Result<Value, CoreError> {
     let dir = data_dir(&app)?;
-    let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
+    let _guard = lock();
     let mut store = load(&dir);
     let mut changed = adopt_mac(&dir, &mut store);
     let (rows, refreshed) = survey(&mut store);
@@ -500,7 +579,7 @@ pub async fn relays_add_folder(app: tauri::AppHandle) -> Result<Value, CoreError
         }
     };
     let Some((bookmark, name)) = picked else { return Ok(json!({"cancelled": true})) };
-    let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
+    let _guard = lock();
     let mut store = load(&dir);
     if native::resolve(&bookmark, false).is_some_and(|r| is_store_folder(&r.path, &dir)) {
         return Err(CoreError::new("own_folder", "that is this app's own folder"));
@@ -517,7 +596,7 @@ pub async fn relays_add_folder(app: tauri::AppHandle) -> Result<Value, CoreError
 #[tauri::command]
 pub async fn relays_add_lan(app: tauri::AppHandle, url: String, label: Option<String>) -> Result<Value, CoreError> {
     let dir = data_dir(&app)?;
-    let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
+    let _guard = lock();
     let mut store = load(&dir);
     let id = add_lan(&mut store, &url, label.as_deref().unwrap_or(MAC_LABEL)).map_err(refusal)?;
     commit(&dir, &mut store).map_err(refusal)?;
@@ -528,7 +607,7 @@ pub async fn relays_add_lan(app: tauri::AppHandle, url: String, label: Option<St
 #[tauri::command]
 pub async fn relays_remove(app: tauri::AppHandle, id: String) -> Result<Value, CoreError> {
     let dir = data_dir(&app)?;
-    let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
+    let _guard = lock();
     let mut store = load(&dir);
     remove(&mut store, &id, mac_url_in(&dir).as_deref()).map_err(refusal)?;
     commit(&dir, &mut store).map_err(refusal)?;
@@ -539,7 +618,7 @@ pub async fn relays_remove(app: tauri::AppHandle, id: String) -> Result<Value, C
 #[tauri::command]
 pub async fn relays_rename(app: tauri::AppHandle, id: String, label: String) -> Result<Value, CoreError> {
     let dir = data_dir(&app)?;
-    let _guard = LOCK.lock().map_err(|_| CoreError::new("busy", "busy"))?;
+    let _guard = lock();
     let mut store = load(&dir);
     if !rename(&mut store, &id, &label) {
         return Err(refusal(Refusal("not_found")));
@@ -558,7 +637,7 @@ pub fn params_for_call(app: &tauri::AppHandle, method: &str, params: Value, inje
         return (params, Vec::new());
     }
     let Ok(dir) = data_dir(app) else { return (params, Vec::new()) };
-    let Ok(_guard) = LOCK.lock() else { return (params, Vec::new()) };
+    let _guard = lock();
     let mut store = load(&dir);
     if adopt_mac(&dir, &mut store) {
         let _ = save(&dir, &store);
@@ -578,7 +657,8 @@ pub fn note_answer(app: &tauri::AppHandle, method: &str, answer: &Value) {
     if method != "sync.run" || answer.get("sites").is_none() {
         return;
     }
-    let (Ok(dir), Ok(_guard)) = (data_dir(app), LOCK.lock()) else { return };
+    let Ok(dir) = data_dir(app) else { return };
+    let _guard = lock();
     let mut store = load(&dir);
     if record_sites(&mut store, answer, now_secs(), mac_url_in(&dir).as_deref()) {
         let _ = save(&dir, &store);
@@ -618,7 +698,8 @@ pub fn debug_seed(app: &tauri::AppHandle) {
     if !seed && !drop_b {
         return;
     }
-    let (Ok(dir), Ok(_guard)) = (data_dir(app), LOCK.lock()) else { return };
+    let Ok(dir) = data_dir(app) else { return };
+    let _guard = lock();
     let mut store = load(&dir);
     if drop_b {
         if let Some(b) = store.relays.iter().filter(|e| e.kind == "folder").nth(1).map(|e| e.id.clone()) {
@@ -746,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn the_paired_mac_is_adopted_once_and_a_removal_sticks_until_it_is_added_by_hand() {
+    fn the_paired_mac_is_adopted_once_and_has_no_removal_memory() {
         let dir = scratch("mac");
         let mut store = Store::default();
         assert!(!adopt_mac(&dir, &mut store), "no relay.json, nothing to adopt");
@@ -759,9 +840,7 @@ mod tests {
         assert_eq!(store.relays.len(), 1);
         assert_eq!(remove(&mut store, "0000000a", Some("http://192.168.1.20:24816")).err().map(|r| r.0), Some("not_found"));
         assert!(remove(&mut store, &id, None).is_ok(), "no longer the paired address: removable");
-        assert!(!adopt_mac(&dir, &mut store), "removed on purpose: not brought back");
-        add_lan(&mut store, "http://192.168.1.20:24816", "Your Mac").unwrap();
-        assert_eq!(store.mac_dismissed, None);
+        assert!(adopt_mac(&dir, &mut store), "no memory of a removal: the file's Mac is listed again");
         // the list form of the file reads too
         std::fs::write(dir.join("relay.json"), r#"{"relays": [{"id": "x", "kind": "folder", "path": "/f"}, {"id": "y", "kind": "lan", "url": "http://10.0.0.2:9"}]}"#).unwrap();
         assert_eq!(mac_url_in(&dir).as_deref(), Some("http://10.0.0.2:9"));
@@ -793,20 +872,20 @@ mod tests {
     fn the_mac_address_must_pass_the_joiners_address_class() {
         // a private v4 with a port, and a ULA v6 with a port: accepted
         for ok in ["http://192.168.1.20:24816", "http://10.0.0.5:9", "http://172.16.0.1:24816", "http://100.64.1.1:24816", "http://[fd12::5]:24816"] {
-            assert!(lan_check_with(ok, false).is_ok(), "{ok}");
+            assert!(lan_check_with(ok, false, &[]).is_ok(), "{ok}");
         }
         // a name, a public address, no port, loopback (outside a simulator build), link-local, multicast, unspecified
-        assert_eq!(lan_check_with("http://mac.local:24816", false), Err("address_name"));
-        assert_eq!(lan_check_with("http://example.com:24816", false), Err("address_name"));
-        assert_eq!(lan_check_with("http://8.8.8.8:24816", false), Err("not_local"));
-        assert_eq!(lan_check_with("http://[2001:4860::1]:24816", false), Err("not_local"));
-        assert_eq!(lan_check_with("http://192.168.1.20", false), Err("bad_address"));
-        assert_eq!(lan_check_with("http://[fd12::5]", false), Err("bad_address"));
-        assert_eq!(lan_check_with("http://127.0.0.1:24816", false), Err("not_local"));
-        assert_eq!(lan_check_with("http://[::1]:24816", false), Err("not_local"));
-        assert_eq!(lan_check_with("http://127.0.0.1:24816", true).as_deref(), Ok("http://127.0.0.1:24816"));
+        assert_eq!(lan_check_with("http://mac.local:24816", false, &[]), Err("address_name"));
+        assert_eq!(lan_check_with("http://example.com:24816", false, &[]), Err("address_name"));
+        assert_eq!(lan_check_with("http://8.8.8.8:24816", false, &[]), Err("not_local"));
+        assert_eq!(lan_check_with("http://[2001:4860::1]:24816", false, &[]), Err("not_local"));
+        assert_eq!(lan_check_with("http://192.168.1.20", false, &[]), Err("bad_address"));
+        assert_eq!(lan_check_with("http://[fd12::5]", false, &[]), Err("bad_address"));
+        assert_eq!(lan_check_with("http://127.0.0.1:24816", false, &[]), Err("not_local"));
+        assert_eq!(lan_check_with("http://[::1]:24816", false, &[]), Err("not_local"));
+        assert_eq!(lan_check_with("http://127.0.0.1:24816", true, &[]).as_deref(), Ok("http://127.0.0.1:24816"));
         for never in ["http://169.254.1.1:1", "http://[fe80::1]:1", "http://224.0.0.1:1", "http://0.0.0.0:1", "http://255.255.255.255:1"] {
-            assert_eq!(lan_check_with(never, true), Err("not_local"), "{never}");
+            assert_eq!(lan_check_with(never, true, &[]), Err("not_local"), "{never}");
         }
         // the adopted Mac and a hand-typed one go through the same rule
         let mut s = Store::default();
@@ -881,5 +960,71 @@ mod tests {
         let view = view_of(&store.relays[0], Some("Cloud".into()), true);
         let text = view.to_string();
         assert!(!text.contains("bookmark"), "{text}");
+    }
+
+    /// [`lan_check`] without the word.
+    fn clean_lan_url(text: &str) -> Option<String> {
+        lan_check(text).ok()
+    }
+
+    fn iface(text: &str, prefix: u8) -> Iface {
+        // parsed through the url crate so this file names no address type (the egress guard)
+        let host = if text.contains(':') { format!("[{text}]") } else { text.to_string() };
+        let (v6, bits) = match url::Url::parse(&format!("http://{host}:1")).unwrap().host().unwrap() {
+            url::Host::Ipv4(a) => (false, u128::from(u32::from_be_bytes(a.octets()))),
+            url::Host::Ipv6(a) => (true, u128::from_be_bytes(a.octets())),
+            url::Host::Domain(_) => panic!("not an address"),
+        };
+        Iface { v6, bits, prefix }
+    }
+
+    /// S1 (I5 review): the core's on-link leg (`join.rs::reachable_class`), same cases as its own test.
+    #[test]
+    fn a_public_address_is_accepted_only_when_it_is_on_link_and_the_old_refusals_stand() {
+        let list = [iface("203.0.113.40", 24), iface("2001:db8:1::7", 64), iface("10.0.0.2", 0)];
+        for ok in ["http://203.0.113.1:24816", "http://203.0.113.254:24816", "http://[2001:db8:1::99]:24816", "http://[::ffff:203.0.113.9]:24816"] {
+            assert!(lan_check_with(ok, false, &list).is_ok(), "{ok}");
+            assert_eq!(lan_check_with(ok, false, &[]), Err("not_local"), "off-link without the interface: {ok}");
+        }
+        for no in ["http://203.0.114.1:24816", "http://203.0.112.255:24816", "http://[2001:db8:2::99]:24816", "http://8.8.8.8:24816"] {
+            assert_eq!(lan_check_with(no, false, &list), Err("not_local"), "{no}");
+        }
+        // a prefix of 0 would make everything on-link, so it counts for nothing
+        assert_eq!(lan_check_with("http://8.8.8.8:24816", false, &[iface("10.0.0.2", 0)]), Err("not_local"));
+        // the refusals from before still refuse, with a full interface list
+        let all = [iface("203.0.113.40", 8), iface("2001:db8::1", 8)];
+        assert_eq!(lan_check_with("http://mac.local:24816", false, &all), Err("address_name"));
+        assert_eq!(lan_check_with("http://203.0.113.1", false, &all), Err("bad_address"), "no port");
+        assert_eq!(lan_check_with("http://127.0.0.1:1", false, &[iface("127.0.0.1", 8)]), Err("not_local"), "loopback off-sim");
+        for never in ["http://169.254.1.1:1", "http://[fe80::1]:1", "http://224.0.0.1:1", "http://[ff02::1]:1"] {
+            assert_eq!(lan_check_with(never, true, &[iface("169.254.1.9", 16), iface("fe80::2", 10), iface("224.0.0.9", 4), iface("ff02::9", 8)]), Err("not_local"), "{never}");
+        }
+    }
+
+    #[test]
+    fn a_relay_json_with_a_global_ipv6_is_adopted_when_on_link_and_refused_otherwise() {
+        let dir = scratch("global6");
+        std::fs::write(dir.join("relay.json"), r#"{"lan": "http://[2001:db8:1::99]:24816"}"#).unwrap();
+        let mut store = Store::default();
+        assert!(!adopt_mac_with(&dir, &mut store, &[]), "no interface on that link");
+        assert!(adopt_mac_with(&dir, &mut store, &[iface("2001:db8:1::7", 64)]));
+        assert_eq!(store.relays[0].url.as_deref(), Some("http://[2001:db8:1::99]:24816"));
+        for bad in [r#"{"lan": "http://mac.local:24816"}"#, r#"{"lan": "http://192.168.1.20"}"#, r#"{"lan": "http://169.254.1.1:5"}"#, r#"{"lan": "http://224.0.0.1:5"}"#] {
+            std::fs::write(dir.join("relay.json"), bad).unwrap();
+            assert!(!adopt_mac_with(&dir, &mut Store::default(), &[iface("203.0.113.40", 8)]), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N1: a lock poisoned by a panic is taken over, never skipped.
+    #[test]
+    fn a_poisoned_lock_is_still_taken() {
+        let _ = std::thread::spawn(|| {
+            let _g = LOCK.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(LOCK.is_poisoned());
+        let _g = lock();
     }
 }

@@ -43,7 +43,7 @@
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>The Watch screen reads live values from your watch over Bluetooth. The watch is only read; nothing is written to it.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>DISCOnect pulls your own encrypted data from your computer on this network.</string>
+	<string>DISCOnect syncs your own encrypted data with your computer on this network, in both directions.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

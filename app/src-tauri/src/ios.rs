@@ -88,6 +88,8 @@ fn finish_forget(keychain: &mut dyn Keychain, dir: &Path, notes: &mut Vec<String
     if pending.is_some() {
         // the relay list names the Mac and the person's folders: it goes with the rest of the Forget (19d review #14)
         crate::relays::remove_files(dir);
+        // so are the phone's own live-session files and their ledger: they hold readings (I5 review M2)
+        crate::live_phone::forget_in(dir);
     }
     match pending {
         None => {}
@@ -307,6 +309,11 @@ mod tests {
             std::fs::write(dir.join("relay.json"), b"{}").unwrap();
             std::fs::write(dir.join(crate::relays::FILE), b"{}").unwrap();
             std::fs::write(dir.join(format!("{}.bad-1", crate::relays::FILE)), b"{").unwrap();
+            for d in [crate::live_phone::LIVE_DIR, crate::live_phone::STAGE_DIR, crate::live_phone::DONE_DIR] {
+                std::fs::create_dir_all(dir.join(d)).unwrap();
+                std::fs::write(dir.join(d).join("a.jsonl"), b"{}").unwrap();
+            }
+            std::fs::write(dir.join(crate::live_phone::LEDGER), b"{}").unwrap();
             if with_marker {
                 std::fs::write(dir.join(disconect_core::pair_forget::MARKER_NAME), b"").unwrap();
             }
@@ -314,11 +321,14 @@ mod tests {
         let mut items = Items(vec![("disconect".into(), id.into())]);
         seed(false);
         let notes = prepare_in(&mut items, &dir);
-        assert!(db.exists() && key.exists() && items.0.len() == 1 && dir.join(crate::relays::FILE).exists(), "no marker: nothing is forgotten: {notes:?}");
+        assert!(db.exists() && key.exists() && items.0.len() == 1 && dir.join(crate::relays::FILE).exists() && dir.join(crate::live_phone::LEDGER).exists(), "no marker: nothing is forgotten: {notes:?}");
         seed(true);
         let notes = prepare_in(&mut items, &dir);
         assert!(!db.exists() && !key.exists() && !dir.join("relay.json").exists() && !dir.join("disconect.db-wal").exists(), "{notes:?}");
         assert!(!dir.join(crate::relays::FILE).exists() && !dir.join(format!("{}.bad-1", crate::relays::FILE)).exists(), "the relay list went with it: {notes:?}");
+        for d in [crate::live_phone::LIVE_DIR, crate::live_phone::STAGE_DIR, crate::live_phone::DONE_DIR, crate::live_phone::LEDGER] {
+            assert!(!dir.join(d).exists(), "{d} went with the Forget: {notes:?}");
+        }
         assert!(items.0.is_empty(), "the keychain item went: {notes:?}");
         assert!(!dir.join(disconect_core::pair_forget::MARKER_NAME).exists());
         assert!(notes.iter().any(|n| n == "completed an interrupted Forget; keychain removed"), "{notes:?}");

@@ -5,7 +5,7 @@
 //! record applies: `sync.run` pushes it on the next sync and nothing new reaches the wire.
 //!
 //! The page names no path. The folder is built here (`<app data>/live-in/`); each file in it is checked (a regular
-//! file, never a link, canonically inside the app's data or Documents folder, a live-session file in the core's own
+//! file, never a link, canonically inside the app's data folder, a live-session file in the core's own
 //! line format with at least one reading), copied to a staging folder and imported from there, one file per call so the
 //! counts are exact. Nothing here reads a watch and nothing transmits.
 //!
@@ -27,9 +27,11 @@ pub const LIVE_DIR: &str = "live-in";
 pub const STAGE_DIR: &str = "live-stage";
 /// What the Sync screen shows.
 pub const LEDGER: &str = "live-produced.json";
-/// A session file larger than this is refused (ten minutes of two metrics is a few kilobytes; a day is well under it).
-const MAX_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_FILES: usize = 200;
+/// Where a file goes once the core has answered ok or duplicate for it (same container; Forget deletes it).
+pub const DONE_DIR: &str = "live-done";
+/// A session file larger than this is refused. One reading per second for a day is about 4.3 MB per metric
+/// (86 400 lines of roughly 50 bytes), so 32 MiB holds a day of several metrics.
+const MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// A refusal word; the page maps it to a sentence, the core is never asked.
 pub type Why = &'static str;
@@ -105,6 +107,11 @@ pub struct Ledger {
     pub last_from: Option<u64>,
     pub last_to: Option<u64>,
     pub last_at: Option<u64>,
+    /// What the last import run left out (refused before the core; a core error on the file): shown as "Files skipped".
+    #[serde(default)]
+    pub last_refused: u64,
+    #[serde(default)]
+    pub last_failed: u64,
 }
 
 pub fn load_ledger(data: &Path) -> Ledger {
@@ -137,6 +144,7 @@ pub fn forget_in(data: &Path) {
     let _ = std::fs::remove_file(data.join(format!(".{LEDGER}.tmp")));
     let _ = std::fs::remove_dir_all(data.join(LIVE_DIR));
     let _ = std::fs::remove_dir_all(data.join(STAGE_DIR));
+    let _ = std::fs::remove_dir_all(data.join(DONE_DIR));
 }
 
 fn now_secs() -> u64 {
@@ -147,8 +155,43 @@ fn counted(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Import every acceptable file in `<data>/live-in/` as the sweep does and answer counts and the span. A refused file
-/// is counted under `refused` and never reaches the core. A core error (locked, busy) ends the run with that error.
+/// Move an imported file to `<data>/live-done/` (0700), under a name that does not clash. A failed move is harmless:
+/// the file would answer duplicate next time.
+fn move_to_done(data: &Path, file: &Path) {
+    let done = data.join(DONE_DIR);
+    if std::fs::create_dir_all(&done).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&done, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(target_os = "ios")]
+    let _ = crate::ios::exclude_from_backup(&done);
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session.jsonl".into());
+    let mut target = done.join(&name);
+    let mut n = 1u32;
+    while target.exists() {
+        target = done.join(format!("{n}-{name}"));
+        n += 1;
+    }
+    let _ = std::fs::rename(file, target);
+}
+
+/// Oldest first: by modified time, then by name. Nothing is cut: a drained folder is how the next run stays short.
+fn oldest_first(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path())).collect())
+        .unwrap_or_default();
+    files.sort();
+    files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Import every acceptable file in `<data>/live-in/` as the sweep does, oldest first, and answer counts and the span.
+/// A refused file is counted under `refused` and never reaches the core. A core error on one file counts it under
+/// `failed` and the run goes on to the next. A file that answers ok or duplicate moves to `live-done/`; the ledger is
+/// saved after each file that imported, so a stop half way loses nothing.
 pub async fn import_all(door: &dyn CoreDoor, data: &Path, roots: &[PathBuf]) -> Result<Value, CoreError> {
     let dir = data.join(LIVE_DIR);
     let none = || CoreError::new("no_session", "there is no session file to import");
@@ -156,26 +199,24 @@ pub async fn import_all(door: &dyn CoreDoor, data: &Path, roots: &[PathBuf]) -> 
         return Err(none());
     }
     let dir = contained(&dir, roots).map_err(|_| CoreError::new("refused", "that folder is not inside this app"))?;
-    let mut names: Vec<_> = std::fs::read_dir(&dir).map_err(|_| none())?.flatten().map(|e| e.path()).collect();
-    names.sort();
-    names.truncate(MAX_FILES);
+    let names = oldest_first(&dir);
     let stage = data.join(STAGE_DIR);
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|_| CoreError::new("write_failed", "could not prepare the import"))?;
-    let result = run_files(door, &names, roots, &stage).await;
-    let _ = std::fs::remove_dir_all(&stage);
-    let run = result?;
     let mut ledger = load_ledger(data);
-    if run.ok > 0 {
-        ledger.sessions += run.ok;
-        ledger.readings += run.readings;
-        ledger.last_from = run.last.as_ref().map(|s| s.from);
-        ledger.last_to = run.last.as_ref().map(|s| s.to);
-        ledger.last_at = Some(now_secs());
+    let run = run_files(door, data, &names, roots, &stage, &mut ledger).await;
+    let _ = std::fs::remove_dir_all(&stage);
+    if (run.refused, run.failed) != (ledger.last_refused, ledger.last_failed) && (run.files > 0 || run.refused > 0) {
+        ledger.last_refused = run.refused;
+        ledger.last_failed = run.failed;
         let _ = save_ledger(data, &ledger);
     }
-    if run.files == 0 {
+    if run.files == 0 && run.refused == 0 {
         return Err(none());
+    }
+    if run.files == 0 {
+        return Ok(json!({ "files": 0, "ok": 0, "duplicate": 0, "failed": 0, "refused": run.refused, "readings": 0,
+                          "from": null, "to": null, "sessions": ledger.sessions, "readings_held": ledger.readings }));
     }
     Ok(json!({ "files": run.files, "ok": run.ok, "duplicate": run.duplicate, "failed": run.failed, "refused": run.refused,
                "readings": run.readings, "from": run.last.as_ref().map(|s| s.from), "to": run.last.as_ref().map(|s| s.to),
@@ -193,7 +234,7 @@ struct Run {
     last: Option<Session>,
 }
 
-async fn run_files(door: &dyn CoreDoor, files: &[PathBuf], roots: &[PathBuf], stage: &Path) -> Result<Run, CoreError> {
+async fn run_files(door: &dyn CoreDoor, data: &Path, files: &[PathBuf], roots: &[PathBuf], stage: &Path, ledger: &mut Ledger) -> Run {
     let mut run = Run::default();
     for (i, path) in files.iter().enumerate() {
         let acceptable = (|| {
@@ -206,28 +247,43 @@ async fn run_files(door: &dyn CoreDoor, files: &[PathBuf], roots: &[PathBuf], st
                 return Err("too_large");
             }
             let bytes = std::fs::read(&canon).map_err(|_| "not_found")?;
-            validate(&bytes).map(|s| (bytes, s))
+            validate(&bytes).map(|s| (canon, bytes, s))
         })();
-        let Ok((bytes, session)) = acceptable else {
+        let Ok((canon, bytes, session)) = acceptable else {
             run.refused += 1;
             continue;
         };
-        let staged = stage.join(format!("s{i}.jsonl"));
-        std::fs::write(&staged, &bytes).map_err(|_| CoreError::new("write_failed", "could not prepare the import"))?;
         run.files += 1;
-        let answer = door.call("import.run", json!({ "path": staged.to_string_lossy(), "transport": "ble" })).await?;
+        let staged = stage.join(format!("s{i}.jsonl"));
+        if std::fs::write(&staged, &bytes).is_err() {
+            run.failed += 1;
+            continue;
+        }
+        let Ok(answer) = door.call("import.run", json!({ "path": staged.to_string_lossy(), "transport": "ble" })).await else {
+            run.failed += 1;
+            continue;
+        };
         let (ok, dup, failed) = (counted(&answer, "ok"), counted(&answer, "duplicate"), counted(&answer, "failed"));
         run.ok += ok;
         run.duplicate += dup;
         run.failed += failed;
         if ok > 0 {
             run.readings += session.readings;
+            ledger.sessions += ok;
+            ledger.readings += session.readings;
+            ledger.last_from = Some(session.from);
+            ledger.last_to = Some(session.to);
+            ledger.last_at = Some(now_secs());
+            let _ = save_ledger(data, ledger);
             if run.last.as_ref().is_none_or(|l| session.to >= l.to) {
                 run.last = Some(session);
             }
         }
+        if ok > 0 || dup > 0 {
+            move_to_done(data, &canon);
+        }
     }
-    Ok(run)
+    run
 }
 
 /// The synthetic session `n` (DEV only): ten minutes of heart rate and steps, one reading each every ten seconds,
@@ -251,7 +307,8 @@ pub fn seed_next(data: &Path) -> std::io::Result<u64> {
     std::fs::create_dir_all(&dir)?;
     #[cfg(target_os = "ios")]
     let _ = crate::ios::exclude_from_backup(&dir);
-    let n = std::fs::read_dir(&dir)?.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("live-seed-")).count() as u64;
+    let seeded = |d: PathBuf| std::fs::read_dir(d).map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().contains("live-seed-")).count() as u64).unwrap_or(0);
+    let n = seeded(dir.clone()) + seeded(data.join(DONE_DIR));
     let file = dir.join(format!("live-seed-{n}.jsonl"));
     std::fs::write(&file, seed_text(n))?;
     #[cfg(target_os = "ios")]
@@ -263,8 +320,7 @@ pub fn seed_next(data: &Path) -> std::io::Result<u64> {
 #[cfg(target_os = "ios")]
 fn roots(app: &tauri::AppHandle) -> Result<(PathBuf, Vec<PathBuf>), CoreError> {
     let data = app.path().app_data_dir().map_err(|_| CoreError::new("write_failed", "no app data folder"))?;
-    let mut roots = vec![data.clone()];
-    roots.extend(app.path().document_dir());
+    let roots = vec![data.clone()];
     Ok((data, roots))
 }
 
@@ -312,8 +368,21 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    /// Answers `import.run` with one file stored and records the params it was given.
+    /// Answers `import.run` with one file stored (true) or one duplicate (false) and records the params it was given.
     struct Fake(Mutex<Vec<Value>>, bool);
+
+    /// Answers each `import.run` from a script (`Err` is a core error), recording the staged text it was given.
+    struct Script(Mutex<Vec<Result<Value, CoreError>>>, Mutex<Vec<String>>);
+
+    impl CoreDoor for Script {
+        fn call<'a>(&'a self, _method: &'a str, params: Value) -> Pin<Box<dyn Future<Output = Result<Value, CoreError>> + Send + 'a>> {
+            Box::pin(async move {
+                let text = std::fs::read_to_string(params["path"].as_str().unwrap()).unwrap();
+                self.1.lock().unwrap().push(text);
+                self.0.lock().unwrap().remove(0)
+            })
+        }
+    }
 
     impl CoreDoor for Fake {
         fn call<'a>(&'a self, method: &'a str, params: Value) -> Pin<Box<dyn Future<Output = Result<Value, CoreError>> + Send + 'a>> {
@@ -380,8 +449,11 @@ mod tests {
         }
         assert!(!data.join(STAGE_DIR).exists(), "the staged copies are removed");
         assert_eq!(load_ledger(&data).sessions, 2);
+        let waiting: Vec<_> = std::fs::read_dir(data.join(LIVE_DIR)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(waiting.len(), 2, "only the refused files stay: {waiting:?}");
+        assert_eq!(std::fs::read_dir(data.join(DONE_DIR)).unwrap().count(), 2, "the imported files moved");
         forget_in(&data);
-        assert!(!data.join(LIVE_DIR).exists() && !data.join(LEDGER).exists());
+        assert!(!data.join(LIVE_DIR).exists() && !data.join(LEDGER).exists() && !data.join(DONE_DIR).exists());
         let _ = (std::fs::remove_dir_all(&data), std::fs::remove_dir_all(&outside));
     }
 
@@ -395,6 +467,112 @@ mod tests {
         let r = tauri::async_runtime::block_on(import_all(&door, &data, &roots)).unwrap();
         assert_eq!((r["ok"].as_u64(), r["duplicate"].as_u64(), r["sessions"].as_u64()), (Some(0), Some(1), Some(0)));
         assert!(!data.join(LEDGER).exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_drained_file_is_not_sent_twice_and_the_oldest_goes_first_with_no_cut() {
+        let data = scratch("drain");
+        let dir = data.join(LIVE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 205 files: the old cut at 200 is gone. The oldest (by modified time) is "z-old", named last.
+        for n in 0..205u64 {
+            std::fs::write(dir.join(format!("a{n:03}.jsonl")), seed_text(n)).unwrap();
+        }
+        std::fs::write(dir.join("z-old.jsonl"), seed_text(999)).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        std::fs::File::options().write(true).open(dir.join("z-old.jsonl")).unwrap().set_modified(old).unwrap();
+        let door = Fake(Mutex::new(Vec::new()), true);
+        let roots = [data.clone()];
+        let r = tauri::async_runtime::block_on(import_all(&door, &data, &roots)).unwrap();
+        assert_eq!(r["ok"].as_u64(), Some(206), "no cut at 200");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(data.join(DONE_DIR)).unwrap().count(), 206);
+        let first = door.0.lock().unwrap()[0]["path"].as_str().unwrap().to_string();
+        assert!(first.ends_with("s0.jsonl"));
+        // A second run has nothing left to send.
+        assert_eq!(tauri::async_runtime::block_on(import_all(&door, &data, &roots)).unwrap_err().code, "no_session");
+        assert_eq!(door.0.lock().unwrap().len(), 206);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_oldest_file_is_staged_first() {
+        let data = scratch("order");
+        let dir = data.join(LIVE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a-new.jsonl"), seed_text(1)).unwrap();
+        std::fs::write(dir.join("z-old.jsonl"), seed_text(2)).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        std::fs::File::options().write(true).open(dir.join("z-old.jsonl")).unwrap().set_modified(old).unwrap();
+        let ok = || Ok(json!({"ok": 1, "duplicate": 0, "failed": 0}));
+        let door = Script(Mutex::new(vec![ok(), ok()]), Mutex::new(Vec::new()));
+        tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
+        let seen = door.1.lock().unwrap();
+        assert_eq!(seen[0], seed_text(2), "the older file first");
+        assert_eq!(seen[1], seed_text(1));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_core_error_on_one_file_is_counted_and_the_run_goes_on_with_the_ledger_saved_after_each_ok() {
+        let data = scratch("fail");
+        let dir = data.join(LIVE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, secs) in [(1u64, 300u64), (2, 200), (3, 100)] {
+            let f = dir.join(format!("s{n}.jsonl"));
+            std::fs::write(&f, seed_text(n)).unwrap();
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(t).unwrap();
+        }
+        std::fs::write(dir.join("big.jsonl"), vec![b' '; (MAX_BYTES + 1) as usize]).unwrap();
+        let ok = || Ok(json!({"ok": 1, "duplicate": 0, "failed": 0}));
+        let door = Script(Mutex::new(vec![ok(), Err(CoreError::new("busy", "the core is busy")), ok()]), Mutex::new(Vec::new()));
+        let r = tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
+        assert_eq!((r["files"].as_u64(), r["ok"].as_u64(), r["failed"].as_u64(), r["refused"].as_u64()), (Some(3), Some(2), Some(1), Some(1)));
+        let held = load_ledger(&data);
+        assert_eq!((held.sessions, held.last_refused, held.last_failed), (2, 1, 1), "both ok files, and what was skipped");
+        let waiting: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(waiting.contains(&"s2.jsonl".to_string()), "the file that failed stays for the next run: {waiting:?}");
+        assert!(!waiting.contains(&"s1.jsonl".to_string()) && !waiting.contains(&"s3.jsonl".to_string()));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_ledger_is_saved_before_the_run_ends() {
+        // The first file imports ok, the second ends the test's door by panicking: the ledger on disk already counts the first.
+        struct Dies(Mutex<u32>);
+        impl CoreDoor for Dies {
+            fn call<'a>(&'a self, _m: &'a str, _p: Value) -> Pin<Box<dyn Future<Output = Result<Value, CoreError>> + Send + 'a>> {
+                Box::pin(async move {
+                    let mut n = self.0.lock().unwrap();
+                    *n += 1;
+                    if *n == 2 {
+                        panic!("killed");
+                    }
+                    Ok(json!({"ok": 1, "duplicate": 0, "failed": 0}))
+                })
+            }
+        }
+        let data = scratch("kill");
+        seed_next(&data).unwrap();
+        seed_next(&data).unwrap();
+        let door = Dies(Mutex::new(0));
+        let d2 = data.clone();
+        let res = std::thread::spawn(move || tauri::async_runtime::block_on(import_all(&door, &d2, std::slice::from_ref(&d2)))).join();
+        assert!(res.is_err());
+        assert_eq!(load_ledger(&data).sessions, 1);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn only_refused_files_still_answer_with_a_count() {
+        let data = scratch("refonly");
+        std::fs::create_dir_all(data.join(LIVE_DIR)).unwrap();
+        std::fs::write(data.join(LIVE_DIR).join("junk.jsonl"), b"nope\n").unwrap();
+        let door = Fake(Mutex::new(Vec::new()), true);
+        let r = tauri::async_runtime::block_on(import_all(&door, &data, std::slice::from_ref(&data))).unwrap();
+        assert_eq!((r["files"].as_u64(), r["refused"].as_u64()), (Some(0), Some(1)));
         let _ = std::fs::remove_dir_all(&data);
     }
 }

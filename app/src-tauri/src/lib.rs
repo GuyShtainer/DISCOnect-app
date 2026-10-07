@@ -109,6 +109,16 @@ async fn core_call(app: tauri::AppHandle, state: State<'_, Core>, method: String
     let params = params.unwrap_or(Value::Object(Default::default()));
     params_refusal(&method, &params)?;
     let core = core_of(&state)?;
+    // iOS: Forget deletes the shell's own files (the relay list and its `.bad-*` copies, the live-session files and
+    // ledger) BEFORE the core is asked, so a kill after the core's own Forget leaves nothing behind; the pending-Forget
+    // hook (`ios::finish_forget`) and the line below do the same again afterwards.
+    #[cfg(target_os = "ios")]
+    if method == "pair.forget" {
+        relays::forget(&app);
+        if let Ok(dir) = app.path().app_data_dir() {
+            live_phone::forget_in(&dir);
+        }
+    }
     // iOS: the whole relay list rides on `sync.run` (once `RELAYS_INJECT` is on); the folders' scopes are held until
     // the answer is back and stop when `_scopes` drops at the end of this function.
     #[cfg(target_os = "ios")]

@@ -729,6 +729,10 @@ const SITE_WORDS: Record<string, string> = {
   missing: "Folder missing", no_permission: "No permission", io_error: "Read or write failed",
   not_auto: "Clicks only", // 19a: a network relay is never polled on a schedule; it is a rule, not a failure
 };
+/** The desktop's line for a run that left some relays unused; the phone's Sync screen says the same with its own pointer. */
+function relaysUnusedLine(failed: number, total: number, pointer: string): string {
+  return `${failed} of ${total} relays could not be used; ${pointer}.`;
+}
 const SITE_KINDS: Record<string, string> = { folder: "Folder", lan: "Network" };
 type RelayAddresses = { addresses: { ip: string; label: string }[]; port: number };
 type OfferReply = { offer: string; url: string; expires_at: number };
@@ -977,12 +981,19 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   if (PHONE) {
     // the phone's Sync: a pull from the Mac's relay, no serving and no pairing offer (relay.addresses is not on its list)
     const pull = async (): Promise<void> => {
-      phonePull.running = true; phonePull.failure = null; phonePull.result = "";
+      phonePull.running = true; phonePull.failure = null; phonePull.result = ""; phonePull.unused = "";
       syncRedraw();
       try {
-        const r = await core.call<{ push?: { bundles: number }; pull: { applied: number; records_new: number; status: string } }>("sync.run");
+        const r = await core.call<{ push?: { bundles: number }; pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run");
+        const bundles = (n: number): string => `${n} ${n === 1 ? "bundle" : "bundles"}`;
         phonePull.sent = r.push?.bundles ?? 0;
-        phonePull.result = `Pulled ${r.pull.applied} ${r.pull.applied === 1 ? "bundle" : "bundles"}, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (not all of it yet)" : ""}.`;
+        phonePull.sites = r.sites ?? null;
+        // I5 review M1: the run both sends and receives, and the line says both; a run that left relays unused says so
+        const failed = phoneSitesUnused(r.sites);
+        phonePull.result = `Sent ${bundles(phonePull.sent)} · pulled ${bundles(r.pull.applied)}, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (not all of it yet)" : ""}.`;
+        phonePull.unused = r.status === "partial" && failed > 0 ? relaysUnusedLine(failed, r.sites?.length ?? 0, "see Relays in Settings") : "";
+        // "Last sync" only counts a run that no relay refused or could not verify
+        if (!phoneSiteAlert(r.sites)) phonePull.lastClean = new Date().toISOString();
       } catch (e) {
         phonePull.failure = phoneSyncFailure(e);
       }
@@ -1051,7 +1062,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       const r = await core.call<{ push: { bundles: number; records: number }; pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run");
       const failed = (r.sites ?? []).filter((s) => s.error && s.error !== "not_auto").length;
       const partial = r.status === "partial" || r.pull.status === "partial";
-      syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${partial ? " (partial)" : ""}.${failed > 0 ? ` ${failed} of ${r.sites?.length ?? 0} relays could not be used; see Relays below.` : ""}`;
+      syncRun.result = `Sent ${r.push.bundles} bundles (${r.push.records} records); received ${r.pull.applied} bundles, ${r.pull.records_new} new records${partial ? " (partial)" : ""}.${failed > 0 ? ` ${relaysUnusedLine(failed, r.sites?.length ?? 0, "see Relays below")}` : ""}`;
     } catch (e) {
       syncError = core.isCoreError(e) ? e : { code: "error", message: String(e) };
     }
@@ -2409,7 +2420,7 @@ async function screenKey(out: ParentNode): Promise<void> {
 // Copy is drawn through neutralText like the coach's text (no maker's name, plain score words). No screen here shows a
 // raw core code or the core's own message: a failure is one fixed sentence that says what to do.
 const PHONE_READ_FAIL = "Close and reopen the app. If this stays, your copy on the Mac is untouched.";
-const PHONE_SYNC_NOTE = "This phone syncs only with the relays listed in Settings: your Mac, while both are on the same network, and the folders you picked. Everything it sends is encrypted with your key, and nothing is sent in the background.";
+const PHONE_SYNC_NOTE = "This phone sends only to the relays listed in Settings. Your Mac, over your network, needs a tap on Sync now. A folder in a cloud service is uploaded later by that service's own app, on its own schedule. What is stored is encrypted with your key, but the service can see the file names, their sizes and the times they were written.";
 
 function pbanner(lead: string, text: string, error = false): HTMLElement {
   return bannerEl(neutralText(lead), neutralText(text), error);
@@ -2830,7 +2841,7 @@ function drawPairDone(out: ParentNode, s: { applied: number; fresh: number; reje
     kv.append(el("dt", "", label), dd);
   }
   card.append(kv);
-  if (s.partial) card.append(ptext("p", "caption muted", "Not all of it has come yet. Open Sync and choose Pull now to get the rest."));
+  if (s.partial) card.append(ptext("p", "caption muted", "Not all of it has come yet. Open Sync and choose Sync now to get the rest."));
   out.append(card);
   if (s.protectedKey === false) out.append(ptext("p", "caption muted", "This phone could not lock the key file to its passcode protection."));
   out.append(ptext("p", "caption muted", "Next time DISCOnect opens, it asks for your passphrase: the one your Mac uses. You can keep the key in this phone's keychain from Settings."));
@@ -2946,7 +2957,7 @@ function openForgetSheet(opener: HTMLElement): void {
   const title = ptext("h2", "heading", "Forget this phone?");
   title.id = "forget-title";
   sheet.append(title);
-  sheet.append(ptext("p", "body", "This deletes this phone's copy of your data, its key file, its keychain entry and its relay setting. Your Mac keeps everything. Pair again to use this phone again."));
+  sheet.append(ptext("p", "body", "This deletes this phone's copy of your data, its key file, its keychain entry and its relay setting. Your Mac keeps everything, and the encrypted bundles already in the folders you picked stay there. Pair again to use this phone again."));
   const unsent = ptext("p", "body", "Counting what has not been sent…");
   unsent.setAttribute("aria-live", "polite");
   sheet.append(unsent);
@@ -3092,19 +3103,18 @@ function relayClock(secs: number): string {
   return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} ${time}`;
 }
 // What the core says went wrong at one relay (its site words), in this phone's sentences. Nothing else is ever drawn:
-// a word not listed reads as a plain failure. `unavailable` and `same_relay` are compared in relayState, not mapped here.
-const PHONE_SITE_WORDS: Record<string, string> = {
-  unreachable: "Not answering",
+// a word not listed reads as a plain failure. `unavailable` and `same_relay` are compared in relayState first.
+// One word table: the desktop's `SITE_WORDS` is the base; the phone overrides only what its own screen words differently.
+//   refused, unverified: the phone says what to check (the date and time; whether it is the relay it paired with).
+//   unsupported_transport: the desktop's "Needs the desktop core" would be wrong here (this phone is a core).
+//   not_folder: the desktop table has no word for it (it is a refusal of a timed run, never a site row on the phone).
+const PHONE_SITE_OVERRIDES: Record<string, string> = {
   refused: "Refused: check the date and time on both devices",
   unverified: "Not verified: it may not be the relay this phone paired with",
-  too_large: "A file was too large to store there",
-  bad_name: "A file had a name this relay does not take",
-  missing: "Folder not found",
-  no_permission: "No permission to use it",
-  io_error: "Reading or writing failed",
-  bad_url: "That address does not work",
   unsupported_transport: "This kind of relay is not supported on this phone",
+  not_folder: "Needs a folder relay",
 };
+const PHONE_SITE_WORDS: Record<string, string> = { ...SITE_WORDS, ...PHONE_SITE_OVERRIDES };
 /** The state line of one relay, from what the shell keeps of the core's last answer for it. */
 function relayState(r: phone.RelayEntry): string {
   if (!r.available || r.site?.error === "unavailable") return "Unavailable";
@@ -3280,24 +3290,36 @@ async function screenPhoneSettings(out: ParentNode): Promise<void> {
 }
 
 // ---- The phone's Sync ----
-const phonePull = { running: false, failure: null as { lead: string; text: string } | null, result: "", sent: null as number | null };
+const phonePull = { running: false, failure: null as { lead: string; text: string } | null, result: "", sent: null as number | null,
+  sites: null as SiteRow[] | null, unused: "", lastClean: null as string | null };
+const PHONE_UNVERIFIED = {
+  lead: "This may not be your Mac",
+  text: "The answer could not be verified: it may come from another Mac, your Mac may have been set up again with a new key, or the network may have altered it. This phone never pairs again by itself. If your Mac was set up again, forget this phone in Settings and pair it again from your Mac.",
+};
+const PHONE_REFUSED = { lead: "Your Mac refused this phone", text: "The date and time on this phone and on your Mac do not agree. Check both, then sync again." };
+/** I5 review M1: the banner for a run in which ANY relay answered unverified or refused (not only a one-relay run). */
+function phoneSiteAlert(sites: SiteRow[] | null | undefined): { lead: string; text: string } | null {
+  const errors = (sites ?? []).map((s) => s.error);
+  if (errors.includes("unverified")) return PHONE_UNVERIFIED;
+  if (errors.includes("refused")) return PHONE_REFUSED;
+  return null;
+}
+/** How many relays of a run could not be used (a network relay left out of a timed run is a rule, not a failure). */
+function phoneSitesUnused(sites: SiteRow[] | null | undefined): number {
+  return (sites ?? []).filter((s) => s.error && s.error !== "not_auto").length;
+}
 
 /** The three things a pull can say that a person can act on, in plain words; anything else is one fixed sentence. */
 function phoneSyncFailure(e: unknown): { lead: string; text: string } {
   const c = core.isCoreError(e) ? e : null;
   if (c?.code === "relay_auth_failed") {
-    return { lead: "Your Mac refused this phone", text: "The date and time on this phone and on your Mac do not agree. Check both, then pull again." };
+    return PHONE_REFUSED;
   }
-  if (c?.code === "relay_unverified") {
-    return {
-      lead: "This may not be your Mac",
-      text: "The answer could not be verified: it may come from another Mac, your Mac may have been set up again with a new key, or the network may have altered it. This phone never pairs again by itself. If your Mac was set up again, forget this phone in Settings and pair it again from your Mac.",
-    };
-  }
+  if (c?.code === "relay_unverified") return PHONE_UNVERIFIED;
   if (c?.code === "not_found" && /unreachable/i.test(c.message)) {
-    return { lead: "Your Mac is not reachable", text: "Open DISCOnect on your Mac with \"Serve the relay on this network\" on, join the same network with this phone, then pull again." };
+    return { lead: "Your Mac is not reachable", text: "Open DISCOnect on your Mac with \"Serve the relay on this network\" on, join the same network with this phone, then sync again." };
   }
-  return { lead: "The pull did not finish", text: "Pull again. If it keeps failing, close and reopen the app." };
+  return { lead: "The sync did not finish", text: "Sync again. If it keeps failing, close and reopen the app." };
 }
 
 /** "From this phone" (19b): what this phone recorded itself and what it has sent. Counts and times only. */
@@ -3324,6 +3346,9 @@ function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTM
     ["Sent", sent],
   ];
   if (mine) rows.push(["Records sent so far", String(mine.records)]);
+  // I5 review S6: files the last import left out (refused before the core, or a core error on them); only when non-zero
+  const skipped = (p?.last_refused ?? 0) + (p?.last_failed ?? 0);
+  if (skipped > 0) rows.push(["Files skipped", String(skipped)]);
   const kv = el("dl", "kv");
   for (const [k, v] of rows) kv.append(el("dt", "", k), el("dd", "value-small", neutralText(v)));
   card.append(kv);
@@ -3340,13 +3365,15 @@ function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTM
       each.append(el("dt", "", neutralText(who)), el("dd", "value-small", neutralText(`${one(c.bundles, "bundle")} · ${one(c.records, "record")}`)));
     }
     card.append(el("h3", "caption muted", neutralText("What each device sent")), each);
+    // the Mac card's caption, in this card's words: "Other" is the Mac, or this phone's own earlier pairing
+    card.append(ptext("p", "caption muted", "Other is your Mac, or an earlier pairing of this phone: a device that was forgotten and paired again shows up as a new line, and its old line stays."));
   }
   return card;
 }
 
 /** Drawn from screenSync (the lint pins every user-started call there); `pull` is its one network call. */
 function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.CoreError | null, pull: () => Promise<void>, produced: phone.Produced | null): void {
-  header(out, "Sync", "This phone pulls what is new from your Mac, on your network.");
+  header(out, "Sync", "This phone syncs with the relays listed in Settings.");
   // no store yet (a key file landed, the first pull has not): the pull below makes it, so only the rows are missing
   if (!status && statusErr?.code !== "not_found") {
     out.append(pbanner("Sync could not be read", PHONE_READ_FAIL, true));
@@ -3354,26 +3381,33 @@ function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.C
   }
   const f = phonePull.failure;
   if (f) out.append(pbanner(f.lead, f.text, true));
+  // any relay that answered unverified or refused, from this run or from the core's memory of the last one
+  const flagged = phoneSiteAlert(phonePull.sites ?? status?.relays);
+  if (flagged && !f) out.append(pbanner(flagged.lead, flagged.text, true));
   const unreachable = f?.lead === "Your Mac is not reachable";
   const mac = pcard("Your Mac");
-  const when = status?.last_pulled_at
-    ? new Date(status.last_pulled_at).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
-    : "never";
+  // "Last sync" is taken only from a run no relay refused or could not verify; after one that did, the last clean time
+  // this session knew, or none
+  const lastSync = flagged ? phonePull.lastClean : status?.last_pulled_at ?? null;
+  const when = lastSync
+    ? new Date(lastSync).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })
+    : flagged ? "none confirmed" : "never";
   const kv = el("dl", "kv");
   // the board's "Your Mac · address" row: the core's `relay_url`; with none, no row
   if (status?.relay_url) kv.append(el("dt", "", "Your Mac"), el("dd", "mono caption wrap", status.relay_url));
-  kv.append(el("dt", "", "Last pull"), el("dd", "", when));
+  kv.append(el("dt", "", "Last sync"), el("dd", "", when));
   mac.append(kv);
-  const go = el("button", "wide", f ? "Pull again" : "Pull now") as HTMLButtonElement;
+  const go = el("button", "wide", f ? "Sync again" : "Sync now") as HTMLButtonElement;
   go.disabled = phonePull.running;
   go.onclick = () => void pull();
   mac.append(go);
   if (phonePull.running) {
-    const live = el("p", "caption muted", "Pulling from your Mac…");
+    const live = el("p", "caption muted", "Syncing…");
     live.setAttribute("role", "status");
     mac.append(live);
   }
   if (phonePull.result) mac.append(el("p", "body", phonePull.result));
+  if (phonePull.unused) mac.append(el("p", "caption error", neutralText(phonePull.unused)));
   out.append(mac);
   out.append(phoneProduced(status, produced));
   if (status && !unreachable) {
@@ -3382,7 +3416,7 @@ function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.C
     const rows: [string, string][] = [
       ["Bundles pulled", String(status.bundles.pulled_applied ?? 0)],
       ["Bundles refused", String(status.bundles.pulled_rejected ?? 0)],
-      ["Records from your Mac", String(status.records_seen)],
+      ["Records synced, both ways", String(status.records_seen)],
       ["Conflicts", String(status.conflicts)],
       ["Chain gaps", status.gaps.length ? String(status.gaps.length) : "none"],
     ];
@@ -3391,7 +3425,7 @@ function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.C
     stat.append(kv2);
     out.append(stat);
   } else if (unreachable) {
-    out.append(ptext("p", "caption muted", "Everything on this phone is as of the last pull. Nothing is lost while the Mac is away."));
+    out.append(ptext("p", "caption muted", "Everything on this phone is as of the last sync. Nothing is lost while the Mac is away."));
   }
   out.append(ptext("p", "caption muted", PHONE_SYNC_NOTE));
 }
@@ -4055,7 +4089,7 @@ void (async () => {
     // still comes from a click, never from the page's own code path)
     if (args.includes("--debug-sync-run")) {
       setTimeout(() => {
-        const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now" || b.textContent === "Pull now");
+        const button = Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Sync now" || b.textContent === "Sync again");
         button?.click();
       }, 800);
     }

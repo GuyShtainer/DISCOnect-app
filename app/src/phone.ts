@@ -84,7 +84,9 @@ export function relaysRename(id: string, label: string): Promise<void> {
 // ---- the phone as a producer (19b, I5 row 3): the shell imports session files from its own folder; the page names no path.
 
 /** What this phone has produced: counts and a span (unix seconds), never a reading. */
-export type Produced = { sessions: number; readings: number; last_from: number | null; last_to: number | null; last_at: number | null };
+export type Produced = { sessions: number; readings: number; last_from: number | null; last_to: number | null; last_at: number | null;
+  /** What the last import left out: files refused before the core, and files the core errored on (counts only). */
+  last_refused?: number; last_failed?: number };
 
 /** iOS: import the session files waiting in the phone's own folder (the shell builds the path; this passes nothing). */
 export function liveImport(): Promise<{ files: number; ok: number; duplicate: number; failed: number; refused: number; readings: number; sessions: number }> {
