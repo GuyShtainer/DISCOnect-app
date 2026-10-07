@@ -717,6 +717,9 @@ type SyncStatus = {
  * person's own setting on their own screen; the privacy walk allows it at this one key), or the network address
  * (`http://host:port`, never a credential; null when the core refused the text). Read on the Mac only. */
 type ListEntry = { id: string; kind: string; label: string; serve: boolean; path?: string; url?: string | null };
+/** A configured folder as the screen shows it: as typed; a relative one says what it is relative to (both cores open it
+ * against the core's working directory, which differs between the app and the command line). */
+const folderWords = (folder: string): string => (/^[/~]/.test(folder) ? folder : `${folder} · relative to where the core was started`);
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
 type SiteRow = { id: string; kind: string; label?: string; pushed: number; healed: number; behind: number; pulled: number; rejected: number; error: string | null };
 // The site words both cores emit (RelayError::site_word and open_sites), in plain words; anything else reads as a plain failure.
@@ -1240,7 +1243,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   if (status?.relay_list && status.relay_list.length > 0) {
     // BL-7: the folder this Mac serves to other devices, as configured ("none" while no entry is marked --serve)
     const served = status.relay_list.find((e) => e.serve);
-    kv.append(el("dt", "", "Folder"), el("dd", "wrap", served?.path ?? "none"));
+    kv.append(el("dt", "", "Folder"), el("dd", "wrap", served?.path === undefined ? "none" : folderWords(served.path)));
   }
   card.append(kv);
   if (noRelay) card.append(el("p", "caption muted", "Set with the command line: disconect sync relay add <folder> --serve"));
@@ -1349,8 +1352,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   } else {
     const kv3 = el("dl", "kv");
     for (const e of list) {
-      const folder = e.path ?? "";
-      const where = e.kind === "lan" ? (e.url ?? "address refused") : /^[/~]/.test(folder) ? folder : `${folder} · relative to where the core was started`;
+      const where = e.kind === "lan" ? (e.url ?? "address refused") : folderWords(e.path ?? "");
       const s = siteOf.get(e.id);
       kv3.append(nameOf(e.label, e.kind, e.id, where), s ? siteLine(s) : el("dd", "value-small muted", "Run a sync to see what moves"));
     }

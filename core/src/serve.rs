@@ -1229,7 +1229,8 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
         // `folder` | `lan` | `mixed` over the list's entries, null with no file or an empty list.
         object.insert("relay_kind".into(), relay_kind_value(entries));
         // The list itself (BL-7): each folder's path is carried on purpose (the person's own setting, shown on their
-        // own screen), masked / scoped in the privacy walk; `relay_url` and each `url` are still never a credential.
+        // own screen), allowed at that one key by the privacy walks (the differ masks it only when it equals a core's
+        // own scratch relay path); `relay_url` and each `url` are still never a credential.
         object.insert("relay_list".into(), relay_list_value(entries));
         // The `sites` of the last `sync.run` of this session; null before the first.
         let last = session.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
