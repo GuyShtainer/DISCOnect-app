@@ -3483,7 +3483,7 @@ void (async () => {
         ["--debug-pair-failed", { v: "error", kind: "other", lead: "Pairing did not finish", text: "Your Mac refused this request. Cancel on your Mac and start a new offer.", exp: null }],
       ];
       for (const [flag, view] of frames) if (args.includes(flag)) setPair(view);
-      // evidence run: the Start screen's own "Scan the code" button, clicked (the real scan path: permission, then the camera)
+      // evidence run: the Start screen's own "Scan the code" button, clicked (the real scan route: permission first, then the camera)
       if (args.includes("--debug-pair-start-scan")) setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Scan the code")?.click(), 1500);
       // the simulator's camera: the offer text the host side wrote to a file, joined as if it had been scanned
       let reloaded = false;
