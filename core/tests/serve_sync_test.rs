@@ -207,6 +207,47 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
     assert_eq!(lines[0]["error"]["code"], "locked");
 }
 
+/// BL-7 negative, the twin of the Python oracle's: a folder text full of forbidden strings rides ONLY at
+/// `sync.status` `.result.relay_list[N].path`; `sync.run` (the folder is unavailable) and every event say nothing of it.
+#[test]
+fn a_relay_path_is_legal_only_at_sync_status_relay_list() {
+    let needles = ["/users/someone", "@example.com", "garmin", "1234567890"];
+    let folder = "/Users/someone/Garmin-1234567890/me@example.com/relay";
+    let (_dir, db) = encrypted_store(false);
+    let mut rig = Rig::new(&db);
+    rig.unlock();
+    relay_json(&db, json!({"relays": [{"id": "a1", "kind": "folder", "path": folder, "label": "", "serve": true}]}));
+    let status = rig.send(2, "sync.status", json!({}));
+    assert_eq!(status.len(), 1, "no event on a status");
+    assert_eq!(
+        status[0]["result"]["relay_list"],
+        json!([{"id": "a1", "kind": "folder", "label": "", "serve": true, "path": folder}])
+    );
+    let run = rig.send(3, "sync.run", json!({}));
+    for line in &run {
+        let text = line.to_string().to_lowercase();
+        for needle in needles {
+            assert!(!text.contains(needle), "{needle} leaked into a sync.run line: {line}");
+        }
+    }
+    let reply = only_response(&run);
+    if let Some(sites) = reply["result"]["sites"].as_array() {
+        // the serve entry's root is created only by a put, and an empty store puts nothing: the site is clean or unavailable
+        assert!(sites.iter().all(|row| row["error"].is_null() || row["error"] == "unavailable"), "{reply}");
+    } else {
+        assert!(reply.get("error").is_some(), "a run with no usable site answers an error or an unavailable site: {reply}");
+    }
+    // the only place any needle appears across both calls is that one key
+    let status_text = status[0].to_string().to_lowercase();
+    let mut without = status[0].clone();
+    without["result"]["relay_list"][0]["path"] = Value::Null;
+    let stripped = without.to_string().to_lowercase();
+    for needle in needles {
+        assert!(status_text.contains(needle), "{needle} rides on relay_list[0].path");
+        assert!(!stripped.contains(needle), "{needle} appears elsewhere in the status: {}", status[0]);
+    }
+}
+
 #[test]
 fn sync_status_names_the_lan_relay_address_and_nothing_else() {
     let (_dir, db) = encrypted_store(false);
