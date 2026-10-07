@@ -1275,11 +1275,19 @@ fn apply_pending(
                     reports[report].rejected += 1;
                 }
                 writer.stats.files_failed += 1;
-                conn.execute(
-                    "INSERT OR REPLACE INTO relay_bundles(name, direction, status, noted_at, reason) \
-                     VALUES(?, 'pulled', 'rejected', ?, ?)",
-                    params![name, utc_now_iso(), reason],
-                )?;
+                if half_applied.contains(name) {
+                    // BL-5b: a half-applied bundle keeps its marker, so a good copy re-derives it
+                    conn.execute(
+                        "UPDATE relay_bundles SET noted_at=?, reason=? WHERE name=?",
+                        params![utc_now_iso(), reason, name],
+                    )?;
+                } else {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO relay_bundles(name, direction, status, noted_at, reason) \
+                         VALUES(?, 'pulled', 'rejected', ?, ?)",
+                        params![name, utc_now_iso(), reason],
+                    )?;
+                }
                 result.rejected.push((name.clone(), reason));
             } else {
                 // a site that may hold a good copy was out of reach: nothing is booked, the next pull retries

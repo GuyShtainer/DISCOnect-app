@@ -1092,6 +1092,59 @@ fn a_half_applied_bundle_is_repaired_by_the_next_pull_through_reparse() {
 }
 
 #[test]
+fn a_half_applied_bundle_rejected_on_refetch_keeps_its_marker_and_re_derives_on_the_next_good_copy() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (device(), device());
+    let export = export_with_uds(
+        tmp.path(),
+        "x",
+        &uds("2025-06-15", 4000, "2025-06-15T12:00:00.0"),
+    );
+    import(&a, &export);
+    import(&a, &fit_drop(tmp.path(), "d", &MONITORING));
+    let relay = relay_in(tmp.path());
+    let name = push(&a, &relay).bundles[0].clone();
+    pull(&b, &relay);
+    let healthy = fingerprint(&b);
+    for table in [
+        "daily_metrics",
+        "daily_labels",
+        "metric_samples",
+        "monitoring_intervals",
+        "sleep_stages",
+        "sleep_sessions",
+        "clock_offsets",
+    ] {
+        b.conn()
+            .execute(&format!("DELETE FROM {table}"), [])
+            .expect("wipe");
+    }
+    b.conn()
+        .execute("UPDATE relay_bundles SET status='applying'", [])
+        .expect("half-applied");
+    // damage the relay copy
+    let path = tmp.path().join("relay").join(&name);
+    let good = fs::read(&path).expect("read copy");
+    let mut bad = good.clone();
+    let middle = bad.len() / 2;
+    bad[middle] ^= 0xff;
+    fs::write(&path, &bad).expect("damage");
+    let r = pull(&b, &relay);
+    assert!(r.applied.is_empty());
+    assert!(r.rejected.iter().any(|(n, _)| n == &name), "{:?}", r.rejected);
+    assert_eq!(pulled_statuses(&b), vec!["applying".to_string()]);
+    let bundles = sync::status(b.conn()).expect("status").bundles;
+    assert_eq!(bundles.get("pulled_applying"), Some(&1));
+    assert_eq!(bundles.get("pulled_rejected"), None);
+    // the good copy comes back
+    fs::write(&path, &good).expect("restore");
+    let r = pull(&b, &relay);
+    assert_eq!(r.applied.len(), 1, "applied again");
+    assert_eq!(fingerprint(&b), healthy, "the re-applied bundle re-derived its streams");
+    assert_eq!(pulled_statuses(&b), vec!["applied".to_string()]);
+}
+
+#[test]
 fn a_record_that_is_not_an_object_aborts_the_whole_pull() {
     let tmp = tempfile::tempdir().expect("tmp");
     let b = device();
