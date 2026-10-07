@@ -1208,6 +1208,8 @@ struct SyncJob {
     master: Secret32,
     /// The relays of this run, opened in the worker.
     specs: Vec<relay_sync::SiteSpec>,
+    /// An `auto` run (19a): `last_sites` keeps a click's row for every `not_auto` site.
+    auto: bool,
     last_sites: Arc<Mutex<Option<Value>>>,
     channel: Arc<Channel>,
     slot: Arc<AtomicBool>,
@@ -1242,7 +1244,19 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
     let strict = job.specs.len() == 1;
     let sites_value = |reports: &[relay_sync::SiteReport]| Value::Array(reports.iter().map(relay_sync::SiteReport::value).collect());
     let keep = |reports: &[relay_sync::SiteReport]| {
-        *job.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sites_value(reports));
+        let mut rows = sites_value(reports);
+        let mut last = job.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if job.auto
+            && let (Value::Array(new_rows), Some(Value::Array(old_rows))) = (&mut rows, last.as_ref())
+        {
+            // an auto run never opened these sites: the click's row (its counts and error) stays the news
+            for row in new_rows.iter_mut().filter(|row| row["error"] == "not_auto") {
+                if let Some(old) = old_rows.iter().find(|old| old["id"] == row["id"]) {
+                    *row = old.clone();
+                }
+            }
+        }
+        *last = Some(rows);
     };
     emit(sync_event("sync", "push", "start", None));
     let pushed = if strict {
@@ -1347,7 +1361,7 @@ fn relays_param(value: &Json) -> Result<Vec<relay_sync::SiteSpec>, Failure> {
 /// Start a push-then-pull over the relays of the call's `relays` param, else of `relay.json`; the answer is sent
 /// when it finishes. Checked in this order: unlocked (`locked`), a relay configured (`not_found`; an empty
 /// `relays` counts as none), an encrypted store (`not_encrypted`), `auto` and the shape of `relays` (`bad_params`), `auto` over a
-/// list with no folder site (`not_folder`), the slot
+/// list with no folder site (`not_folder`), a strict single `lan` list's address (`bad_params`), the slot
 /// shared with `import.run` (`busy`).
 fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     session.require_unlocked()?;
@@ -1392,6 +1406,8 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         }
         for spec in &mut specs {
             spec.not_auto = matches!(spec.config, relay_config::RelayConfig::Lan(_));
+            // a timer never creates a vanished root (a deleted or signed-out cloud folder): it is `unavailable`
+            spec.create_root = false;
         }
     }
     if let [only] = specs.as_slice()
@@ -1425,6 +1441,7 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         db_path: session.db_path.clone(),
         master,
         specs,
+        auto,
         last_sites: Arc::clone(&session.last_sites),
         channel: Arc::clone(&session.channel),
         slot: Arc::clone(&session.import_slot),

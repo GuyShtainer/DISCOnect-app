@@ -613,10 +613,10 @@ fn auto_runs_the_folder_sites_and_reports_lan_not_auto() {
         std::fs::create_dir_all(folder).expect("mkdir");
     }
     let (_da, a) = encrypted_store(true);
-    // a port nothing listens on: a connection attempt would be `unreachable`
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let url = format!("http://{}", closed.local_addr().expect("addr"));
-    drop(closed);
+    // a listener that counts: a connection attempt of the run would be an accept
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
     relay_json(
         &a,
         json!({"relays": [
@@ -635,9 +635,64 @@ fn auto_runs_the_folder_sites_and_reports_lan_not_auto() {
     let lan = json!({"id": "0000000c", "kind": "lan", "label": "mac", "pushed": 0, "healed": 0, "behind": 0, "pulled": 0,
                      "rejected": 0, "error": "not_auto"});
     assert_eq!(result["sites"][2], lan);
+    let accepted = listener.accept();
+    assert!(matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "no connection was opened: {accepted:?}");
     let status = rig.send(3, "sync.status", json!({}));
     assert_eq!(status[0]["result"]["relays"][2], lan);
     assert_eq!(status[0]["result"]["relay_kind"], "mixed");
+}
+
+#[test]
+fn an_auto_run_never_creates_a_vanished_serve_root_and_a_click_does() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let root = tmp.path().join("cloud");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let (_da, a) = encrypted_store(true);
+    relay_json(&a, json!({"relays": [{"id": "0000000a", "kind": "folder", "path": root, "serve": true}]}));
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    std::fs::remove_dir_all(&root).expect("rm");
+    let lines = rig.send(2, "sync.run", json!({"auto": true}));
+    let reply = only_response(&lines);
+    // what the same list answers today: a list of one is strict, and a vanished root is `unavailable`
+    assert!(!root.exists(), "an auto run does not re-create the root: {reply}");
+    let status = rig.send(3, "sync.status", json!({}));
+    assert_eq!(status[0]["result"]["relays"][0]["error"], "unavailable", "{reply}");
+    assert_eq!(reply["result"]["status"], "partial", "{reply}");
+    assert_eq!(reply["result"]["sites"][0]["error"], "unavailable", "{reply}");
+    let lines = rig.send(4, "sync.run", json!({}));
+    assert_eq!(only_response(&lines)["result"]["status"], "ok");
+    assert!(root.is_dir(), "a click re-creates the serve root");
+}
+
+#[test]
+fn an_auto_run_keeps_each_not_auto_sites_click_row_in_the_remembered_relays() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let folder = tmp.path().join("one");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let (_da, a) = encrypted_store(true);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    relay_json(
+        &a,
+        json!({"relays": [
+            {"id": "0000000a", "kind": "folder", "path": folder},
+            {"id": "0000000b", "kind": "lan", "url": url, "label": "mac"},
+        ]}),
+    );
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let lines = rig.send(2, "sync.run", json!({}));
+    assert_eq!(only_response(&lines)["result"]["sites"][1]["error"], "unreachable");
+    let click_lan = rig.send(3, "sync.status", json!({}))[0]["result"]["relays"][1].clone();
+    let lines = rig.send(4, "sync.run", json!({"auto": true}));
+    // the run's own answer still says `not_auto`
+    assert_eq!(only_response(&lines)["result"]["sites"][1]["error"], "not_auto");
+    let relays = rig.send(5, "sync.status", json!({}))[0]["result"]["relays"].clone();
+    assert_eq!(relays[1], click_lan, "the click's row is kept");
+    assert_eq!(relays[1]["error"], "unreachable");
+    assert_eq!(relays[0]["pushed"], 0, "the folder row is the auto run's own (nothing new to push)");
 }
 
 #[test]
