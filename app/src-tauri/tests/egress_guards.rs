@@ -111,11 +111,26 @@ fn the_main_window_is_built_in_setup_so_it_can_carry_the_navigation_hooks() {
 fn capabilities_grant_core_default_to_the_main_window_and_nothing_else() {
     let dir = manifest().join("capabilities");
     let files = files_under(&dir, "json");
-    assert_eq!(files.len(), 1, "one capability file: {files:?}");
-    let caps: Value = serde_json::from_str(&text(&files[0])).expect("json");
+    // two files: default.json (core:default, every platform) and phone-scan.json (12-F row 4: the camera scan, iOS only)
+    assert_eq!(files.len(), 2, "two capability files: {files:?}");
+    let named = |n: &str| files.iter().find(|f| f.ends_with(n)).unwrap_or_else(|| panic!("{n} exists: {files:?}"));
+    let caps: Value = serde_json::from_str(&text(named("default.json"))).expect("json");
     assert_eq!(caps["permissions"], serde_json::json!(["core:default"]));
     assert_eq!(caps["windows"], serde_json::json!(["main"]));
     assert!(caps.get("webviews").is_none() && caps.get("remote").is_none(), "no remote origin gets IPC");
+    let scan: Value = serde_json::from_str(&text(named("phone-scan.json"))).expect("json");
+    assert_eq!(scan["platforms"], serde_json::json!(["iOS"]), "the camera scan is granted on the phone only");
+    assert_eq!(scan["windows"], serde_json::json!(["main"]));
+    assert_eq!(
+        scan["permissions"],
+        serde_json::json!([
+            "barcode-scanner:allow-scan",
+            "barcode-scanner:allow-cancel",
+            "barcode-scanner:allow-check-permissions",
+            "barcode-scanner:allow-request-permissions"
+        ])
+    );
+    assert!(scan.get("webviews").is_none() && scan.get("remote").is_none(), "no remote origin gets IPC");
 }
 
 // ---- plugins and the dependency tree -------------------------------------------------------------
@@ -507,13 +522,13 @@ fn the_webview_names_no_import_path_and_the_debug_doors_exist_only_in_debug_buil
             if code[line_start..at].trim_start().starts_with("//") {
                 continue; // a doc comment naming the variable
             }
-            let gate = ["#[cfg(debug_assertions)]", "#[cfg(test)]"]
+            let gate = ["#[cfg(debug_assertions)]", "#[cfg(all(debug_assertions, target_os = \"ios\"))]", "#[cfg(test)]"]
                 .into_iter()
                 .filter_map(|attr| code[..at].rfind(attr).map(|i| (i, attr)))
                 .max();
             let head = gate.map_or("\n}\n", |(i, _)| &code[i..at]);
             assert!(!head.contains("\n}\n"), "{name} sits outside a `#[cfg(debug_assertions)]` item: {}", path.display());
-            if gate.is_some_and(|(_, attr)| attr == "#[cfg(debug_assertions)]") {
+            if gate.is_some_and(|(_, attr)| attr != "#[cfg(test)]") {
                 assert!(path.ends_with("lib.rs"), "{name} appears outside lib.rs: {}", path.display());
             }
         }
@@ -674,7 +689,7 @@ fn the_keep_awake_switch_is_ios_only_and_the_offer_file_is_a_debug_ios_door() {
         let head = &lib[..at];
         // the attribute lines directly above the fn (stop at the first line that is not an attribute or a doc line)
         let mut attrs = Vec::new();
-        for line in head.lines().rev().skip(0) {
+        for line in head.lines().rev() {
             let t = line.trim();
             if t.starts_with("#[") || t.starts_with("///") || t.starts_with("async") || t.is_empty() { attrs.push(t.to_string()); } else { break; }
         }
