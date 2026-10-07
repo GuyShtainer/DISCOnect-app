@@ -38,7 +38,7 @@ type Health = {
   live?: LiveBlock; never_imported: boolean; recent_imports?: ImportRun[];
   coverage: { window: { from: string; to: string; days: number }; ledger: LedgerRow[]; unattributed_failures?: number; undatable_files?: number };
 };
-const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files" };
+const TRANSPORT_WORD: Record<string, string> = { connect_export: "export", usb: "USB", ble: "Bluetooth", drop: "dropped files", relay: "sync", reparse: "re-read" };
 
 // The metric list is read once per session from data.contract (contract order; sample cadence = daily mean);
 // each entry's scopes (the live link last, where a session stream folds the metric) are what Trends and Sleep draw.
@@ -768,7 +768,16 @@ const autoSync = {
   line: "", // the walk line under the switch: "Synced on its own at HH:MM · N new" or the failure, once
   running: false, // a tick holds the core's one task slot: Sync now and Start an offer wait for it instead of hearing busy
   pending: null as Promise<void> | null,
+  silent: 0, // ticks in a row that heard busy/locked (the slot held by a long import, a sync, a pairing); BL-5a
+  waitingSince: null as Date | null, // the first silent tick of the run; the walk line says so from the third
 };
+const AUTO_SYNC_SILENT_SAY = 3; // ≥10 min of silence before the walk line names the wait
+const clockHm = (d: Date): string => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+/** The walk line's tail while ticks keep hearing busy (BL-5a): empty until the third silent tick in a row. */
+function autoSyncWaitText(): string {
+  return autoSync.silent >= AUTO_SYNC_SILENT_SAY && autoSync.waitingSince
+    ? ` Waiting since ${clockHm(autoSync.waitingSince)}: something else is using the store.` : "";
+}
 function autoSyncLoad(): void {
   try { autoSync.on = localStorage.getItem(AUTO_SYNC_STORE) !== "off"; } catch { autoSync.on = true; }
 }
@@ -784,20 +793,29 @@ async function autoSyncRun(): Promise<void> {
   await autoSync.pending;
 }
 async function autoSyncTick(): Promise<void> {
-  const clock = (d: Date): string => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const clock = clockHm;
   let fresh = 0; // records this tick brought in: a data screen on show is redrawn so "on its own" is seen, not just said
   try {
     const r = await core.call<{ pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run", { auto: true });
     if (!autoSync.on) return; // switched off while the run was out: its result is dropped
     autoSync.at = new Date();
+    autoSync.silent = 0; autoSync.waitingSince = null;
     const polled = (r.sites ?? []).filter((x) => x.error !== "not_auto"); // a network relay is never polled, so it is not counted
     const failed = polled.filter((x) => x.error).length;
     fresh = r.pull.records_new;
     autoSync.line = `Synced on its own at ${clock(autoSync.at)} · ${fresh} new${r.status === "partial" || r.pull.status === "partial" ? " (partial)" : ""}${failed > 0 ? ` · ${failed} of ${polled.length} relays could not be used; see Relays below` : ""}`;
   } catch (e) {
-    if (core.isCoreError(e) && (e.code === "busy" || e.code === "locked" || e.code === "not_found" || e.code === "not_folder")) return; // nothing to do this tick; the next one looks again
+    if (core.isCoreError(e) && (e.code === "busy" || e.code === "locked")) {
+      // the slot is held: nothing to do this tick; from the third silent tick in a row the walk line says so (BL-5a)
+      autoSync.silent += 1;
+      autoSync.waitingSince ??= new Date();
+      if (autoSync.silent >= AUTO_SYNC_SILENT_SAY && current() === "sync") void route();
+      return;
+    }
+    if (core.isCoreError(e) && (e.code === "not_found" || e.code === "not_folder")) return; // no store or no folder is not a wait; the next tick looks again
     if (!autoSync.on) return;
     autoSync.at = new Date();
+    autoSync.silent = 0; autoSync.waitingSince = null;
     autoSync.line = `Could not sync on its own at ${clock(autoSync.at)}. ${coreLine(e)}`;
   }
   // the Sync screen shows the line; a data screen shows the new records; the pairing view is never rebuilt under a code being typed
@@ -1289,7 +1307,9 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     sw.append(box);
     stat.append(sw);
     const rule = status.relay_kind === "mixed" ? " A network relay is never polled on its own: Sync now reaches it." : "";
-    const line = autoSync.running ? "Syncing on its own…" : autoSync.line || "Every 5 minutes while the app is open, and when you come back to it.";
+    const said = autoSync.line || "Every 5 minutes while the app is open, and when you come back to it.";
+    const wait = autoSyncWaitText(); // its own sentence after the walk line (which may end in a fragment)
+    const line = autoSync.running ? "Syncing on its own…" : wait ? `${said.endsWith(".") ? said : `${said}.`}${wait}` : said;
     stat.append(el("p", "caption muted", autoSync.on ? `${line}${rule}` : "Off. Sync now still works."));
   }
   if (syncRun.running || syncRun.push !== "idle") {
@@ -1979,7 +1999,11 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
     // the newest run never ended and nothing of ours runs now: `interrupted` = a later write open noticed the dead
     // writer; `running` = not noticed yet, or a command-line import running beside the app (7b-10)
     const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
-    return bannerEl("Interrupted", `${when} · this import stopped before it ended · drop it again, files already held are skipped`, true);
+    // BL-5a: import.last also lists sync and re-read runs; the way back depends on what stopped
+    const what = run.transport === "relay" ? "a sync stopped before it ended · run Sync again"
+      : run.transport === "reparse" ? "a re-read of the held records stopped before it ended · run it again from the command line: disconect reparse"
+      : "this import stopped before it ended · drop it again, files already held are skipped";
+    return bannerEl("Interrupted", `${when} · ${what}`, true);
   }
   if (run.status === "cancelled") {
     const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
