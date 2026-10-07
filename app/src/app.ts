@@ -2197,6 +2197,18 @@ let debugPairYes = false; // --debug-pair-yes / --debug-pair-no / --debug-pair-c
 let debugPairNo = false;
 let debugPairCancel = false;
 let debugPairOpen = false;
+let debugPairReload: "code" | "confirm" | null = null;
+/** Evidence run (12-F row 4, attack M3), debug builds only: reload the webview once, a moment after the named screen shows. */
+function debugReloadOnce(at: "code" | "confirm"): void {
+  if (import.meta.env.DEV) {
+    if (debugPairReload !== at) return;
+    try {
+      if (sessionStorage.getItem("debug-reloaded")) return;
+      sessionStorage.setItem("debug-reloaded", "1");
+    } catch { return; }
+    setTimeout(() => location.reload(), 2000);
+  }
+}
 
 /** Move to another pairing screen. The screen stays awake exactly while the code is up, so every way out of the Code
  *  screen (confirm, cancel, error, reload at start-up) goes through here and switches it off. */
@@ -2249,14 +2261,14 @@ function pairFailure(e: unknown): void {
     } else if (m.startsWith("This phone is already paired")) {
       pairError("paired", "This phone is already paired", "It already holds a copy of your data. To pair it again, forget this phone in Settings first; that deletes its copy, and your Mac keeps everything.");
     } else if (m.startsWith("Your Mac closed this offer")) {
-      if (joinCodeShown) pairError("closed", "Your Mac closed this offer", m);
+      if (joinCodeShown) pairError("closed", "Pairing stopped", m);
       else pairError("ended", "This offer has already ended", m);
     } else if (m.startsWith("The key was saved")) {
       pairError("saved", "Paired, but the first pull did not finish", m);
     } else if (m.startsWith("Cancelled.")) {
-      pairError("other", "Pairing cancelled", m);
+      pairError("other", "Pairing stopped", m);
     } else if (m.startsWith("Not paired.")) {
-      pairError("other", "Not paired", m);
+      pairError("other", "You chose not to pair", m);
     } else {
       pairError("other", "Pairing did not finish", m);
     }
@@ -2289,8 +2301,10 @@ function phonePairEvent(payload: unknown): void {
   if (p.phase === "code" && typeof p.code === "string" && (pp.v === "joining" || pp.v === "code")) {
     joinCodeShown = true;
     setPair({ v: "code", code: p.code, host: joinHost, exp: joinExp });
+    debugReloadOnce("code");
   } else if (p.phase === "released" && (pp.v === "code" || pp.v === "joining")) {
     setPair({ v: "confirm", host: joinHost });
+    debugReloadOnce("confirm");
   }
 }
 function phonePairProgress(p: { phase?: string; state?: string }): void {
@@ -2326,7 +2340,7 @@ async function phoneCancel(): Promise<void> {
     // the join answers "Cancelled. Cancel on your Mac too." and that frame is drawn from its rejection
   } catch (e) {
     if (core.isCoreError(e) && e.code === "busy") { void phoneAnswer(false); return; } // already released: answer the check with no
-    pairError("other", "Pairing cancelled", "Cancelled. Cancel on your Mac too.");
+    pairError("other", "Pairing stopped", "Cancelled. Cancel on your Mac too.");
   }
 }
 
@@ -2455,7 +2469,7 @@ function drawPairCode(out: ParentNode, s: { code: string; exp: number | null }):
 }
 
 function drawPairConfirm(out: ParentNode, s: { host: string | null }): void {
-  header(out, "Did your Mac say Paired?", "Answer after you typed the digits into your Mac.");
+  header(out, "Check your Mac", "Answer after you typed the digits into your Mac.");
   const card = pcard("Confirm");
   card.append(ptext("p", "body", `Did your Mac say Paired? This phone will trust the Mac at ${s.host ?? "the address in the offer"}.`));
   card.append(ptext("p", "caption muted", "Answer Yes only if your Mac showed Paired just now. If it did not, answer No: nothing is saved."));
@@ -3441,6 +3455,8 @@ void (async () => {
     debugPairYes = args.includes("--debug-pair-yes"); // the Confirm screen answers itself with a real click (12-F row 4 evidence runs)
     debugPairNo = args.includes("--debug-pair-no");
     debugPairOpen = args.includes("--debug-pair-open-today"); // the Done screen's own "Open Today" is clicked once it shows
+    if (args.includes("--debug-pair-reload-on-code")) debugPairReload = "code"; // reload the webview once, 2 s after the Code screen shows
+    if (args.includes("--debug-pair-reload-on-confirm")) debugPairReload = "confirm";
     debugPairCancel = args.includes("--debug-pair-cancel"); // the Code screen's own Cancel is clicked a few seconds after it shows
   }
   await phoneEndStrayJoin(); // a reload mid-join ends that join before any screen is drawn (phone only; a no-op elsewhere)
@@ -3462,13 +3478,17 @@ void (async () => {
         ["--debug-pair-done", { v: "done", applied: 4, fresh: 4812, rejected: 0, partial: false, protectedKey: true }],
         ["--debug-pair-expired", { v: "error", kind: "expired", lead: "This offer expired", text: "This offer expired by this phone's clock. Check the date and time.", exp: soon - 20 * 60 }],
         ["--debug-pair-paired", { v: "error", kind: "paired", lead: "This phone is already paired", text: "It already holds a copy of your data. To pair it again, forget this phone in Settings first; that deletes its copy, and your Mac keeps everything.", exp: null }],
-        ["--debug-pair-closed", { v: "error", kind: "closed", lead: "Your Mac closed this offer", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
+        ["--debug-pair-closed", { v: "error", kind: "closed", lead: "Pairing stopped", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
         ["--debug-pair-ended", { v: "error", kind: "ended", lead: "This offer has already ended", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
         ["--debug-pair-failed", { v: "error", kind: "other", lead: "Pairing did not finish", text: "Your Mac refused this request. Cancel on your Mac and start a new offer.", exp: null }],
       ];
       for (const [flag, view] of frames) if (args.includes(flag)) setPair(view);
+      // evidence run: the Start screen's own "Scan the code" button, clicked (the real scan path: permission, then the camera)
+      if (args.includes("--debug-pair-start-scan")) setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Scan the code")?.click(), 1500);
       // the simulator's camera: the offer text the host side wrote to a file, joined as if it had been scanned
-      if (args.includes("--debug-pair-offer-file") && pp.v === "start" && unpaired()) {
+      let reloaded = false;
+      try { reloaded = sessionStorage.getItem("debug-reloaded") === "1"; } catch { /* no storage */ }
+      if (args.includes("--debug-pair-offer-file") && pp.v === "start" && unpaired() && !reloaded) {
         void phone.debugOfferFromFile().then((text) => phoneJoin(text), () => undefined);
       }
     }
