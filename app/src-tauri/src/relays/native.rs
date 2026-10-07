@@ -48,8 +48,10 @@ fn bookmark_of(url: &NSURL) -> Option<Vec<u8>> {
 }
 
 /// Resolve a bookmark and start its scope. `None` when it does not resolve (the folder is gone, the volume or the
-/// provider is not there): the caller says "unavailable", it does not drop the entry.
-pub fn resolve(bookmark: &[u8]) -> Option<Resolved> {
+/// provider is not there) **or the scope could not be started** (the folder is then not this app's to read): the caller
+/// says "unavailable", it does not drop the entry. `unscoped_ok` is for the debug seed's plain-folder bookmarks and is
+/// honoured in debug builds only.
+pub fn resolve(bookmark: &[u8], unscoped_ok: bool) -> Option<Resolved> {
     let data = NSData::with_bytes(bookmark);
     let mut stale = objc2::runtime::Bool::NO;
     // SAFETY: `stale` is a valid pointer for the call.
@@ -59,10 +61,18 @@ pub fn resolve(bookmark: &[u8]) -> Option<Resolved> {
     .ok()?;
     // SAFETY: a plain NSURL message; the result decides whether a stop is owed (see `Scope`).
     let started = unsafe { url.startAccessingSecurityScopedResource() };
+    if !scope_allows(started, unscoped_ok) {
+        return None; // 19d review #17a: no scope, no path
+    }
     let path = url.path().map(|p| p.to_string());
     let refreshed = if stale.as_bool() { bookmark_of(&url) } else { None };
     let scope = Scope { url, started };
     path.map(|path| Resolved { scope, path, refreshed })
+}
+
+/// Whether a folder may be used: its scope started, or (debug builds, the seed's plain folders) the entry says it has none.
+fn scope_allows(started: bool, unscoped_ok: bool) -> bool {
+    started || (cfg!(debug_assertions) && unscoped_ok)
 }
 
 /// A bookmark for a folder this app already owns (the debug seed and the tests); the picker's own bookmarks come from
@@ -195,14 +205,18 @@ mod tests {
         let folder = dir.join("Relay");
         std::fs::create_dir_all(&folder).unwrap();
         let bytes = bookmark_for_path(&folder).expect("a bookmark");
+        // (the simulator starts every scope, so "did not start" is tested on the rule itself)
+        assert!(!scope_allows(false, false), "a bookmark whose scope does not start is unavailable, not a path");
+        assert!(scope_allows(true, false));
+        assert_eq!(scope_allows(false, true), cfg!(debug_assertions), "only the debug seed's folders may go unscoped, and only in debug");
         {
-            let r = resolve(&bytes).expect("resolves");
+            let r = resolve(&bytes, true).expect("resolves");
             assert_eq!(std::fs::canonicalize(&r.path).unwrap(), std::fs::canonicalize(&folder).unwrap());
             assert!(std::fs::read_dir(&r.path).is_ok());
         }
         std::fs::remove_dir_all(&folder).unwrap();
-        assert!(resolve(&bytes).is_none(), "a folder that is gone is unavailable");
-        assert!(resolve(b"not a bookmark").is_none());
+        assert!(resolve(&bytes, true).is_none(), "a folder that is gone is unavailable");
+        assert!(resolve(b"not a bookmark", true).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
