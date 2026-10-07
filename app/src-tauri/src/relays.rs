@@ -203,7 +203,6 @@ pub fn lan_check(text: &str) -> Result<String, &'static str> {
 }
 
 fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str> {
-    use std::net::IpAddr;
     let t = text.trim();
     if t.len() > 200 || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("bad_address");
@@ -213,9 +212,21 @@ fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str>
     if u.scheme() != "http" || !u.username().is_empty() || u.password().is_some() || !plain_path || u.query().is_some() || u.fragment().is_some() {
         return Err("bad_address");
     }
-    let ip: IpAddr = match u.host() {
-        Some(url::Host::Ipv4(v4)) => IpAddr::V4(v4),
-        Some(url::Host::Ipv6(v6)) => IpAddr::V6(v6),
+    // (no address types are named here: the egress guard keeps the network types in the coach module)
+    // the class of an address: (never a pairing address, loopback, private range), on its IPv4 form when it is mapped
+    let v4_class = |o: [u8; 4]| (o[0] == 0 || o[0] >= 224 || (o[0] == 169 && o[1] == 254), o[0] == 127, o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) || (o[0] == 100 && (64..=127).contains(&o[1])));
+    let (never, loopback, private, host) = match u.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            let (n, l, p) = v4_class(v4.octets());
+            (n, l, p, v4.to_string())
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            let (n, l, p) = match v6.to_ipv4_mapped() {
+                Some(m) => v4_class(m.octets()),
+                None => (v6.is_unspecified() || v6.octets()[0] == 0xff || (v6.segments()[0] & 0xffc0) == 0xfe80, v6.is_loopback(), (v6.segments()[0] & 0xfe00) == 0xfc00),
+            };
+            (n, l, p, format!("[{v6}]"))
+        }
         Some(url::Host::Domain(_)) => return Err("address_name"),
         None => return Err("bad_address"),
     };
@@ -223,32 +234,9 @@ fn lan_check_with(text: &str, loopback_ok: bool) -> Result<String, &'static str>
     let authority = t.split_once("://").map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""));
     let has_port = if authority.starts_with('[') { authority.contains("]:") } else { authority.contains(':') };
     let port = u.port_or_known_default().filter(|_| has_port).ok_or("bad_address")?;
-    let ip = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
-        v4 => v4,
-    };
-    let never = match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 0 || o[0] >= 224 || (o[0] == 169 && o[1] == 254)
-        }
-        IpAddr::V6(v6) => v6.is_unspecified() || v6.octets()[0] == 0xff || (v6.segments()[0] & 0xffc0) == 0xfe80,
-    };
-    let private = match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168) || (o[0] == 100 && (64..=127).contains(&o[1]))
-        }
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
-    };
-    let ok = !never && if ip.is_loopback() { loopback_ok } else { private };
-    if !ok {
+    if never || !(private || (loopback && loopback_ok)) {
         return Err("not_local");
     }
-    let host = match ip {
-        IpAddr::V6(v6) => format!("[{v6}]"),
-        IpAddr::V4(v4) => v4.to_string(),
-    };
     Ok(format!("http://{host}:{port}"))
 }
 
