@@ -904,20 +904,23 @@ fn an_address_that_left_resets_keep_so_the_next_offers_server_follows_the_lifeti
     };
     let mut live = Live::unlocked(&db, hooks);
     let listen = listen_on_free_port();
-    live.call("relay.serve", json!({"on": true, "listen": listen}));
+    let on = live.call("relay.serve", json!({"on": true, "listen": listen}));
+    assert!(on["result"]["serving"] == true, "the server starts on the free port: {on}");
     present.store(false, Ordering::SeqCst);
     live.event("relay", "stopped");
-    // the stop lands a tick after the event under full-suite load: wait, never assert the instant
+    // the server is taken before the event is emitted, so the status reads null by now; the stop itself completes a
+    // tick later: wait, never assert the instant
     assert!(wait_until(5, || live.serving().is_null()), "the server left with its address");
     present.store(true, Ordering::SeqCst);
     // sync.status reads the server gone the moment it is taken; its stop (the acceptor's join, behind `stopping`)
     // completes a tick later, and under full-suite load the next offer on the same port meets "the relay is
-    // stopping" or the port still held: retry until the old server is really gone, never assert the instant
+    // stopping": retry on exactly that answer (the listener is closed by then, so the port is free), never assert
+    // the instant; any other error fails at once
     let mut reply = Value::Null;
     let started = wait_until(10, || {
         reply = live.call("pair.offer", json!({"listen": listen}));
         reply["result"]["offer"].is_string()
-            || !matches!(reply["error"]["code"].as_str(), Some("busy") | Some("internal"))
+            || error_of(&reply) != ("busy", "the relay is stopping; try again in a moment")
     });
     assert!(started && reply["result"]["offer"].is_string(), "the next offer's server starts once the old one stopped: {reply}");
     assert_eq!(live.serving()["keep"], false, "the switch and the core agree: keep is off");
