@@ -269,6 +269,7 @@ fn import_live_batch(
     files: Vec<LiveFile>,
     writer: &mut Writer<'_>,
     mut progress: Option<Progress<'_>>,
+    cancel: Option<Cancel<'_>>,
 ) -> Result<(), SourceError> {
     let total = files.len() as u64;
     for (done, (label, readings, cut_off)) in (1u64..).zip(files) {
@@ -302,6 +303,10 @@ fn import_live_batch(
         if let Some(report) = progress.as_deref_mut() {
             report(done, Some(total), outcome);
         }
+        if cancel.is_some_and(|asked| asked()) {
+            writer.stats.cancelled = true;
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -312,6 +317,11 @@ fn import_live_batch(
 /// export's JSON phase restarts `done` at 0 and reports `(done, None, stream)` after each imported file.
 /// Never a file name or path.
 pub type Progress<'a> = &'a mut dyn FnMut(u64, Option<u64>, &str);
+
+/// `CancelCheck`: asked after each file, right after `progress`. True stops the import there: the file that was
+/// being read is kept, nothing later is read, the phases not yet started are skipped, the phase that was cut keeps
+/// its tail derivations, and the run is booked `cancelled` (`ImportStats::cancelled`).
+pub type Cancel<'a> = &'a dyn Fn() -> bool;
 
 /// Lend a progress callback to one phase without giving it away.
 pub fn reborrow<'b>(progress: &'b mut Option<Progress<'_>>) -> Option<Progress<'b>> {
@@ -336,6 +346,7 @@ pub(crate) fn import_batch(
     files: &[(String, Vec<u8>)],
     writer: &mut Writer<'_>,
     mut progress: Option<Progress<'_>>,
+    cancel: Option<Cancel<'_>>,
 ) -> Result<(), WriterError> {
     for (_label, data) in files {
         writer.offsets.extend(fit::scan_clock_offsets(data));
@@ -346,6 +357,10 @@ pub(crate) fn import_batch(
         if let Some(report) = progress.as_deref_mut() {
             report(done, Some(total), outcome_text(outcome));
         }
+        if cancel.is_some_and(|asked| asked()) {
+            writer.stats.cancelled = true; // the batch's own derivations still run for what was written
+            break;
+        }
     }
     writer.derive_daily_steps()?;
     writer.derive_daily_from_samples()?;
@@ -355,12 +370,24 @@ pub(crate) fn import_batch(
 /// Import whatever `path` is into `conn` (a writable connection holding the write lock) and report.
 /// `transport` defaults to `connect_export` for an account export and `drop` otherwise. An
 /// export's FIT members go first (one clock-offset pre-pass), then its JSON files, in one run.
-/// `progress` is called after each file (see [`Progress`]).
+/// `progress` is called after each file (see [`Progress`]). [`import_path_with`] adds a cancel check.
 pub fn import_path(
     conn: &Connection,
     path: &Path,
     transport: Option<&str>,
+    progress: Option<Progress<'_>>,
+) -> Result<ImportStats, SourceError> {
+    import_path_with(conn, path, transport, progress, None)
+}
+
+/// [`import_path`] with `cancel` asked after each file (see [`Cancel`]): a cancelled run returns its stats with
+/// `cancelled` set (no error), booked `cancelled` in `import_runs`.
+pub fn import_path_with(
+    conn: &Connection,
+    path: &Path,
+    transport: Option<&str>,
     mut progress: Option<Progress<'_>>,
+    cancel: Option<Cancel<'_>>,
 ) -> Result<ImportStats, SourceError> {
     if !path.exists() {
         return Err(SourceError::NotFound(path.display().to_string()));
@@ -372,10 +399,18 @@ pub fn import_path(
     let outcome = if is_export {
         export::collect_fit_members(path)
             .and_then(|files| {
-                import_batch(&files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)
+                import_batch(&files, &mut writer, reborrow(&mut progress), cancel).map_err(SourceError::from)
             })
-            .and_then(|()| export::import_connect_export(path, &mut writer, reborrow(&mut progress)))
             .and_then(|()| {
+                if writer.stats.cancelled {
+                    return Ok(());
+                }
+                export::import_connect_export(path, &mut writer, reborrow(&mut progress), cancel)
+            })
+            .and_then(|()| {
+                if writer.stats.cancelled {
+                    return Ok(());
+                }
                 let stored = stored_json_streams(conn)?;
                 rederive_json(conn, &mut writer, &stored)?;
                 writer.derive_live_samples()?;
@@ -384,10 +419,12 @@ pub fn import_path(
     } else {
         iter_live_files(path).and_then(|live_files| {
             let single_live_file = path.is_file() && !live_files.is_empty();
-            import_live_batch(live_files, &mut writer, reborrow(&mut progress))?;
+            import_live_batch(live_files, &mut writer, reborrow(&mut progress), cancel)?;
             let fit_files = if single_live_file { Vec::new() } else { iter_fit_files(path)? };
-            import_batch(&fit_files, &mut writer, reborrow(&mut progress)).map_err(SourceError::from)?;
-            writer.derive_live_samples()?;
+            if !writer.stats.cancelled {
+                import_batch(&fit_files, &mut writer, reborrow(&mut progress), cancel).map_err(SourceError::from)?;
+            }
+            writer.derive_live_samples()?; // also after a cancel: the live files written get their samples
             Ok(())
         })
     };

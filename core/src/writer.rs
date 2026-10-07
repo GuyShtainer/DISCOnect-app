@@ -169,6 +169,8 @@ pub struct ImportStats {
     pub warnings: Vec<String>,
     pub dates_assumed_utc: u64,
     pub derived_days: i64,
+    /// The run was cancelled after a file (`import.cancel`): the counters are what it read before that.
+    pub cancelled: bool,
 }
 
 impl ImportStats {
@@ -187,12 +189,16 @@ impl ImportStats {
             warnings: Vec::new(),
             dates_assumed_utc: 0,
             derived_days: 0,
+            cancelled: false,
         }
     }
 
-    /// `ok`, `partial` (some failed) or `failed` (some failed and none imported).
+    /// `cancelled` (the caller's cancel check answered True), `ok`, `partial` (some failed) or `failed` (some
+    /// failed and none imported).
     pub fn status(&self) -> &'static str {
-        if self.files_failed > 0 && self.files_imported == 0 {
+        if self.cancelled {
+            "cancelled"
+        } else if self.files_failed > 0 && self.files_imported == 0 {
             "failed"
         } else if self.files_failed > 0 {
             "partial"

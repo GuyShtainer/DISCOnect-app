@@ -57,7 +57,7 @@ fn core_of(state: &State<'_, Core>) -> Result<Sidecar, CoreError> {
 #[cfg(not(target_os = "ios"))]
 pub const ALLOWED_METHODS: &[&str] = &[
     "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "import.last",
-    "sync.status", "sync.run", "relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel",
+    "import.cancel", "sync.status", "sync.run", "relay.addresses", "relay.serve", "pair.offer", "pair.confirm", "pair.cancel",
 ];
 
 /// The phone's list (12-F, S5): the four server-side methods are gone, because a phone serves nothing and the core
@@ -65,12 +65,13 @@ pub const ALLOWED_METHODS: &[&str] = &[
 /// flag, never the relay's offer. `pair.forget` (12-F row 5b) is on this list only: it deletes the phone's own copy.
 /// `key.lock` (row 5c) is too: the phone drops its master after five minutes away (see [`AwayClock`]); the app calls it
 /// in-process, the list says the page may too. `pair.join` and `pair.land` (12-F row 3) are the phone as the pairing
-/// joiner; every other core refuses them after the shared prefix.
+/// joiner; every other core refuses them after the shared prefix. `import.cancel` (BL-3) is on both lists: the Import
+/// screen is desktop-only, and a phone's core answers it `not_found`.
 /// `tests/egress_guards.rs` reads the first list above for the page's calls and this one for the four.
 #[cfg(target_os = "ios")]
 pub const ALLOWED_METHODS: &[&str] = &[
     "app.info", "data.today", "data.live", "data.sleep", "data.contract", "data.health", "data.metric", "data.facts", "key.status", "key.cache", "key.unlock", "key.lock", "import.last",
-    "sync.status", "sync.run", "pair.cancel", "pair.forget", "pair.join", "pair.land",
+    "import.cancel", "sync.status", "sync.run", "pair.cancel", "pair.forget", "pair.join", "pair.land",
 ];
 
 /// `Ok` when the page may call `method`; otherwise a fixed refusal that never echoes the method.
@@ -125,8 +126,8 @@ fn mcp_command(app: tauri::AppHandle) -> String {
 fn release_args(args: Vec<String>) -> Vec<String> {
     // the last eighteen are the phone's pairing evidence flags (12-F row 4): states drawn with synthetic values, and the
     // debug door that feeds the offer text from a file and answers the screens' choices
-    const NO_OPERAND: [&str; 30] = [
-        "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-unlock", "--debug-forget-open",
+    const NO_OPERAND: [&str; 31] = [
+        "--debug-drop-over", "--debug-pair-digits", "--debug-drawer-open", "--debug-sync-run", "--debug-pair-start", "--debug-import-cancel", "--debug-unlock", "--debug-forget-open",
         "--debug-pair-scan", "--debug-pair-code", "--debug-pair-confirm", "--debug-pair-done", "--debug-pair-expired", "--debug-pair-paired",
         "--debug-pair-closed", "--debug-pair-ended", "--debug-pair-stopping", "--debug-pair-landing", "--debug-pair-joining", "--debug-pair-clock", "--debug-pair-notpaired", "--debug-pair-failed", "--debug-pair-offer-file", "--debug-pair-yes", "--debug-pair-no", "--debug-pair-cancel", "--debug-pair-open-today", "--debug-pair-reload-on-code", "--debug-pair-reload-on-confirm", "--debug-pair-start-scan", "--debug-pair-reload-on-landing",
     ];

@@ -396,6 +396,10 @@ pub struct Session {
     unlocked: Option<Secret32>,
     /// True while an import worker owns the slot (`Session.import_slot` in the oracle).
     import_slot: Arc<AtomicBool>,
+    /// True while the slot's holder is an import, not a sync or a pair push: what `import.cancel` reaches.
+    importing: Arc<AtomicBool>,
+    /// Set by `import.cancel`; the import worker asks it after each file.
+    import_cancel: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     /// Test hook: the next import worker waits for this channel to deliver or close first.
     hold: Option<Receiver<()>>,
@@ -413,6 +417,8 @@ impl Session {
             channel: Arc::new(channel),
             unlocked: None,
             import_slot: Arc::new(AtomicBool::new(false)),
+            importing: Arc::new(AtomicBool::new(false)),
+            import_cancel: Arc::new(AtomicBool::new(false)),
             workers: Vec::new(),
             hold: None,
             relay: serving::new_state(),
@@ -553,6 +559,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("data.facts", Handler::Reply(data_facts)),
     ("import.run", Handler::Spawn(import_run)),
     ("import.last", Handler::Reply(import_last)),
+    ("import.cancel", Handler::Reply(import_cancel)),
     ("sync.status", Handler::Reply(sync_status)),
     ("sync.run", Handler::Spawn(sync_run)),
     ("relay.addresses", Handler::Reply(relay_addresses)),
@@ -997,8 +1004,13 @@ struct ImportJob {
     master: Option<Secret32>,
     channel: Arc<Channel>,
     slot: Arc<AtomicBool>,
+    importing: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     hold: Option<Receiver<()>>,
 }
+
+/// What the cancelled `import.run` request answers (code `cancelled`); `import.cancel` itself says only "cancelling".
+pub const CANCELLED_IMPORT: &str = "the import was cancelled; the files read so far are kept";
 
 /// A `progress` event line, shaped like the oracle's (`note` is redacted).
 fn progress_line(done: u64, total: Option<u64>, note: &str) -> String {
@@ -1024,11 +1036,15 @@ fn run_import(job: &ImportJob) -> Result<Value, Failure> {
     let mut progress = |done: u64, total: Option<u64>, note: &str| {
         let _ = channel.write_line(&progress_line(done, total, note));
     };
-    let stats = sources::import_path(store.conn(), path, job.transport, Some(&mut progress))?;
+    let cancel = || job.cancel.load(Ordering::SeqCst);
+    let stats = sources::import_path_with(store.conn(), path, job.transport, Some(&mut progress), Some(&cancel))?;
     let run_id: Option<i64> = store
         .conn()
         .query_row("SELECT MAX(id) FROM import_runs", [], |row| row.get(0))
         .map_err(StoreError::from)?;
+    if stats.cancelled {
+        return Err(Failure::serve("cancelled", CANCELLED_IMPORT));
+    }
     Ok(json!({
         "run_id": run_id, "files": stats.files_seen, "ok": stats.files_imported,
         "partial": stats.status() == "partial", "duplicate": stats.files_duplicate,
@@ -1049,8 +1065,22 @@ fn import_worker(job: ImportJob) {
         Ok(Err(failure)) => failure_line(&job.id, &failure),
         Err(_) => failure_line(&job.id, &Failure::serve("internal", "unexpected panic in the import worker")),
     };
+    job.importing.store(false, Ordering::SeqCst);
     job.slot.store(false, Ordering::SeqCst);
     let _ = job.channel.write_line(&line);
+}
+
+/// `import.cancel`: ask the running import to stop after the file it is reading (a stop path: only `locked` is
+/// checked). `{"state": "cancelling"}` while an import owns the slot, again on a repeat; the `import.run` request
+/// then answers `cancelled` — or its result, when the cancel came after the last file's check. No import (also a
+/// sync or a pair push holding the slot) → `not_found`.
+fn import_cancel(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.require_unlocked()?;
+    if !session.importing.load(Ordering::SeqCst) {
+        return Err(Failure::serve("not_found", "no import is running"));
+    }
+    session.import_cancel.store(true, Ordering::SeqCst);
+    Ok(json!({"state": "cancelling"}))
 }
 
 /// Start an import on a worker thread; the answer is sent when it finishes.
@@ -1076,6 +1106,8 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     {
         return Err(Failure::serve("busy", session.join.busy_message("an import is already running")));
     }
+    session.import_cancel.store(false, Ordering::SeqCst);
+    session.importing.store(true, Ordering::SeqCst);
     // a path with a lone surrogate cannot name a file here: it is reported as missing (booked, kb/23)
     let text = path.to_text();
     let lossy = text.clone().unwrap_or_else(|| path.units_lossy());
@@ -1089,9 +1121,11 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         master: session.unlocked_master().cloned(),
         channel: Arc::clone(&session.channel),
         slot: Arc::clone(&session.import_slot),
+        importing: Arc::clone(&session.importing),
+        cancel: Arc::clone(&session.import_cancel),
         hold: session.hold.take(),
     };
-    let slot = Arc::clone(&session.import_slot);
+    let (slot, importing) = (Arc::clone(&session.import_slot), Arc::clone(&session.importing));
     match std::thread::Builder::new()
         .name("import".into())
         .spawn(move || import_worker(job))
@@ -1101,6 +1135,7 @@ fn import_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
             Ok(())
         }
         Err(error) => {
+            importing.store(false, Ordering::SeqCst);
             slot.store(false, Ordering::SeqCst);
             Err(Failure::Io(error))
         }

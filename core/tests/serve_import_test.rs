@@ -363,6 +363,75 @@ fn a_second_import_while_one_runs_is_busy_and_reads_keep_working() {
     );
 }
 
+
+#[test]
+fn a_held_import_cancelled_before_release_reads_one_file_and_is_booked_cancelled() {
+    // the flag is set while the worker is held, so exactly the first file is read: the check sits right after
+    // each file's progress event (twin of the Python test of the same name)
+    let (dir, db) = new_store();
+    let export = export_folder(dir.path());
+    let mut rig = Rig::new(&db);
+    let (release, gate) = mpsc::channel::<()>();
+    rig.session.hold_next_import(gate);
+    let mut chunks = VecDeque::new();
+    chunks.push_back(request(1, "import.run", json!({"path": export, "transport": "export"})));
+    chunks.push_back(
+        [
+            request(2, "import.cancel", json!({})),
+            request(3, "import.cancel", json!({})), // a repeat while it runs says the same
+        ]
+        .concat(),
+    );
+    let mut input = Pieces {
+        chunks,
+        at_end: Some(Box::new(move || drop(release))),
+    };
+    assert_eq!(serve::serve_lines(&mut rig.session, &mut input), 0);
+    let lines = rig.lines();
+    let by_id = |id: i64| lines.iter().find(|l| l["id"] == id).expect("answer");
+    assert_eq!(by_id(2)["result"], json!({"state": "cancelling"}));
+    assert_eq!(by_id(3)["result"], json!({"state": "cancelling"}));
+    assert_eq!(
+        by_id(1)["error"],
+        json!({"code": "cancelled", "message": "the import was cancelled; the files read so far are kept"})
+    );
+    assert_eq!(
+        events(&lines).iter().map(|e| e.0).collect::<Vec<_>>(),
+        vec![1],
+        "the file being read finished; nothing later was read"
+    );
+    let last = rig.send(4, "import.last", json!({}));
+    let run = &last.last().expect("answer")["result"]["runs"][0];
+    assert_eq!(
+        (run["status"].as_str(), run["files_seen"].as_i64(), run["files_imported"].as_i64(), run["error"].is_null()),
+        (Some("cancelled"), Some(1), Some(1), true)
+    );
+    let none = rig.send(5, "import.cancel", json!({}));
+    assert_eq!(
+        none.last().expect("answer")["error"],
+        json!({"code": "not_found", "message": "no import is running"}),
+        "nothing runs now"
+    );
+    let again = rig.send(6, "import.run", json!({"path": export, "transport": "export"}));
+    let result = &again.last().expect("answer")["result"];
+    assert_eq!(
+        (result["ok"].as_i64(), result["duplicate"].as_i64()),
+        (Some(2), Some(1)),
+        "the slot is free; the file kept counts as a duplicate"
+    );
+}
+
+#[test]
+fn import_cancel_with_no_import_is_not_found() {
+    let (_dir, db) = new_store();
+    let mut rig = Rig::new(&db);
+    let lines = rig.send(1, "import.cancel", json!({}));
+    assert_eq!(
+        lines.last().expect("answer")["error"],
+        json!({"code": "not_found", "message": "no import is running"})
+    );
+}
+
 #[test]
 fn an_import_is_busy_while_another_process_holds_the_write_lock() {
     let (dir, db) = new_store();

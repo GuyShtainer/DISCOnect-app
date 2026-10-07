@@ -245,6 +245,7 @@ fn key_lock_drops_the_master_and_is_idempotent() {
     assert_eq!(rig.send("key.lock", json!({"x": 1}))["result"], locked, "params are ignored");
     assert_eq!(rig.send("key.status", json!({}))["result"]["unlocked"], false);
     assert_eq!(rig.code("sync.status", json!({})), "locked");
+    assert_eq!(rig.code("import.cancel", json!({})), "locked");
     assert_eq!(rig.code("key.cache", json!({"enable": true})), "locked");
     assert_eq!(rig.send("key.lock", json!({}))["result"], locked, "twice");
     assert_eq!(rig.send("key.unlock", json!({"passphrase": PASSPHRASE}))["result"], json!({"unlocked": true}));
@@ -284,6 +285,7 @@ fn the_methods_table_and_the_deferred_list_partition_the_protocol() {
             "data.facts",
             "import.run",
             "import.last",
+            "import.cancel",
             "sync.status",
             "sync.run",
             "relay.addresses",

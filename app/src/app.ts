@@ -1643,8 +1643,11 @@ type ImportUi = {
   notice: string | null;
   /** Drops that sent `started` while an import of this app already ran: each will be answered `busy`. */
   extra: number;
+  /** The Cancel button was pressed and the core said "cancelling": the file being read finishes, then the run ends. */
+  cancelling: boolean;
 };
-const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null, notice: null, extra: 0 };
+const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null, notice: null, extra: 0, cancelling: false };
+let debugImportCancel = false; // --debug-import-cancel (evidence runs, debug builds): the running card's Cancel is clicked a moment after the import starts
 let dropOverDebug = false;
 let importBusyTimer: ReturnType<typeof setTimeout> | null = null;
 const IMPORT_BUSY = "An import or a sync is already running. Drop it again when that ends.";
@@ -1674,6 +1677,7 @@ function importPaint(): void {
 }
 
 function importProgressLine(): string {
+  if (importUi.cancelling) return `Stopping after this file · ${importUi.done} read`;
   if (!importUi.seen) return "Starting";
   // only an export's JSON phase reports no total (a folder counts its files from the first event)
   if (importUi.total === null) return `Reading the export's records · ${importUi.done} read`;
@@ -1708,12 +1712,16 @@ function onImportEvent(payload: unknown): void {
       importUi.seen = false;
       importUi.error = null;
       importUi.notice = null;
+      importUi.cancelling = false;
+      if (debugImportCancel) setTimeout(() => (document.getElementById("import-cancel") as HTMLButtonElement | null)?.click(), 700);
     }
-  } else if (p.state === "done") {
+  } else if (p.state === "done" || (p.state === "failed" && p.code === "cancelled")) {
+    // `cancelled`: the Cancel button's own ending; the run row below says what was kept
     importUi.running = false;
     importUi.kind = null;
     importUi.error = null;
     importUi.extra = 0;
+    importUi.cancelling = false;
   } else if (p.state === "failed") {
     if (p.code === "bad_drop" || p.code === "core_unavailable") {
       importUi.error = { code: p.code, message: p.message ?? "" }; // never touches a run in progress
@@ -1772,11 +1780,34 @@ function dropCard(kind: "export" | "usb", title: string, hint: string): HTMLElem
     const line = el("span", "caption", importProgressLine());
     line.id = "import-progress-text";
     card.append(line);
+    const cancel = el("button", "secondary", "Cancel");
+    cancel.id = "import-cancel";
+    cancel.disabled = importUi.cancelling;
+    cancel.onclick = () => void importCancel();
+    card.append(cancel);
     fill.style.width = importUi.total ? `${Math.min(100, Math.round((importUi.done / importUi.total) * 100))}%` : "0%";
   } else {
     card.append(el("p", "body", hint));
   }
   return card;
+}
+
+/** The running card's Cancel: the core stops after the file it is reading (`import.cancel`); a `not_found` means it
+ * already ended, which the import event is about to say. */
+async function importCancel(): Promise<void> {
+  try {
+    await core.call("import.cancel");
+  } catch (e) {
+    if (!(core.isCoreError(e) && e.code === "not_found")) {
+      importUi.error = core.isCoreError(e) ? e : { code: "error", message: String(e) };
+      importRedraw();
+    }
+    return;
+  }
+  importUi.cancelling = true;
+  const button = document.getElementById("import-cancel") as HTMLButtonElement | null;
+  if (button) button.disabled = true;
+  importPaint();
 }
 
 /** Plain words for a failed import: never a code name, never the core's own message. */
@@ -1801,6 +1832,11 @@ function importOutcomeBanner(run: ImportRun | undefined): HTMLElement {
     // writer; `running` = not noticed yet, or a command-line import running beside the app (7b-10)
     const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
     return bannerEl("Interrupted", `${when} · this import stopped before it ended · drop it again, files already held are skipped`, true);
+  }
+  if (run.status === "cancelled") {
+    const when = run.started_at ? new Date(run.started_at).toLocaleString() : "unknown time";
+    const read = `${run.files_seen} file${run.files_seen === 1 ? "" : "s"}`;
+    return bannerEl("Cancelled", `${when} · stopped after ${read} · what was read is kept · drop it again to finish, files already held are skipped`);
   }
   const failedRun = run.status === "failed";
   const withFailures = !failedRun && run.files_failed > 0;
@@ -1863,6 +1899,7 @@ async function screenImport(out: ParentNode): Promise<void> {
         grid.append(a);
       } else {
         const word = run.status === "interrupted" ? "interrupted"
+          : run.status === "cancelled" ? "cancelled"
           : run.status === "running" ? (i === 0 && importUi.running ? "running" : "interrupted")
           : "done";
         grid.append(el("span", "caption", word));
@@ -3527,6 +3564,7 @@ void (async () => {
     if (args.includes("--debug-pair-reload-on-confirm")) debugPairReload = "confirm";
     if (args.includes("--debug-pair-reload-on-landing")) debugPairReload = "landing"; // right after the Yes is sent (the first pull may be done by then)
     debugPairCancel = args.includes("--debug-pair-cancel"); // the Code screen's own Cancel is clicked a few seconds after it shows
+    debugImportCancel = args.includes("--debug-import-cancel"); // the running import card's Cancel is clicked a moment after the import starts
   }
   await phoneEndStrayJoin(); // a reload mid-join ends that join before any screen is drawn (phone only; a no-op elsewhere)
   const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
