@@ -613,7 +613,7 @@ fn pair_land_false_lands_nothing() {
     let no = live.call("pair.land", json!({"confirm": false}));
     assert_eq!(no["result"], json!({"state": "declined"}));
     let done = live.response(id);
-    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Cancel on your Mac too."));
+    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Nothing was saved on this device. Your Mac may say Paired; it keeps no record of this device. Start a new offer on your Mac to pair."));
     assert!(phone_files(&pdb).is_empty(), "a no lands nothing");
     assert_eq!((live.joiners)(), 0);
     assert_eq!(live.call("pair.land", json!({"confirm": true}))["error"]["code"], "not_found");
@@ -631,7 +631,7 @@ fn the_land_wait_ends_as_a_no() {
     let digits = code_of(&mut live);
     mac.confirm(&digits).expect("release");
     let done = live.response(id);
-    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Cancel on your Mac too."));
+    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Nothing was saved on this device. Your Mac may say Paired; it keeps no record of this device. Start a new offer on your Mac to pair."));
     assert!(phone_files(&pdb).is_empty());
     // N3: a `pair.land` after the wait ran out is refused, never answered "landing"
     let late = live.call("pair.land", json!({"confirm": true}));
@@ -1208,7 +1208,7 @@ fn a_key_lock_during_the_land_wait_ends_the_join_not_paired() {
     let started = Instant::now();
     assert_eq!(live.call("key.lock", json!({}))["result"], json!({"state": "locked"}));
     let done = live.response(id);
-    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Cancel on your Mac too."));
+    assert_eq!(error_of(&done), ("pair_failed", "Not paired. Nothing was saved on this device. Your Mac may say Paired; it keeps no record of this device. Start a new offer on your Mac to pair."));
     assert!(started.elapsed() < Duration::from_secs(20), "the 600 s wait was not ended");
     assert!(phone_files(&pdb).is_empty(), "nothing is written while the key is supposed to be dropped");
     assert_eq!((live.joiners)(), 0);

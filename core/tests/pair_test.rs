@@ -842,14 +842,14 @@ fn pair_offer_and_pair_join_as_processes_with_the_digits_typed() {
     assert!(before_prompt.iter().all(|l| !l.contains(&joiner_code)), "{before_prompt:?}");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{joiner_code}\n").as_bytes()).expect("digits");
     line_with(&mut offer_err, "released");
-    line_with(&mut offer_err, "Pairing done");
+    line_with(&mut offer_err, "Paired; serving");
     // the human check (12-G N12): nothing lands until the user says the other device shows the pairing as done;
     // the question names the relay host; a blank line asks again
     assert!(line_with(&mut join_err, "This store would use the relay at ").contains(&offer_host(&offer)));
-    line_with(&mut join_err, "Did the other device say the pairing is done");
+    line_with(&mut join_err, "Did the other device say Paired");
     assert!(!joined_db.exists() && !keys::key_path_for(&joined_db).exists() && !relay_file.exists(), "nothing before the answer");
     join_in.write_all(b"\n").expect("a stray Enter");
-    line_with(&mut join_err, "Did the other device say the pairing is done");
+    line_with(&mut join_err, "Did the other device say Paired");
     join_in.write_all(b"y\n").expect("answer");
     drop(join_in);
 
@@ -901,8 +901,8 @@ fn a_joiner_that_is_not_told_paired_writes_nothing() {
     let code = code_in(&line_with(&mut join_err, "Code on this device"));
     lines_until(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
-    line_with(&mut offer_err, "Pairing done");
-    line_with(&mut join_err, "Did the other device say the pairing is done");
+    line_with(&mut offer_err, "Paired; serving");
+    line_with(&mut join_err, "Did the other device say Paired");
     join_in.write_all(b"n\n").expect("answer");
     drop(join_in);
     let mut rest = String::new();
@@ -950,7 +950,7 @@ fn a_joiner_with_no_terminal_to_ask_on_writes_nothing() {
     let code = code_in(&line_with(&mut join_err, "Code on this device"));
     lines_until(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
-    line_with(&mut offer_err, "Pairing done");
+    line_with(&mut offer_err, "Paired; serving");
     let mut rest = String::new();
     join_err.read_to_string(&mut rest).expect("stderr");
     let out = joiner.wait_with_output().expect("join output");
@@ -981,7 +981,7 @@ fn a_joiner_told_paired_on_the_command_line_lands_without_a_prompt() {
     let code = code_in(&line_with(&mut join_err, "Code on this device"));
     lines_until(&mut offer_err, "Type the code shown on the other device");
     offerer.0.stdin.as_mut().expect("stdin").write_all(format!("{code}\n").as_bytes()).expect("digits");
-    line_with(&mut offer_err, "Pairing done");
+    line_with(&mut offer_err, "Paired; serving");
     let out = joiner.wait_with_output().expect("join output");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");

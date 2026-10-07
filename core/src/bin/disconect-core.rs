@@ -25,7 +25,7 @@
 //! refuses before any request when the store, its key file, `<keys>.next`, `DISCONECT_KEYS` or a relay file of another
 //! store are in the way, shows its code on stderr, and once the offerer released asks on the terminal (`/dev/tty`
 //! when the offer came on a pipe; stdin when stdin is the terminal, its stray input flushed first) whether the other
-//! device says the pairing is done, naming the relay host: `y`/`yes` lands, a blank line asks again, anything
+//! device says Paired, naming the relay host: `y`/`yes` lands, a blank line asks again, anything
 //! else, EOF, no terminal at all or the offer's expiry drops the pairing with "Not paired; nothing was written"
 //! (exit 1); `--i-saw-paired` answers yes for scripts; `DISCONECT_ASK_ON_STDIN=1` reads the answer from stdin
 //! for test harnesses — the phone's `pair.land` step, 12-G N12. Then it writes the relay file (`relay.json` beside the db by default, where the app and the CLI read it), the
@@ -578,7 +578,7 @@ fn offer_session(handle: &PairHandle, master: &[u8; 32], key_file_bytes: &[u8]) 
     eprintln!("released — waiting for the device to fetch");
     let left = handle.expires_at().saturating_sub(disconect_core::relay::lan::wall_clock());
     if handle.wait_delivered(std::time::Duration::from_secs(left)) {
-        eprintln!("Pairing done; serving the relay (Ctrl-C to stop)");
+        eprintln!("Paired; serving the relay (Ctrl-C to stop)");
     } else {
         eprintln!("the device never fetched the payload; serving the relay (Ctrl-C to stop)");
     }
@@ -608,7 +608,7 @@ fn run_pair_join(args: &Args) -> Result<(), (u8, String)> {
     )
     .map_err(|e| pair_failure(&e))?;
     if !args.i_saw_paired && !confirmed(&offer) {
-        return Err((1, "Not paired; nothing was written. If the other device says the pairing is done, start a new offer there; if it never showed a device answering, cancel its offer.".into()));
+        return Err((1, "Not paired; nothing was written. If the other device says Paired, start a new offer there; if it never showed a device answering, cancel its offer.".into()));
     }
     let pulled = pair_client::land(&joined, db, &relay_file).map_err(|e| pair_failure(&e))?;
     println!("{}", json!({"paired": true, "pulled": pull_json(&pulled)}));
@@ -673,7 +673,7 @@ fn confirmed(offer: &disconect_core::pair::Offer) -> bool {
             return false;
         }
         let _ = writeln!(out, "This store would use the relay at {host}.");
-        let _ = writeln!(out, "Did the other device say the pairing is done? Type y to keep this pairing, anything else to drop it [y/N]");
+        let _ = writeln!(out, "Did the other device say Paired? Type y to keep this pairing, anything else to drop it [y/N]");
         let _ = out.flush();
         match lines.recv_timeout(left) {
             Ok(Some(line)) => match line.trim().to_ascii_lowercase().as_str() {

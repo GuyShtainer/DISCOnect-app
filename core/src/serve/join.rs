@@ -784,7 +784,7 @@ fn run_join(job: &JoinJob) -> Outcome {
     }
     let _ = job.channel.write_line(&event_line(&json!({"event": "pair", "phase": "released"})));
     if !wait_decision(&job.ctl, job.hooks.land_wait) {
-        return Outcome::Failed { failure: pair_failed("Not paired. Cancel on your Mac too."), drop_joiner: true };
+        return Outcome::Failed { failure: pair_failed("Not paired. Nothing was saved on this device. Your Mac may say Paired; it keeps no record of this device. Start a new offer on your Mac to pair."), drop_joiner: true };
     }
     land(job, &joined)
 }
