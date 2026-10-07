@@ -225,6 +225,8 @@ pub struct SiteSpec {
     /// A `lan` address also has to be an address class the phone may sync with (an IP literal, private or
     /// on-link; see `serve::join::lan_address_class_ok`): set for the entries a shell injects per call.
     pub check_address: bool,
+    /// A `lan` site of an `auto` run (19a): reported with the word `not_auto`, never opened, never connected to.
+    pub not_auto: bool,
 }
 
 impl SiteSpec {
@@ -236,6 +238,7 @@ impl SiteSpec {
             unavailable: false,
             create_root: entry.serve,
             check_address: false,
+            not_auto: false,
         }
     }
 }
@@ -259,7 +262,7 @@ fn folder_identity(root: &Path) -> Option<(u64, u64)> {
 }
 
 /// Open every relay of a run. There is one report per spec, in the specs' order; a spec that cannot be used
-/// carries its reason word (`unavailable`, `same_relay`, `bad_url`) and has no site. Never an error, and nothing is
+/// carries its reason word (`unavailable`, `same_relay`, `bad_url`, `not_auto`) and has no site. Never an error, and nothing is
 /// created: a missing root is `unavailable` (the first put creates `<root>/<account>` only).
 pub fn open_sites(specs: &[SiteSpec], master: &[u8]) -> (Vec<Site>, Vec<SiteReport>) {
     let mut sites: Vec<Site> = Vec::new();
@@ -273,7 +276,9 @@ pub fn open_sites(specs: &[SiteSpec], master: &[u8]) -> (Vec<Site>, Vec<SiteRepo
         };
         let mut report = SiteReport::new(&spec.id, kind);
         report.label = spec.label.clone();
-        let opened: Result<Box<dyn Relay + Send>, &'static str> = if spec.unavailable {
+        let opened: Result<Box<dyn Relay + Send>, &'static str> = if spec.not_auto {
+            Err("not_auto")
+        } else if spec.unavailable {
             Err("unavailable")
         } else {
             match &spec.config {

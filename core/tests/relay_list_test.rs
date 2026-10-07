@@ -85,6 +85,7 @@ fn folder_specs(roots: &[&Path]) -> Vec<SiteSpec> {
             unavailable: false,
             create_root: false,
             check_address: false,
+            not_auto: false,
         })
         .collect()
 }
@@ -287,7 +288,7 @@ fn open_sites_reports_what_it_cannot_open_and_never_fails() {
     let tmp = tempfile::tempdir().expect("tmp");
     let real = tmp.path().join("real");
     fs::create_dir_all(&real).expect("mkdir");
-    let spec = |id: &str, config: RelayConfig, unavailable: bool| SiteSpec { id: id.into(), config, label: String::new(), unavailable, create_root: false, check_address: false };
+    let spec = |id: &str, config: RelayConfig, unavailable: bool| SiteSpec { id: id.into(), config, label: String::new(), unavailable, create_root: false, check_address: false, not_auto: false };
     let folder = |p: &Path| RelayConfig::Folder(p.to_string_lossy().into_owned());
     let mut specs = vec![
         spec("00000001", folder(&real), false),
@@ -342,6 +343,7 @@ fn nothing_is_booked_when_no_site_can_take_a_bundle() {
         unavailable: false,
         create_root: false,
         check_address: false,
+            not_auto: false,
     };
     let (sites, mut reports) = open_sites(&[spec], &master());
     let result = push_all(a.conn(), &master(), &sites, &mut reports).expect("push");
@@ -357,6 +359,7 @@ fn nothing_is_booked_when_no_site_can_take_a_bundle() {
         unavailable: false,
         create_root: true,
         check_address: false,
+            not_auto: false,
     };
     let (sites, mut reports) = open_sites(&[legacy], &master());
     let result = push_all(a.conn(), &master(), &sites, &mut reports).expect("push");
@@ -457,6 +460,7 @@ fn a_public_lan_url_is_bad_url() {
         unavailable: false,
         create_root: false,
         check_address: check,
+            not_auto: false,
     };
     let specs = vec![
         spec("00000001", "http://8.8.8.8:24816", true),
@@ -514,6 +518,7 @@ fn lan_spec(url: &str) -> SiteSpec {
         unavailable: false,
         create_root: false,
         check_address: true,
+            not_auto: false,
     }
 }
 

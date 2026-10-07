@@ -177,7 +177,7 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
                "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
-               "serving": null, "relay_url": null, "relays": null})
+               "serving": null, "relay_url": null, "relay_kind": null, "relays": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");
@@ -558,6 +558,11 @@ fn an_empty_relay_list_answers_not_found_and_a_public_lan_address_is_refused() {
     rig.unlock();
     for (id, method) in [(2, "sync.run"), (3, "relay.addresses")] {
         let reply = rig.send(id, method, json!({}));
+        // the phone build cannot serve: its `relay.addresses` refuses before the shared prefix (12-F S5)
+        if cfg!(target_os = "ios") && method == "relay.addresses" {
+            assert_eq!(reply[0]["error"]["code"], "unsupported_transport", "{method}");
+            continue;
+        }
         assert_eq!(reply[0]["error"]["code"], "not_found", "{method}");
         assert_eq!(reply[0]["error"]["message"], "no relay is configured (relay.json in the data folder)");
     }
@@ -598,4 +603,89 @@ fn a_lan_site_in_the_list_is_partial_while_the_mac_is_away_and_carries_its_label
     assert_eq!(result["sites"][0]["error"], Value::Null);
     assert_eq!((result["sites"][1]["label"].as_str(), result["sites"][1]["kind"].as_str()), (Some("mac"), Some("lan")));
     assert_eq!(result["sites"][1]["error"], "unreachable");
+}
+
+#[test]
+fn auto_runs_the_folder_sites_and_reports_lan_not_auto() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+    for folder in [&one, &two] {
+        std::fs::create_dir_all(folder).expect("mkdir");
+    }
+    let (_da, a) = encrypted_store(true);
+    // a port nothing listens on: a connection attempt would be `unreachable`
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    relay_json(
+        &a,
+        json!({"relays": [
+            {"id": "0000000a", "kind": "folder", "path": one},
+            {"id": "0000000b", "kind": "folder", "path": two},
+            {"id": "0000000c", "kind": "lan", "url": url, "label": "mac"},
+        ]}),
+    );
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let lines = rig.send(2, "sync.run", json!({"auto": true}));
+    let result = &only_response(&lines)["result"];
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["sites"][0], site_row("0000000a", 1, 0, 0, Value::Null));
+    assert_eq!(result["sites"][1], site_row("0000000b", 1, 0, 0, Value::Null));
+    let lan = json!({"id": "0000000c", "kind": "lan", "label": "mac", "pushed": 0, "healed": 0, "behind": 0, "pulled": 0,
+                     "rejected": 0, "error": "not_auto"});
+    assert_eq!(result["sites"][2], lan);
+    let status = rig.send(3, "sync.status", json!({}));
+    assert_eq!(status[0]["result"]["relays"][2], lan);
+    assert_eq!(status[0]["result"]["relay_kind"], "mixed");
+}
+
+#[test]
+fn auto_with_no_folder_site_is_not_folder() {
+    let (_da, a) = encrypted_store(true);
+    relay_json(&a, json!({"lan": "http://127.0.0.1:9"}));
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let text = "auto sync runs over folder relays only; the list has none";
+    let reply = rig.send(2, "sync.run", json!({"auto": true}));
+    assert_eq!((reply[0]["error"]["code"].as_str(), reply[0]["error"]["message"].as_str()), (Some("not_folder"), Some(text)));
+    let per_call = json!([{"id": "0000000a", "kind": "lan", "url": "http://8.8.8.8:1"}]);
+    let reply = rig.send(3, "sync.run", json!({"auto": true, "relays": per_call}));
+    assert_eq!(reply[0]["error"]["code"], "not_folder");
+    let reply = rig.send(4, "sync.run", json!({"auto": true, "relays": []}));
+    assert_eq!(reply[0]["error"]["code"], "not_found");
+}
+
+#[test]
+fn auto_must_be_true_or_absent() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (_da, a) = encrypted_store(true);
+    relay_json(&a, json!({"folder": tmp.path().join("relay")}));
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    for bad in [json!(false), json!(null), json!(1), json!("true")] {
+        let reply = rig.send(2, "sync.run", json!({"auto": bad}));
+        assert_eq!(reply[0]["error"]["code"], "bad_params", "{bad}");
+        assert_eq!(reply[0]["error"]["message"], "auto: true or absent");
+    }
+}
+
+#[test]
+fn relay_kind_in_sync_status() {
+    let (_da, a) = encrypted_store(false);
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let kind = |rig: &mut Rig, id: i64| rig.send(id, "sync.status", json!({}))[0]["result"]["relay_kind"].clone();
+    assert_eq!(kind(&mut rig, 1), Value::Null);
+    relay_json(&a, json!({"relays": []}));
+    assert_eq!(kind(&mut rig, 2), Value::Null);
+    relay_json(&a, json!({"folder": "/f"}));
+    assert_eq!(kind(&mut rig, 3), json!("folder"));
+    relay_json(&a, json!({"lan": "http://127.0.0.1:9"}));
+    assert_eq!(kind(&mut rig, 4), json!("lan"));
+    relay_json(&a, json!({"relays": [
+        {"id": "0000000a", "kind": "folder", "path": "/f"},
+        {"id": "0000000b", "kind": "lan", "url": "http://127.0.0.1:9"},
+    ]}));
+    assert_eq!(kind(&mut rig, 5), json!("mixed"));
 }

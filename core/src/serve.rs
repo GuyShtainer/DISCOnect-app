@@ -1161,6 +1161,24 @@ fn relay_url_value(path: &Path) -> Value {
         .map_or(Value::Null, Value::String)
 }
 
+/// `relay_kind` of `sync.status`: what kinds of relay `relay.json`'s list holds.
+fn relay_kind_value(path: &Path) -> Value {
+    let Some(entries) = relay_config::read_list(path).filter(|entries| !entries.is_empty()) else {
+        return Value::Null;
+    };
+    let folders = entries.iter().filter(|e| matches!(e.config, relay_config::RelayConfig::Folder(_))).count();
+    Value::String(
+        if folders == entries.len() {
+            "folder"
+        } else if folders == 0 {
+            "lan"
+        } else {
+            "mixed"
+        }
+        .into(),
+    )
+}
+
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay
 /// tables answers what a fresh one would.
 fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
@@ -1174,6 +1192,8 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
         // The address this device pulls from, `http://host:port` from `relay.json`; null with no LAN relay named
         // (a folder relay has no address). Never a path, a credential or a folder name.
         object.insert("relay_url".into(), relay_url_value(&relay_json_path(&session.db_path)));
+        // `folder` | `lan` | `mixed` over the list's entries, null with no file or an empty list.
+        object.insert("relay_kind".into(), relay_kind_value(&relay_json_path(&session.db_path)));
         // The `sites` of the last `sync.run` of this session; null before the first.
         let last = session.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         object.insert("relays".into(), last.unwrap_or(Value::Null));
@@ -1255,7 +1275,8 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
     });
     emit(sync_event("sync", "pull", "done", Some(&pull)));
     keep(&reports);
-    let partial = pushed.partial || pulled.status != "ok" || reports.iter().any(|r| r.error.is_some());
+    // a `not_auto` site is the rule at work, not a failure
+    let partial = pushed.partial || pulled.status != "ok" || reports.iter().any(|r| r.error.is_some_and(|word| word != "not_auto"));
     Ok(json!({
         "push": push,
         "pull": pull,
@@ -1318,14 +1339,15 @@ fn relays_param(value: &Json) -> Result<Vec<relay_sync::SiteSpec>, Failure> {
         if specs.iter().any(|spec| spec.id == id) {
             return Err(bad());
         }
-        specs.push(relay_sync::SiteSpec { id, config, label, unavailable, create_root: false, check_address: true });
+        specs.push(relay_sync::SiteSpec { id, config, label, unavailable, create_root: false, check_address: true, not_auto: false });
     }
     Ok(specs)
 }
 
 /// Start a push-then-pull over the relays of the call's `relays` param, else of `relay.json`; the answer is sent
 /// when it finishes. Checked in this order: unlocked (`locked`), a relay configured (`not_found`; an empty
-/// `relays` counts as none), an encrypted store (`not_encrypted`), the shape of `relays` (`bad_params`), the slot
+/// `relays` counts as none), an encrypted store (`not_encrypted`), `auto` and the shape of `relays` (`bad_params`), `auto` over a
+/// list with no folder site (`not_folder`), the slot
 /// shared with `import.run` (`busy`).
 fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     session.require_unlocked()?;
@@ -1354,12 +1376,26 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
             ),
         ));
     };
-    let specs = match (per_call, entries) {
+    let auto = match call.params.get("auto") {
+        None => false,
+        Some(Json::Bool(true)) => true,
+        Some(_) => return Err(Failure::serve("bad_params", "auto: true or absent")),
+    };
+    let mut specs = match (per_call, entries) {
         (Some(value), _) => relays_param(value)?,
         (None, Some(entries)) => entries.iter().map(relay_sync::SiteSpec::from_entry).collect(),
         (None, None) => return Err(not_found()),
     };
+    if auto {
+        if !specs.iter().any(|spec| matches!(spec.config, relay_config::RelayConfig::Folder(_))) {
+            return Err(Failure::serve("not_folder", "auto sync runs over folder relays only; the list has none"));
+        }
+        for spec in &mut specs {
+            spec.not_auto = matches!(spec.config, relay_config::RelayConfig::Lan(_));
+        }
+    }
     if let [only] = specs.as_slice()
+        && !only.not_auto
         && !only.unavailable
         && let relay_config::RelayConfig::Lan(url) = &only.config
     {

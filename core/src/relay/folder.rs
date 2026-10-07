@@ -82,7 +82,8 @@ impl RelayError {
     /// | `Io` PermissionDenied                     | `no_permission` |
     /// | any other `Io`                            | `io_error`      |
     ///
-    /// `open_sites` adds `unavailable`, `same_relay`, `bad_url` and `unsupported_transport`.
+    /// `open_sites` adds `unavailable`, `same_relay`, `bad_url`, `unsupported_transport` and `not_auto` (a `lan` site
+    /// of an `auto` run: skipped by rule, never opened; it is not a failure of the run).
     pub fn site_word(&self) -> &'static str {
         use std::io::ErrorKind as K;
         match self {
