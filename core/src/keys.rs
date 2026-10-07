@@ -325,6 +325,27 @@ pub fn unlock(key_path: &Path, source: PassphraseSource<'_>) -> Result<Secret32,
 }
 
 #[cfg(test)]
+mod home_expansion {
+    //! The Python twin is `tests/test_home.py::test_a_bare_tilde_expands_and_a_named_user_is_left_alone_like_the_rust_core`.
+    use super::*;
+
+    #[test]
+    fn a_bare_tilde_expands_and_a_named_user_is_left_alone() {
+        // `~name/…` is never looked up in the password database (Python's expanduser would), so both cores open the
+        // same folder; the tests never set HOME (other tests read it), so the expanded cases are checked by shape
+        let home = std::env::var_os("HOME").expect("HOME is set in the test environment");
+        assert_eq!(expand_user(Path::new("~root/x")), Path::new("~root/x"));
+        assert_eq!(expand_user(Path::new("~nobody")), Path::new("~nobody"));
+        assert_eq!(expand_user(Path::new("/abs/~")), Path::new("/abs/~"));
+        assert_eq!(expand_user(Path::new("rel/~/x")), Path::new("rel/~/x"));
+        assert_eq!(expand_user(Path::new("~")), PathBuf::from(&home));
+        assert_eq!(expand_user(Path::new("~/")), PathBuf::from(&home));
+        assert_eq!(expand_user(Path::new("~/a/b")), PathBuf::from(&home).join("a/b"));
+        assert_eq!(expand_user(Path::new("~//a")), PathBuf::from(&home).join("a"));
+    }
+}
+
+#[cfg(test)]
 mod wire_constants {
     //! Known-answer vectors for the frozen derivations; the Python twin is `tests/test_wire_constants.py`.
     use super::*;

@@ -283,13 +283,9 @@ fn run_reparse(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, Str
     if stats.status() == "ok" { Ok(()) } else { Err((1, String::new())) }
 }
 
-/// `Path.expanduser()` for a leading `~`.
+/// A leading `~` stands for `$HOME` (`~name` is left alone): the library's one reading, shared with the Python core.
 fn expand_user(folder: &str) -> PathBuf {
-    match (folder.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        (None, Some(home)) if folder == "~" => PathBuf::from(home),
-        _ => PathBuf::from(folder),
-    }
+    keys::expand_user(std::path::Path::new(folder))
 }
 
 /// `relay.json` in the folder of the resolved database, shared with the Python CLI.
