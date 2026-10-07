@@ -3457,6 +3457,7 @@ window.addEventListener("hashchange", () => {
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 // 12-F row 5c: the shell dropped the master after five minutes away (`key.lock`, in Rust); draw Unlock, never the old screen
 void core.onCoreEvent("locked", () => {
+  if (PHONE) main.replaceChildren(); // the old screen's DOM is gone the moment the lock arrives, so a failsafe never reveals data
   void route();
   if (!PHONE) return;
   // the shell holds its cover across the lock: take it off only once the page really shows Unlock (the route may be
