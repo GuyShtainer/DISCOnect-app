@@ -77,7 +77,6 @@ function stepTip(i: number): void {
   if (typeof x === "number") active.chart.dispatchAction({ type: "showTip", x, y: GRID.top + 40 });
 }
 
-/** Group digits with a thin space like the rest of the app; one decimal under 100. */
 /** One series' words for one day: "<scope word> <value> <unit>" or "<scope word> no data", then ", <n> % of the day"
  * when the core measured how much of the day the value rests on; a live series with no session that day says
  * nothing (a session claims no day). */

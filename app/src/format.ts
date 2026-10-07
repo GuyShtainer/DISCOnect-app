@@ -1,5 +1,5 @@
-// The one number formatter (BL-6, 7b-7 review N9): Today, Sleep, Data health and the Trends readout all say a value
-// the same way. `fmt` rounds (one decimal under 100, thin-space thousands at 100 and above) and drops the unit word
+// The one number formatter (BL-6, 7b-7 review N9): Today's cards, the Sleep night's minutes and the Trends readout
+// all say a value the same way. `fmt` rounds (one decimal under 100, thin-space thousands at 100 and above) and drops the unit word
 // for a score or steps; `fmtValue` also reads minutes at an hour and above as "7 h 12 min".
 export function fmt(value: number | null, unit: string | null): string {
   if (value === null || value === undefined) return "no data";

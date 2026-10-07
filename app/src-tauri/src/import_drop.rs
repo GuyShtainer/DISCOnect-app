@@ -4,6 +4,7 @@
 //! hears `core://import` events (`started`, `done`, `failed`) and the core's own `progress` events.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 use tauri::{Emitter, Manager, Runtime};
@@ -70,13 +71,32 @@ fn failed(error: &CoreError) -> Value {
     json!({ "state": "failed", "code": error.code, "message": message })
 }
 
-/// Call `import.run` through the door and tell `emit` ("core://import", payload) what happens. The counts of the
-/// core's answer ride on `done`; a core error (including `busy`) is a `failed` carrying the core's code.
 /// A drop that lands while a sync tick or a click holds the core's one task slot hears `busy` for well under a
 /// second (BL-6, 19a review): the drop waits for the slot this long, in these steps, before it fails.
 pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 pub const BUSY_TRIES: usize = 8;
 
+/// Drops whose [`run_import_waiting`] is running now. Only the first drop waits for the slot: a drop that starts
+/// while another is in flight gets no retries, so it fails `busy` at once and the page's count of extra drops stays
+/// true (BL-6 review S1: otherwise a second drop could win the slot as the first import ended and run untracked).
+static DROPS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct InFlight(bool);
+
+impl InFlight {
+    fn enter() -> Self {
+        InFlight(DROPS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) == 0)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        DROPS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Call `import.run` through the door and tell `emit` ("core://import", payload) what happens. The counts of the
+/// core's answer ride on `done`; a core error (including `busy`) is a `failed` carrying the core's code.
 pub async fn run_import(door: &dyn CoreDoor, emit: &(dyn Fn(&str, Value) + Sync), path: &Path, kind: Kind) {
     run_import_waiting(door, emit, path, kind, BUSY_WAIT, BUSY_TRIES).await;
 }
@@ -90,6 +110,8 @@ pub async fn run_import_waiting(
     wait: std::time::Duration,
     tries: usize,
 ) {
+    let flight = InFlight::enter();
+    let tries = if flight.0 { tries } else { 0 };
     emit("core://import", json!({ "state": "started", "kind": kind.word() }));
     let transport = match kind {
         Kind::Export => "export",
@@ -112,6 +134,7 @@ pub async fn run_import_waiting(
         Err(e) => failed(&e),
     };
     emit("core://import", payload);
+    drop(flight);
 }
 
 /// The drop entry point (a real drop and the debug door both end here). Classifies, refuses with `bad_drop`, or
@@ -254,7 +277,15 @@ mod tests {
         }
     }
 
+    /// The drops-in-flight count is one static: tests that drive an import run one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn drive_waiting(door: &dyn CoreDoor, kind: Kind, tries: usize) -> Vec<Value> {
+        let _one = serial();
         let seen = Mutex::new(Vec::new());
         let emit = |name: &str, payload: Value| {
             assert_eq!(name, "core://import");
@@ -281,11 +312,41 @@ mod tests {
     fn a_drop_that_hears_busy_past_the_wait_fails_with_the_core_code() {
         let door = BusyThen(usize::MAX, Ok(json!({})), Mutex::new(Vec::new()));
         let events = drive_waiting(&door, Kind::Usb, BUSY_TRIES);
+        assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[1]["code"], "busy");
         assert_eq!(door.2.lock().expect("calls").len(), BUSY_TRIES + 1, "the first try and every retry");
     }
 
+    #[test]
+    fn a_second_drop_while_the_first_waits_for_the_slot_fails_busy_at_once() {
+        let _one = serial();
+        let counts = json!({ "run_id": 5, "files": 1, "ok": 1, "partial": 0, "duplicate": 0, "failed": 0 });
+        let first = BusyThen(3, Ok(counts), Mutex::new(Vec::new()));
+        let second = BusyThen(usize::MAX, Ok(json!({})), Mutex::new(Vec::new()));
+        let seen_first = Mutex::new(Vec::new());
+        let seen_second = Mutex::new(Vec::new());
+        let emit_first = |_: &str, payload: Value| seen_first.lock().expect("seen").push(payload);
+        let emit_second = |_: &str, payload: Value| seen_second.lock().expect("seen").push(payload);
+        let wait = std::time::Duration::from_millis(1);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("runtime");
+        rt.block_on(async {
+            tokio::join!(
+                run_import_waiting(&first, &emit_first, Path::new("/scratch/one"), Kind::Export, wait, BUSY_TRIES),
+                run_import_waiting(&second, &emit_second, Path::new("/scratch/two"), Kind::Export, wait, BUSY_TRIES),
+            );
+        });
+        let first_events = seen_first.into_inner().expect("seen");
+        let second_events = seen_second.into_inner().expect("seen");
+        assert_eq!(first_events[1]["state"], "done", "the first drop waited and imported: {first_events:?}");
+        assert_eq!(first.2.lock().expect("calls").len(), 4);
+        assert_eq!(second_events.len(), 2, "{second_events:?}");
+        assert_eq!(second_events[1]["code"], "busy", "the second drop never waited: {second_events:?}");
+        assert_eq!(second.2.lock().expect("calls").len(), 1, "one try, no retry");
+        assert_eq!(DROPS_IN_FLIGHT.load(Ordering::SeqCst), 0, "both flights ended");
+    }
+
     fn drive(door: &Fake, kind: Kind) -> Vec<Value> {
+        let _one = serial();
         let seen = Mutex::new(Vec::new());
         let emit = |name: &str, payload: Value| {
             assert_eq!(name, "core://import");
@@ -307,12 +368,16 @@ mod tests {
         assert_eq!(calls[0].1, json!({ "path": "/scratch/in", "transport": "export" }));
     }
 
+    /// Runs under the production timer (`BUSY_WAIT` × `BUSY_TRIES`, about two seconds): the proof that `run_import`
+    /// really retries that many times on a core that stays busy.
     #[test]
     fn a_busy_core_is_a_failed_event_with_the_core_code() {
         let door = Fake(Err(CoreError::new("busy", "an import or a sync is already running")), Mutex::new(Vec::new()));
         let events = drive(&door, Kind::Usb);
         assert_eq!(events[0], json!({ "state": "started", "kind": "usb" }));
         assert_eq!(events[1], json!({ "state": "failed", "code": "busy", "message": "an import or a sync is already running" }));
-        assert_eq!(door.1.lock().expect("calls")[0].1["transport"], "usb");
+        let calls = door.1.lock().expect("calls");
+        assert_eq!(calls[0].1["transport"], "usb");
+        assert_eq!(calls.len(), BUSY_TRIES + 1, "the first try and every retry under the production timer");
     }
 }

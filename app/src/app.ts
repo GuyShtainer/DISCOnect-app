@@ -498,7 +498,6 @@ function todayCard(row: TodayRow, todayDay: string): HTMLElement {
   return card;
 }
 
-/** `fmt`, with minutes of an hour or more read as hours and minutes ("7 h 00 min"). */
 // ---- Watch (the live link, Bet 9 follow-up) -----------------------------------------------
 // The lab's Python reads the watch over Bluetooth as a child of the app; every reading arrives as an event and
 // is also collected in the lab's raw folder on this Mac. The screen only draws the latest value per metric.
@@ -1482,9 +1481,9 @@ function sentence(t: string | undefined | null): string | null {
   return t ? t.charAt(0).toUpperCase() + t.slice(1) : null;
 }
 
+/** Sleep minutes in the shared formatter's words ("7 h 12 min", "48 min"); rounded first so 59.6 reads as an hour. */
 function sleepMinutes(m: number): string {
-  const n = Math.round(m);
-  return n >= 60 ? `${Math.floor(n / 60)} h ${String(n % 60).padStart(2, "0")} min` : `${n} min`;
+  return fmtValue(Math.round(m), "min");
 }
 
 /** One daily figure of a night: the sleep length (`sleep_duration`, in MINUTES) or the sleep score. */
@@ -1803,8 +1802,11 @@ type ImportUi = {
   extra: number;
   /** The Cancel button was pressed and the core said "cancelling": the file being read finishes, then the run ends. */
   cancelling: boolean;
+  /** Cancel was pressed while the drop still waited for the core's slot (`import.cancel` found no run): sent again
+   * on the first progress event, when the run exists (BL-6 review S2). */
+  cancelWanted: boolean;
 };
-const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null, notice: null, extra: 0, cancelling: false };
+const importUi: ImportUi = { running: false, kind: null, done: 0, total: null, note: "", seen: false, error: null, notice: null, extra: 0, cancelling: false, cancelWanted: false };
 let debugImportCancel = false; // --debug-import-cancel (evidence runs, debug builds): the running card's Cancel is clicked a moment after the import starts
 let dropOverDebug = false;
 let importBusyTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1871,6 +1873,7 @@ function onImportEvent(payload: unknown): void {
       importUi.error = null;
       importUi.notice = null;
       importUi.cancelling = false;
+      importUi.cancelWanted = false;
       if (debugImportCancel) setTimeout(() => (document.getElementById("import-cancel") as HTMLButtonElement | null)?.click(), 700);
     }
   } else if (p.state === "done" || (p.state === "failed" && p.code === "cancelled")) {
@@ -1880,6 +1883,7 @@ function onImportEvent(payload: unknown): void {
     importUi.error = null;
     importUi.extra = 0;
     importUi.cancelling = false;
+    importUi.cancelWanted = false;
   } else if (p.state === "failed") {
     if (p.code === "bad_drop" || p.code === "core_unavailable") {
       importUi.error = { code: p.code, message: p.message ?? "" }; // never touches a run in progress
@@ -1905,11 +1909,16 @@ function onImportEvent(payload: unknown): void {
 
 function onImportProgress(p: { done?: number; total?: number | null; note?: string }): void {
   if (!importUi.running) return;
+  const first = !importUi.seen;
   importUi.seen = true;
   importUi.done = p.done ?? 0;
   importUi.total = typeof p.total === "number" ? p.total : null;
   importUi.note = p.note ?? "";
   if (importUi.kind === null) importIdleLater();
+  if (first && importUi.cancelWanted) {
+    importUi.cancelWanted = false;
+    void importCancel(); // the run exists now: the Cancel pressed during the wait for the slot reaches it
+  }
   importPaint();
 }
 
@@ -1951,12 +1960,15 @@ function dropCard(kind: "export" | "usb", title: string, hint: string): HTMLElem
 }
 
 /** The running card's Cancel: the core stops after the file it is reading (`import.cancel`); a `not_found` means it
- * already ended, which the import event is about to say. */
+ * already ended, which the import event is about to say, or that the drop still waits for the core's slot (no
+ * progress seen yet): then the cancel is kept and sent again on the first progress event. */
 async function importCancel(): Promise<void> {
   try {
     await core.call("import.cancel");
   } catch (e) {
-    if (!(core.isCoreError(e) && e.code === "not_found")) {
+    if (core.isCoreError(e) && e.code === "not_found" && importUi.running && !importUi.seen) {
+      importUi.cancelWanted = true;
+    } else if (!(core.isCoreError(e) && e.code === "not_found")) {
       // a notice, not the outcome: the import keeps running (review N6)
       importUi.notice = core.isCoreError(e) ? e.message : String(e);
       importRedraw();
@@ -3264,9 +3276,9 @@ function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTM
   if (sessions === 0) {
     card.append(ptext("p", "caption muted", "Nothing recorded on this phone yet."));
   }
-  const fmt = (secs: number, withDay: boolean): string =>
+  const when = (secs: number, withDay: boolean): string =>
     new Date(secs * 1000).toLocaleString("en-GB", withDay ? { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
-  const span = p?.last_from != null && p.last_to != null ? `${fmt(p.last_from, true)} to ${fmt(p.last_to, false)}` : "none yet";
+  const span = p?.last_from != null && p.last_to != null ? `${when(p.last_from, true)} to ${when(p.last_to, false)}` : "none yet";
   const unsent = status?.records_unsent ?? 0;
   const mine = (status?.chains ?? []).find((c) => c.self);
   const sent = phonePull.sent !== null
