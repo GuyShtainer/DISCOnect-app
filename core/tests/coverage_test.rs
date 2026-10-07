@@ -301,3 +301,31 @@ fn calendar_is_one_pass_of_statuses_and_completeness() {
     assert_eq!(rows[1].1, "present");
     assert_eq!(rows.iter().map(|row| row.2).collect::<Vec<_>>(), [None, Some(50), Some(0), None, None]);
 }
+
+#[test]
+fn a_midnight_hour_resolves_each_sample_of_one_pair() {
+    // 7b-13 review, twin of `test_a_midnight_hour_reads_its_samples_through_the_index`: on a +5:30 watch the
+    // hour 18Z holds local midnight; 18:10Z is 23:40 on 06-01 and 18:40Z is 00:10 on 06-02. The index half
+    // is the unit test `the_midnight_hour_read_searches_the_sample_index`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = writable(dir.path());
+    let conn = store.conn();
+    let first = raw(conn, "fit:monitoring_b", "2025-06-01T00:00:00Z", "2025-06-03T00:00:00Z");
+    conn.execute(
+        "INSERT INTO clock_offsets(ts_utc, offset_s, raw_record_id) VALUES('2025-06-01T12:00:00Z', 19800, ?1)",
+        [first],
+    )
+    .expect("offset");
+    for stamp in ["2025-06-01T18:10:00Z", "2025-06-01T18:40:00Z"] {
+        conn.execute(
+            "INSERT INTO metric_samples(metric, ts_utc, value, source_scope, raw_record_id) VALUES('heart_rate', ?1, 60, 'device', ?2)",
+            rusqlite::params![stamp, first],
+        )
+        .expect("sample");
+    }
+    let got = coverage::day_statuses(conn, Contract::get().expect("contract"), "heart_rate", "device", "2025-05-31", "2025-06-03")
+        .expect("statuses");
+    let want = [("2025-05-31", "not_covered"), ("2025-06-01", "present"), ("2025-06-02", "present"), ("2025-06-03", "source_empty")]
+        .map(|(day, status)| (day.to_string(), status));
+    assert_eq!(got, want);
+}

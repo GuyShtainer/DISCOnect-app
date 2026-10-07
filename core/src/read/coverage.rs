@@ -262,6 +262,22 @@ fn failed_by_stream(
     Ok((failed, unattributed))
 }
 
+/// `_HOUR_SAMPLES`: the samples of one (metric, scope) in one UTC hour bucket (`YYYY-MM-DDTHH`). The
+/// `ts_utc` range lets SQLite search the sample index for the hour; with `substr` alone it walked every
+/// row of the metric once per hour that holds a local midnight (7b-13 review: ~11 s on both cores for a
+/// year of minutes on a half-hour-zone watch). The `substr` keeps the row set exactly the bucket's.
+const HOUR_SAMPLES: &str = "SELECT ts_utc FROM metric_samples WHERE metric=? AND source_scope=? \
+     AND ts_utc >= ? AND ts_utc < ? AND substr(ts_utc, 1, 13)=?";
+
+/// `_hour_end`: the first text after every text that starts with `hour`: its last character, one higher.
+fn hour_end(hour: &str) -> String {
+    let mut chars: Vec<char> = hour.chars().collect();
+    if let Some(last) = chars.last_mut() {
+        *last = char::from_u32(u32::from(*last) + 1).unwrap_or(char::MAX);
+    }
+    chars.into_iter().collect()
+}
+
 /// Per (metric, scope), the local days that hold at least one row.
 fn present_days(
     conn: &Connection,
@@ -303,11 +319,9 @@ fn present_days(
             BTreeSet::from([first_day])
         } else {
             // a local midnight falls inside this hour (half-hour zones): resolve each sample
-            let mut inner = conn.prepare(
-                "SELECT ts_utc FROM metric_samples WHERE metric=? AND source_scope=? \
-                 AND substr(ts_utc, 1, 13)=?",
-            )?;
-            let mut stamps = inner.query([metric, scope, hour])?;
+            let mut inner = conn.prepare(HOUR_SAMPLES)?;
+            let end = hour_end(hour);
+            let mut stamps = inner.query([metric, scope, hour, end.as_str(), hour])?;
             let mut found = BTreeSet::new();
             while let Some(stamp) = stamps.next()? {
                 let moment = parse_moment(text(stamp.get_ref(0)?)?)?;
@@ -927,6 +941,30 @@ mod tests {
             None
         );
         assert!(span_days(&offsets, Some("garbage"), Some("1970-01-02T05:00:00Z")).is_err());
+    }
+
+    #[test]
+    fn the_midnight_hour_read_searches_the_sample_index() {
+        // 7b-13 review: with `substr` alone SQLite walked every row of the metric once per midnight hour
+        assert_eq!(hour_end("2025-06-01T18"), "2025-06-01T19");
+        assert_eq!(hour_end("2025-06-01T09"), "2025-06-01T0:");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::store::open_for_write_with(&dir.path().join("store.db"), "test", 5.0, None)
+            .expect("store");
+        let mut statement = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {HOUR_SAMPLES}"))
+            .expect("plan");
+        let plan = statement
+            .query_map(
+                ["heart_rate", "device", "2025-06-01T18", "2025-06-01T19", "2025-06-01T18"],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("details")
+            .join(" ");
+        assert!(plan.contains("ts_utc>? AND ts_utc<?"), "{plan}");
     }
 
     #[test]
