@@ -422,5 +422,17 @@ fn fifty_thousand_metric_names_are_answered_in_two_seconds() {
         assert_eq!(ignored[0], "name-0");
         assert_eq!(ignored[24_999], "name-24999");
     }
-    assert!(took < Duration::from_secs(2), "50k names took {took:?}");
+    // two seconds on a Mac build of either profile; a slower runner (the iOS simulator's debug build takes 2.3–3.1 s)
+    // declares itself with DISCONECT_TEST_TIME_SCALE=<integer multiplier> instead of loosening the pin for everyone
+    let budget = Duration::from_secs(2 * time_scale());
+    assert!(took < budget, "50k names took {took:?} (budget {budget:?})");
+}
+
+/// `DISCONECT_TEST_TIME_SCALE` (a positive integer, default 1): how much slower than a Mac this runner may be.
+fn time_scale() -> u64 {
+    std::env::var("DISCONECT_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|scale| *scale >= 1)
+        .unwrap_or(1)
 }
