@@ -9,6 +9,10 @@ const NO_STORE: &str = "error: no store: pass --db <path> or set DISCONECT_DB (H
 fn run(args: &[&str], home: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_disconect-core"));
     command.env_remove("DISCONECT_DB").args(args);
+    // the old names only produce a warning line; keep stderr to the lines under test
+    for suffix in ["DB", "KEYS", "PASSPHRASE", "RECOVERY_WORDS"] {
+        command.env_remove(format!("HEARTHBEAT_{suffix}"));
+    }
     match home {
         Some(value) => command.env("HOME", value),
         None => command.env_remove("HOME"),
@@ -25,6 +29,11 @@ fn serve_and_mcp_without_a_home_say_no_store_and_exit_1() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(stderr.lines().any(|l| l == NO_STORE), "{args:?} with HOME {home:?}: {stderr}");
         }
+        // the relay list needs no store but does need a home for relay.json (the Python twin says the same)
+        let out = run(&["sync", "relay", "list"], home);
+        assert_eq!(out.status.code(), Some(1), "relay list with HOME {home:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.lines().any(|l| l == "error: HOME is not set"), "relay list with HOME {home:?}: {stderr}");
     }
 }
 
@@ -40,5 +49,6 @@ fn a_db_override_needs_no_home() {
         .output()
         .expect("run the binary");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
     assert!(!stderr.contains("HOME is not set"), "{stderr}");
 }
