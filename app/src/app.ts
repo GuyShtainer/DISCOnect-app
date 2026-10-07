@@ -841,15 +841,17 @@ function listenOf(ip: string, port: number): string {
 function drawQr(text: string): HTMLElement {
   const box = el("div", "qr");
   try {
-    const qr = qrcode(0, "M");
+    const qr = qrcode(0, "L"); // error-correction L: the offer fits version 13 (69 modules), so each module is drawn larger
     qr.addData(text);
     qr.make();
     const n = qr.getModuleCount();
-    const size = 216;
     const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
+    // 312 CSS px at most, every module a whole number of device pixels (crisp edges: a camera reads them better)
+    const mod = Math.max(1, Math.floor((312 * dpr) / n));
+    const size = (mod * n) / dpr;
     const canvas = el("canvas");
-    canvas.width = size * dpr;
-    canvas.height = size * dpr;
+    canvas.width = mod * n;
+    canvas.height = mod * n;
     canvas.style.width = `${size}px`;
     canvas.style.height = `${size}px`;
     canvas.setAttribute("role", "img");
@@ -857,13 +859,9 @@ function drawQr(text: string): HTMLElement {
     const ctx = canvas.getContext("2d");
     if (ctx) {
       ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--qr-ink").trim() || "CanvasText";
-      const px = size * dpr;
       for (let r = 0; r < n; r++) {
         for (let c = 0; c < n; c++) {
-          if (!qr.isDark(r, c)) continue;
-          const x0 = Math.round((c * px) / n);
-          const y0 = Math.round((r * px) / n);
-          ctx.fillRect(x0, y0, Math.round(((c + 1) * px) / n) - x0, Math.round(((r + 1) * px) / n) - y0);
+          if (qr.isDark(r, c)) ctx.fillRect(c * mod, r * mod, mod, mod);
         }
       }
     }
@@ -2176,7 +2174,7 @@ function phoneEmptyBanner(): HTMLElement {
 // the six digits live in this module's memory for as long as their screen needs them: never stored, never in a URL,
 // never passed to console.*.
 const OFFER_PREFIX = "disconect-pair:v2.";
-type PairErrorKind = "expired" | "paired" | "closed" | "ended" | "saved" | "other";
+type PairErrorKind = "expired" | "clock" | "paired" | "closed" | "ended" | "saved" | "other";
 type PairView =
   | { v: "start" }
   | { v: "paste" } // debug builds only
@@ -2184,6 +2182,7 @@ type PairView =
   | { v: "joining"; host: string | null; exp: number | null; reached: boolean }
   | { v: "code"; code: string; host: string | null; exp: number | null }
   | { v: "confirm"; host: string | null }
+  | { v: "stopping" }
   | { v: "landing"; done: string[] }
   | { v: "done"; applied: number; fresh: number; rejected: number; partial: boolean; protectedKey: boolean | null }
   | { v: "error"; kind: PairErrorKind; lead: string; text: string; exp: number | null };
@@ -2193,20 +2192,21 @@ let joinHost: string | null = null; // the host and expiry of the offer being jo
 let joinExp: number | null = null;
 let joinCodeShown = false; // an end after the code was shown reads as "closed by your Mac"; before it, as "already ended"
 let answerBusy = false;
+let declinedByUi = false; // the UI itself sent pair.land false (a No tap): only then is "Not paired" the user's own choice
 let debugPairYes = false; // --debug-pair-yes / --debug-pair-no / --debug-pair-cancel (evidence runs, debug builds)
 let debugPairNo = false;
 let debugPairCancel = false;
 let debugPairOpen = false;
-let debugPairReload: "code" | "confirm" | null = null;
+let debugPairReload: "code" | "confirm" | "landing" | null = null;
 /** Evidence run (12-F row 4, attack M3), debug builds only: reload the webview once, a moment after the named screen shows. */
-function debugReloadOnce(at: "code" | "confirm"): void {
+function debugReloadOnce(at: "code" | "confirm" | "landing"): void {
   if (import.meta.env.DEV) {
     if (debugPairReload !== at) return;
     try {
       if (sessionStorage.getItem("debug-reloaded")) return;
       sessionStorage.setItem("debug-reloaded", "1");
     } catch { return; }
-    setTimeout(() => location.reload(), 2000);
+    setTimeout(() => location.reload(), at === "landing" ? 0 : 2000);
   }
 }
 
@@ -2256,8 +2256,10 @@ function pairFailure(e: unknown): void {
   }
   const m = e.message;
   if (e.code === "pair_failed") {
-    if (m.startsWith("This offer expired") || m.startsWith("This offer is too far ahead")) {
-      pairError("expired", m.startsWith("This offer expired") ? "This offer expired" : "This phone's clock is off", m, exp);
+    if (m.startsWith("This offer expired")) {
+      pairError("expired", "Time ran out", m, exp);
+    } else if (m.startsWith("This offer is too far ahead")) {
+      pairError("clock", "This phone's clock is off", m, exp);
     } else if (m.startsWith("This phone is already paired")) {
       pairError("paired", "This phone is already paired", "It already holds a copy of your data. To pair it again, forget this phone in Settings first; that deletes its copy, and your Mac keeps everything.");
     } else if (m.startsWith("Your Mac closed this offer")) {
@@ -2268,14 +2270,16 @@ function pairFailure(e: unknown): void {
     } else if (m.startsWith("Cancelled.")) {
       pairError("other", "Pairing stopped", m);
     } else if (m.startsWith("Not paired.")) {
-      pairError("other", "You chose not to pair", m);
+      pairError("other", declinedByUi ? "You chose not to pair" : "Pairing stopped", m);
     } else {
       pairError("other", "Pairing did not finish", m);
     }
     return;
   }
   // a refusal that is not a pair_failed (bad_params, busy, unsupported...): the core's fixed sentence, never an address
-  if (["bad_params", "busy", "not_found", "unsupported_transport", "locked"].includes(e.code)) pairError("other", "Pairing did not start", m);
+  if (e.code === "busy") pairError("other", "Pairing did not start", "Another pairing, sync or pull is running on this phone. Wait for it to finish, then start again.");
+  else if (e.code === "locked") pairError("other", "Pairing did not start", "This phone is locked. Unlock it, then start again.");
+  else if (["bad_params", "not_found", "unsupported_transport"].includes(e.code)) pairError("other", "Pairing did not start", "This phone could not start pairing with that offer. Scan the code on your Mac again.");
   else pairError("other", "Pairing did not finish", "Pairing stopped. Cancel on your Mac and start a new offer.");
 }
 
@@ -2285,6 +2289,7 @@ async function phoneJoin(text: string): Promise<void> {
   joinHost = shown?.host ?? null;
   joinExp = shown?.exp ?? null;
   joinCodeShown = false;
+  declinedByUi = false;
   setPair({ v: "joining", host: joinHost, exp: joinExp, reached: false });
   try {
     const r = await core.call<{ pull: { applied: number; records_new: number; rejected: number; status: string }; key_file_protected: boolean | null }>("pair.join", { offer: text });
@@ -2310,16 +2315,18 @@ function phonePairEvent(payload: unknown): void {
 function phonePairProgress(p: { phase?: string; state?: string }): void {
   if (p.state !== "done" || typeof p.phase !== "string") return;
   // the first progress line can arrive a moment before pair.land's own answer: it moves Confirm to Landing too
-  if (pp.v === "confirm") setPair({ v: "landing", done: [p.phase] });
+  if (pp.v === "confirm") { setPair({ v: "landing", done: [p.phase] }); debugReloadOnce("landing"); }
   else if (pp.v === "landing" && !pp.done.includes(p.phase)) setPair({ v: "landing", done: [...pp.done, p.phase] });
 }
 
 async function phoneAnswer(yes: boolean): Promise<void> {
   if (answerBusy) return;
   answerBusy = true;
+  if (!yes) declinedByUi = true;
+  main.querySelectorAll<HTMLButtonElement>("button").forEach((b) => { b.disabled = true; }); // one answer only, while the call runs
   try {
     await core.call("pair.land", { confirm: yes });
-    if (yes && pp.v === "confirm") setPair({ v: "landing", done: [] });
+    if (yes && pp.v === "confirm") { setPair({ v: "landing", done: [] }); debugReloadOnce("landing"); }
     // a no: the join answers "Not paired. Cancel on your Mac too." and that frame is drawn from its rejection
   } catch (e) {
     pairFailure(e);
@@ -2335,6 +2342,7 @@ async function phoneCancel(): Promise<void> {
     setPair({ v: "start" });
     return;
   }
+  setPair({ v: "stopping" }); // the code leaves the screen now, not when the join rejects
   try {
     await core.call("pair.cancel");
     // the join answers "Cancelled. Cancel on your Mac too." and that frame is drawn from its rejection
@@ -2368,17 +2376,36 @@ async function phoneScan(): Promise<void> {
   }
 }
 
-/** Start-up: a page that reloaded while a join was open cannot show its code again, so it ends that join first. */
+/** Start-up: a page that reloaded while a join was open cannot show its code again, so it ends that join first, and says
+ *  only what the core answered: stopped before the release, thrown away after it, or (a landing under way after Yes)
+ *  nothing until the landing has ended and the store says which way it went. */
 async function phoneEndStrayJoin(): Promise<void> {
   if (!PHONE) return;
   void phone.keepAwake(false).catch(() => undefined);
+  void phone.cancelScan().catch(() => undefined); // a reload during a scan must not leave the camera running (no scan: an error, ignored)
   try {
     await core.call("pair.cancel"); // before the Mac released: aborted
+    pairError("other", "Pairing stopped", "This screen reloaded, so pairing stopped. Nothing was saved and your Mac sent nothing. Choose Cancel on your Mac.");
+    return;
   } catch (e) {
     if (!(core.isCoreError(e) && e.code === "busy")) return; // no join (not_found), or the store is locked: nothing to end
-    try { await core.call("pair.land", { confirm: false }); } catch { /* already answered */ } // after the release: say no
   }
-  pairError("other", "Pairing was stopped", "This screen reloaded while a pairing was open, so it was stopped and nothing was saved. Cancel on your Mac too.");
+  try {
+    await core.call("pair.land", { confirm: false }); // after the release, before an answer: say no
+    pairError("other", "Pairing stopped", "This screen reloaded after your Mac sent the key, so this phone threw it away. Nothing was saved. Your Mac may say Done; it keeps no record of this phone. Start a new offer to pair.");
+    return;
+  } catch (e) {
+    if (!(core.isCoreError(e) && e.code === "busy")) return; // the join ended meanwhile
+  }
+  // both busy: a landing is under way (a Yes was sent before the reload). Claim nothing until it ends.
+  setPair({ v: "landing", done: [] });
+  for (let i = 0; i < 400; i++) {
+    await new Promise((r) => setTimeout(r, 750));
+    try { await core.call("pair.cancel"); } catch (e) { if (core.isCoreError(e) && e.code === "not_found") break; }
+  }
+  await refreshKey();
+  if (unpaired()) pairError("other", "Pairing stopped", "Pairing did not finish. Start a new offer on your Mac.");
+  else setPair({ v: "start" }); // paired: the app's own routing shows Unlock or Today
 }
 
 function stackOf(...nodes: HTMLElement[]): HTMLElement {
@@ -2406,6 +2433,7 @@ function screenPairStart(out: ParentNode): void {
     case "joining": return drawPairJoining(out, pp);
     case "code": return drawPairCode(out, pp);
     case "confirm": return drawPairConfirm(out, pp);
+    case "stopping": return drawPairStopping(out);
     case "landing": return drawPairLanding(out, pp.done);
     case "done": return drawPairDone(out, pp);
     case "error": return drawPairError(out, pp);
@@ -2441,12 +2469,23 @@ function drawPairScan(out: ParentNode, note: string): void {
   out.append(bottom);
 }
 
+function drawPairStopping(out: ParentNode): void {
+  header(out, "Stopping…", "");
+  const b = pbanner("Stopping pairing", "Nothing is saved on this phone.");
+  b.setAttribute("role", "status");
+  out.append(b);
+}
+
 function drawPairJoining(out: ParentNode, s: { host: string | null; exp: number | null }): void {
   header(out, "Pairing with your Mac", "Keep this screen open.");
   const b = pbanner("Reaching your Mac…", s.exp ? `The offer is open until ${clockTime(s.exp)} by this phone's clock.` : "Your Mac's offer is open for 15 minutes.");
   b.setAttribute("role", "status");
   out.append(b);
   out.append(ptext("p", "caption muted", "The first time, iOS asks whether DISCOnect may find devices on your local network. Choose Allow."));
+  const slow = ptext("p", "caption muted", "Still trying. If it doesn't connect, allow DISCOnect under Settings, Privacy and Security, Local Network.");
+  slow.hidden = true;
+  out.append(slow);
+  setTimeout(() => { if (slow.isConnected && pp.v === "joining") slow.hidden = false; }, 15000);
   out.append(stackOf(pbutton("Cancel", "secondary wide", () => void phoneCancel())));
 }
 
@@ -2455,7 +2494,8 @@ function drawPairCode(out: ParentNode, s: { code: string; exp: number | null }):
   const card = pcard("Pairing code");
   card.append(ptext("p", "caption muted center", "Code on this phone"));
   const big = el("span", "bigcode", `${s.code.slice(0, 3)} ${s.code.slice(3)}`);
-  big.setAttribute("aria-label", s.code.split("").join(" "));
+  big.setAttribute("role", "img");
+  big.setAttribute("aria-label", `Code ${s.code.split("").join(" ")}`);
   card.append(big);
   card.append(ptext("p", "caption muted center", "Your Mac sends your key only when these digits match. If they are typed wrong, the offer closes and nothing is sent."));
   out.append(card);
@@ -2474,7 +2514,13 @@ function drawPairConfirm(out: ParentNode, s: { host: string | null }): void {
   card.append(ptext("p", "body", `Did your Mac say Paired? This phone will trust the Mac at ${s.host ?? "the address in the offer"}.`));
   card.append(ptext("p", "caption muted", "Answer Yes only if your Mac showed Paired just now. If it did not, answer No: nothing is saved."));
   out.append(card);
-  out.append(stackOf(pbutton("Yes", "wide", () => void phoneAnswer(true)), pbutton("No", "secondary wide", () => void phoneAnswer(false))));
+  const yes = pbutton("Yes", "wide", () => void phoneAnswer(true));
+  yes.setAttribute("aria-label", "Yes, my Mac said Paired");
+  const no = pbutton("No", "secondary wide", () => void phoneAnswer(false));
+  no.setAttribute("aria-label", "No, it did not");
+  out.append(stackOf(yes, no));
+  const heading = (out as HTMLElement).querySelector("h1");
+  if (heading) { heading.tabIndex = -1; setTimeout(() => heading.focus(), 50); } // VoiceOver lands on the question
   if (import.meta.env.DEV && (debugPairYes || debugPairNo)) {
     setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === (debugPairYes ? "Yes" : "No"))?.click(), 2500);
   }
@@ -2513,18 +2559,24 @@ function drawPairDone(out: ParentNode, s: { applied: number; fresh: number; reje
 
 function drawPairError(out: ParentNode, s: { kind: PairErrorKind; lead: string; text: string; exp: number | null }): void {
   header(out, "Pair with your Mac", "");
-  const b = pbanner(s.lead, s.text, true);
+  // a landing that failed after the relay setting was written leaves a phone with no key file that is "already paired"
+  const partial = s.kind === "paired" && unpaired();
+  const b = partial
+    ? pbanner("This phone holds part of an earlier pairing", "Forget it to start again; your Mac keeps everything.", true)
+    : pbanner(s.lead, s.text, true);
   b.setAttribute("role", "alert");
   out.append(b);
-  if (s.kind === "expired" && s.exp) out.append(ptext("p", "caption muted", `The offer expired at ${clockTime(s.exp)} by this phone's clock. Offers last 15 minutes. Start a new one on your Mac.`));
+  if (s.kind === "expired" && s.exp) out.append(ptext("p", "caption muted", `Offers last 15 minutes. This one ended at ${clockTime(s.exp)} by this phone's clock. Start a new one on your Mac.`));
   if (s.kind === "closed") out.append(ptext("p", "caption muted", "Nothing was sent to this phone. The digits typed on the Mac may not have matched, the offer may have been cancelled there, or another device answered."));
   if (s.kind === "ended") out.append(ptext("p", "caption muted", "Each offer pairs one device, once. Start a new offer on your Mac."));
   const actions: HTMLElement[] = [];
-  if (s.kind === "paired") {
+  if (partial) {
+    actions.push(forgetButton());
+  } else if (s.kind === "paired") {
     actions.push(pbutton("Go to Settings", "secondary wide", () => { setPair({ v: "start" }); location.hash = "#/settings"; }));
   } else if (s.kind === "saved") {
     actions.push(pbutton("Open Sync", "wide", () => { setPair({ v: "start" }); location.hash = "#/sync"; }));
-  } else if (s.kind === "expired" || s.kind === "closed" || s.kind === "ended") {
+  } else if (s.kind === "expired" || s.kind === "clock" || s.kind === "closed" || s.kind === "ended") {
     actions.push(pbutton("Scan a new code", "wide", () => void phoneScan()));
   } else {
     actions.push(pbutton("Start again", "wide", () => setPair({ v: "start" })));
@@ -2592,7 +2644,7 @@ function forgetResultSheet(sheet: HTMLElement, answer: { keychain: string }): vo
   sheet.append(ptext("p", "caption muted", FORGET_REVOKE));
   const actions = el("div", "actions");
   const done = el("button", "", "Done") as HTMLButtonElement;
-  done.onclick = () => { forgetOpener = null; closeForgetSheet(); location.hash = "#/today"; void route(); };
+  done.onclick = () => { forgetOpener = null; closeForgetSheet(); pp = { v: "start" }; location.hash = "#/today"; void route(); };
   actions.append(done);
   sheet.append(actions);
   // the shade and Escape end the result the same way Done does: back to the app, which is now Pair Start
@@ -3402,7 +3454,12 @@ window.addEventListener("hashchange", () => {
 });
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 // 12-F row 5c: the shell dropped the master after five minutes away (`key.lock`, in Rust); draw Unlock, never the old screen
-void core.onCoreEvent("locked", () => void route());
+void core.onCoreEvent("locked", () => {
+  void route().then(() => {
+    // the shell holds its cover across the lock; release it once Unlock has been painted (it has its own failsafe)
+    if (PHONE) requestAnimationFrame(() => requestAnimationFrame(() => void phone.coverRelease().catch(() => undefined)));
+  });
+});
 void core.onCoreEvent("restarted", () => {
   if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core stopped; the offer is gone.", error: true });
   banner = "The core restarted after an error; the last request was lost.";
@@ -3457,6 +3514,7 @@ void (async () => {
     debugPairOpen = args.includes("--debug-pair-open-today"); // the Done screen's own "Open Today" is clicked once it shows
     if (args.includes("--debug-pair-reload-on-code")) debugPairReload = "code"; // reload the webview once, 2 s after the Code screen shows
     if (args.includes("--debug-pair-reload-on-confirm")) debugPairReload = "confirm";
+    if (args.includes("--debug-pair-reload-on-landing")) debugPairReload = "landing"; // right after the Yes is sent (the first pull may be done by then)
     debugPairCancel = args.includes("--debug-pair-cancel"); // the Code screen's own Cancel is clicked a few seconds after it shows
   }
   await phoneEndStrayJoin(); // a reload mid-join ends that join before any screen is drawn (phone only; a no-op elsewhere)
@@ -3476,7 +3534,7 @@ void (async () => {
         ["--debug-pair-code", { v: "code", code: "482917", host: "192.168.1.20", exp: soon }],
         ["--debug-pair-confirm", { v: "confirm", host: "192.168.1.20" }],
         ["--debug-pair-done", { v: "done", applied: 4, fresh: 4812, rejected: 0, partial: false, protectedKey: true }],
-        ["--debug-pair-expired", { v: "error", kind: "expired", lead: "This offer expired", text: "This offer expired by this phone's clock. Check the date and time.", exp: soon - 20 * 60 }],
+        ["--debug-pair-expired", { v: "error", kind: "expired", lead: "Time ran out", text: "This offer expired by this phone's clock. Check the date and time.", exp: soon - 20 * 60 }],
         ["--debug-pair-paired", { v: "error", kind: "paired", lead: "This phone is already paired", text: "It already holds a copy of your data. To pair it again, forget this phone in Settings first; that deletes its copy, and your Mac keeps everything.", exp: null }],
         ["--debug-pair-closed", { v: "error", kind: "closed", lead: "Pairing stopped", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],
         ["--debug-pair-ended", { v: "error", kind: "ended", lead: "This offer has already ended", text: "Your Mac closed this offer. Cancel on your Mac and start a new offer.", exp: null }],

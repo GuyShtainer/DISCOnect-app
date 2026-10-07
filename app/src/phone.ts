@@ -35,3 +35,8 @@ export function keepAwake(on: boolean): Promise<void> {
 export function debugOfferFromFile(): Promise<string> {
   return invoke<string>("debug_offer_from_file");
 }
+
+/** iOS: take the shell's cover off after the page has painted Unlock (the cover is held across the lock after an absence). */
+export function coverRelease(): Promise<void> {
+  return invoke("cover_release");
+}

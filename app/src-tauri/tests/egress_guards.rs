@@ -696,12 +696,16 @@ fn the_keep_awake_switch_is_ios_only_and_the_offer_file_is_a_debug_ios_door() {
         attrs.join(" ")
     };
     assert!(item("keep_awake").contains("#[cfg(target_os = \"ios\")]"), "keep_awake: {}", item("keep_awake"));
+    assert!(item("cover_release").contains("#[cfg(target_os = \"ios\")]"), "cover_release: {}", item("cover_release"));
     let door = item("debug_offer_from_file");
     assert!(door.contains("#[cfg(all(debug_assertions, target_os = \"ios\"))]"), "debug_offer_from_file: {door}");
     // the handler lists: every list that names them carries the iOS cfg, and the offer file only the debug one
     for stanza in lib.split("let builder = builder.invoke_handler(").skip(1) {
         let before = lib[..lib.find(stanza).unwrap()].lines().rev().find(|l| l.trim_start().starts_with("#[cfg(")).unwrap_or("").to_string();
         let list = stanza.split("]);").next().unwrap();
+        if list.contains("cover_release") {
+            assert!(before.contains("target_os = \"ios\"") && !before.contains("not(target_os = \"ios\")"), "{before}");
+        }
         if list.contains("keep_awake") {
             assert!(before.contains("target_os = \"ios\"") && !before.contains("not(target_os = \"ios\")"), "{before}");
         }
@@ -711,7 +715,7 @@ fn the_keep_awake_switch_is_ios_only_and_the_offer_file_is_a_debug_ios_door() {
     }
     // the page calls keep_awake and the offer file in phone.ts only; the offer file's caller sits inside a DEV guard
     let phone = text(&app_dir().join("src").join("phone.ts"));
-    assert!(phone.contains("\"keep_awake\"") && phone.contains("\"debug_offer_from_file\""));
+    assert!(phone.contains("\"keep_awake\"") && phone.contains("\"debug_offer_from_file\"") && phone.contains("\"cover_release\""));
     let app = text(&app_dir().join("src").join("app.ts"));
     let call = app.find("phone.debugOfferFromFile()").expect("the debug door's caller");
     let guard = app[..call].rfind("if (import.meta.env.DEV) {").expect("inside a DEV guard");

@@ -13,6 +13,8 @@
 //! theme is not known here) and the product's name in the secondary label colour. No data, no code, no state.
 
 use std::ptr::NonNull;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -52,6 +54,27 @@ fn show(mtm: MainThreadMarker) {
     }
 }
 
+/// Since when the cover is held across a lock (12-F row 5 fix S4): DidBecomeActive leaves a held cover on, because the
+/// page has not painted Unlock yet. `release` (the page, after painting, or the failsafe thread) takes it off.
+static HELD_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Keep the cover on through the next DidBecomeActive.
+pub fn hold() {
+    if let Ok(mut slot) = HELD_SINCE.lock() {
+        *slot = Some(Instant::now());
+    }
+}
+
+/// Drop the hold and take the cover off (main thread). Idempotent.
+pub fn release() {
+    if let Ok(mut slot) = HELD_SINCE.lock() {
+        *slot = None;
+    }
+    if let Some(mtm) = MainThreadMarker::new() {
+        hide(mtm);
+    }
+}
+
 /// Take every cover off.
 fn hide(mtm: MainThreadMarker) {
     let app = UIApplication::sharedApplication(mtm);
@@ -75,7 +98,10 @@ pub fn install(mtm: MainThreadMarker) {
     });
     let on_active = RcBlock::new(|_: NonNull<NSNotification>| {
         if let Some(mtm) = MainThreadMarker::new() {
-            hide(mtm);
+            let held = HELD_SINCE.lock().ok().and_then(|slot| *slot);
+            if !crate::cover_hold_stays(held, Instant::now()) {
+                hide(mtm);
+            }
         }
     });
     // SAFETY: the names are UIKit's own constants; both blocks run on the main queue, where UIKit objects may be used,
