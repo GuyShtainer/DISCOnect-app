@@ -19,7 +19,7 @@ export function unlock(passphrase: string): Promise<{ unlocked: boolean }> {
   return invoke("core_unlock", { passphrase });
 }
 
-export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | "pair" | "relay" | "import", cb: (payload: unknown) => void): Promise<UnlistenFn> {
+export function onCoreEvent(name: "progress" | "log" | "restarted" | "exited" | "locked" | "pair" | "relay" | "import", cb: (payload: unknown) => void): Promise<UnlistenFn> {
   return listen(`core://${name}`, (e) => cb(e.payload));
 }
 

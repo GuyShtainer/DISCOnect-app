@@ -332,6 +332,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let written = (|| {
         let mut file = options.open(&temp)?;
+        // iOS only: class A before the first byte, so the class survives the rename (12-F A7, attack S1)
+        #[cfg(target_os = "ios")]
+        set_class_a(&file);
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&temp, path)
@@ -345,4 +348,74 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// `fcntl` commands of `<sys/fcntl.h>` (Darwin) and the class value of `PROTECTION_CLASS_A`
+/// (`NSFileProtectionComplete`: unreadable while the phone is locked).
+#[cfg(target_os = "ios")]
+const F_GETPROTECTIONCLASS: libc::c_int = 63;
+#[cfg(target_os = "ios")]
+const F_SETPROTECTIONCLASS: libc::c_int = 64;
+#[cfg(target_os = "ios")]
+const PROTECTION_CLASS_A: libc::c_int = 1;
+
+/// Best effort: set class A on an open file. The result is not an error of the write (the simulator reports no
+/// classes); the landing's read-back hook looks at the key file on the device and re-applies.
+#[cfg(target_os = "ios")]
+fn set_class_a(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fcntl` on a descriptor this function borrows for the call; the command takes an int argument.
+    let _ = unsafe { libc::fcntl(file.as_raw_fd(), F_SETPROTECTIONCLASS, PROTECTION_CLASS_A) };
+}
+
+/// The protection class of the file at `path` (`F_GETPROTECTIONCLASS`), `None` when it cannot be read or the
+/// platform reports none (the simulator).
+#[cfg(target_os = "ios")]
+pub fn protection_class(path: &Path) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: as in `set_class_a`.
+    let class = unsafe { libc::fcntl(file.as_raw_fd(), F_GETPROTECTIONCLASS) };
+    (class >= 0).then_some(class)
+}
+
+/// Read the class of the file at `path` back; when it is not class A, try once more to set it. Never an error.
+/// Returns `true` when the platform reported class A. The simulator reports nothing, so this is `false` there.
+#[cfg(target_os = "ios")]
+pub fn verify_class_a(path: &Path) -> bool {
+    if protection_class(path) == Some(PROTECTION_CLASS_A) {
+        return true;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) {
+        set_class_a(&file);
+    }
+    protection_class(path) == Some(PROTECTION_CLASS_A)
+}
+
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::write_atomic;
+
+    /// The desktop write path is the old one: the same bytes, mode 0600, the parent 0700, no temp file left.
+    #[cfg(unix)]
+    #[test]
+    fn non_ios_write_atomic_keeps_bytes_and_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("inner").join("key.json");
+        write_atomic(&target, b"{\"k\":1}\n").expect("write");
+        assert_eq!(std::fs::read(&target).expect("read"), b"{\"k\":1}\n");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode(&target), 0o600);
+        assert_eq!(mode(target.parent().expect("parent")), 0o700);
+        let names: Vec<_> = std::fs::read_dir(target.parent().expect("parent"))
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "no temp file is left behind");
+        // overwrite keeps the mode
+        write_atomic(&target, b"two").expect("rewrite");
+        assert_eq!(std::fs::read(&target).expect("read"), b"two");
+        assert_eq!(mode(&target), 0o600);
+    }
 }

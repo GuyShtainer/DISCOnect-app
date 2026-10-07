@@ -177,7 +177,7 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
                "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
-               "serving": null})
+               "serving": null, "relay_url": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");
@@ -205,6 +205,27 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
     relay_json(&edb, json!({"folder": edir.path().join("relay")}));
     let lines = locked.send(3, "sync.run", json!({}));
     assert_eq!(lines[0]["error"]["code"], "locked");
+}
+
+#[test]
+fn sync_status_names_the_lan_relay_address_and_nothing_else() {
+    let (_dir, db) = encrypted_store(false);
+    let mut rig = Rig::new(&db);
+    assert_eq!(rig.send(0, "key.unlock", json!({"passphrase": PASSPHRASE}))[0]["result"], json!({"unlocked": true}));
+    let url = |rig: &mut Rig| rig.send(1, "sync.status", json!({}))[0]["result"]["relay_url"].clone();
+    assert_eq!(url(&mut rig), Value::Null, "no relay.json");
+    relay_json(&db, json!({"folder": "/some/folder"}));
+    assert_eq!(url(&mut rig), Value::Null, "a folder relay has no address");
+    relay_json(&db, json!({"folder": 5}));
+    assert_eq!(url(&mut rig), Value::Null, "a file that names nothing");
+    relay_json(&db, json!({"lan": "http://192.168.1.20:8321"}));
+    assert_eq!(url(&mut rig), json!("http://192.168.1.20:8321"));
+    relay_json(&db, json!({"lan": " http://192.168.1.20:8321/ ", "folder": "/f"}));
+    assert_eq!(url(&mut rig), json!("http://192.168.1.20:8321"), "trimmed, no trailing slash, lan wins");
+    for bad in ["https://192.168.1.20:8321", "http://user@host:1", "http://host:1/path", "192.168.1.20:8321"] {
+        relay_json(&db, json!({"lan": bad}));
+        assert_eq!(url(&mut rig), Value::Null, "{bad}: not a usable LAN address, so none is shown");
+    }
 }
 
 #[test]

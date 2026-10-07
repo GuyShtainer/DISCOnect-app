@@ -764,9 +764,11 @@ dependencies = [
 name = "disconect-app"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "disconect-core",
  "objc2",
  "objc2-foundation",
+ "objc2-ui-kit",
  "serde",
  "serde_json",
  "sha2 0.11.0",

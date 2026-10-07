@@ -512,6 +512,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("key.status", Handler::Reply(key_status)),
     ("key.unlock", Handler::Reply(key_unlock)),
     ("key.cache", Handler::Reply(key_cache)),
+    ("key.lock", Handler::Reply(key_lock)),
     ("data.health", Handler::Reply(data_health)),
     ("data.metric", Handler::Reply(data_metric)),
     ("data.today", Handler::Reply(data_today)),
@@ -529,6 +530,7 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("pair.confirm", Handler::Reply(pair_confirm)),
     ("pair.cancel", Handler::Reply(pair_cancel)),
     ("tools.call", Handler::Ordered(tools_call)),
+    ("pair.forget", Handler::Reply(pair_forget)),
 ];
 
 /// `_int_param`: an integer (never a bool, never a float), `default` when the key is absent. An
@@ -697,6 +699,13 @@ fn key_unlock(session: &mut Session, call: &Call) -> Result<Value, Failure> {
     };
     session.unlocked = Some(master);
     Ok(json!({"unlocked": true}))
+}
+
+/// Drop this session's master key: the session reads as locked until `key.unlock` runs again. Idempotent (already
+/// locked, or nothing to lock, answers the same). The keychain item, if any, is left alone.
+fn key_lock(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    session.unlocked = None;
+    Ok(json!({"state": "locked"}))
 }
 
 /// Store or remove the master key in the OS keychain. Needs the store unlocked.
@@ -1071,6 +1080,14 @@ fn relay_json_path(db_path: &Path) -> PathBuf {
     home::relay_config_beside(db_path)
 }
 
+/// `relay_url` of `sync.status`: the normalised base address of the LAN relay `relay.json` names, else null.
+fn relay_url_value(path: &Path) -> Value {
+    match relay_config::read(path) {
+        Some(relay_config::RelayConfig::Lan(url)) => relay_config::lan_base_url(&url).map_or(Value::Null, Value::String),
+        _ => Value::Null,
+    }
+}
+
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay
 /// tables answers what a fresh one would.
 fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
@@ -1081,6 +1098,9 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
     if let Some(object) = status.as_object_mut() {
         // Rust only: what the relay of this session is doing right now (null when it serves nothing)
         object.insert("serving".into(), serving::serving_value(&session.relay));
+        // The address this device pulls from, `http://host:port` from `relay.json`; null with no LAN relay named
+        // (a folder relay has no address). Never a path, a credential or a folder name.
+        object.insert("relay_url".into(), relay_url_value(&relay_json_path(&session.db_path)));
     }
     Ok(status)
 }
@@ -1530,6 +1550,63 @@ fn parse(line: &str) -> Result<Call, Rejected> {
         method: method.clone(),
         params,
     })
+}
+
+// ---- the phone's own method ----
+
+/// `pair.forget` (12-F, M5): the phone deletes its copy, key file, keychain item and `relay.json`, then forgets the
+/// master. A phone-only method: any other core answers `unsupported_transport` (the Python core, the desktop build).
+/// Params are ignored; the unsent count the sheet shows is `sync.status`'s `records_unsent`. The order and its crash
+/// safety are in [`crate::pair_forget`]. Answers `{"forgotten": true, "keychain": "removed"|"none"|"failed: <text>"}`,
+/// or `busy` when an import or a sync runs, with nothing deleted.
+#[cfg(not(target_os = "ios"))]
+fn pair_forget(_session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    Err(Failure::serve(
+        "unsupported_transport",
+        "this core is not a phone; there is nothing to forget",
+    ))
+}
+
+#[cfg(target_os = "ios")]
+fn pair_forget(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
+    use crate::pair_forget as forget;
+    let paths = forget::Paths::beside(&session.db_path, &session.key_path());
+    // 1. the marker, before anything else
+    forget::write_marker(&paths).map_err(Failure::Io)?;
+    // 2. the import slot (shared with sync) and the write lock; a refusal deletes nothing and takes the marker back
+    if session
+        .import_slot
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        forget::clear_marker(&paths);
+        return Err(Failure::serve("busy", "an import or a sync is already running"));
+    }
+    let outcome = forget_holding_slot(session, &paths);
+    session.import_slot.store(false, Ordering::SeqCst);
+    outcome
+}
+
+#[cfg(target_os = "ios")]
+fn forget_holding_slot(session: &mut Session, paths: &crate::pair_forget::Paths) -> Result<Value, Failure> {
+    use crate::pair_forget as forget;
+    let lock = match crate::write_lock::acquire(&session.db_path, "forget", std::time::Duration::ZERO) {
+        Ok(lock) => lock,
+        Err(error) => {
+            forget::clear_marker(paths);
+            return Err(match error {
+                LockError::Busy { .. } => Failure::serve("busy", error.to_string()),
+                LockError::HomeMoved(_) => Failure::serve("not_found", error.to_string()),
+                LockError::Io(io) => Failure::Io(io),
+            });
+        }
+    };
+    let result = forget::run(paths, &mut forget::RealItems, &mut |_| false);
+    drop(lock);
+    let keychain = result.map_err(Failure::Io)?;
+    // 7. the master leaves the session
+    session.unlocked = None;
+    Ok(json!({"forgotten": true, "keychain": keychain.text()}))
 }
 
 /// The server roles a phone never plays (the Mac serves the relay and offers pairing), refused before

@@ -8,7 +8,12 @@ export default defineConfig(() => ({
   // The page reads its --debug-* flags only when import.meta.env.DEV is true. `tauri build --debug` runs a
   // production-mode vite build, so say DEV is true there too (the tauri CLI sets TAURI_ENV_DEBUG); a release build keeps it false
   // and the flag code is dropped from the bundle.
-  define: process.env.TAURI_ENV_DEBUG === "true" ? { "import.meta.env.DEV": "true" } : {},
+  // `__PHONE__` is the same kind of build-time constant: true when the tauri CLI builds for iOS (it sets
+  // TAURI_ENV_PLATFORM to the target's platform for the before-build command), so a desktop bundle reads it as false.
+  define: {
+    ...(process.env.TAURI_ENV_DEBUG === "true" ? { "import.meta.env.DEV": "true" } : {}),
+    __PHONE__: JSON.stringify(process.env.TAURI_ENV_PLATFORM === "ios"),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

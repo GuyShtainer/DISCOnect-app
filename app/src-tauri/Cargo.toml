@@ -37,8 +37,13 @@ url = "2"
 # The iOS start-up hook (`src/ios.rs`): the backup flag and the file protection class. Already in the iOS graph
 # through tauri/wry (same locked version, so no new package); only the classes the hook names are enabled here.
 [target.'cfg(target_os = "ios")'.dependencies]
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSError", "NSFileManager"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString", "NSURL", "NSArray", "NSDictionary", "NSValue", "NSError", "NSFileManager", "NSNotification", "NSOperation", "block2"] }
 objc2 = "0.6.4"
+# The app-switcher cover (`src/cover.rs`, 12-F row 5b): UIKit's window, view, label and colour classes and the two
+# lifecycle notifications. All three are already in the iOS graph through tauri/wry at these locked versions (no new
+# package; MIT, Zlib OR Apache-2.0 OR MIT, MIT).
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIApplication", "UIWindow", "UIView", "UILabel", "UIColor", "UIResponder", "UIScene", "UIWindowScene", "NSText", "UIFont", "UIScreen"] }
+block2 = "0.6.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
