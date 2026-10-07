@@ -1087,6 +1087,26 @@ pub fn pull_strict(
     }
 }
 
+/// A name booked `rejected` is not fetched again for a day (the core's clock): one retry per day.
+const REJECTED_BACKOFF_SECONDS: i64 = 24 * 3600;
+
+/// Names booked `rejected` less than a day ago: left out of the run.
+fn held_back(conn: &Connection) -> Result<HashSet<String>, SyncError> {
+    let now = crate::time::now_instant();
+    let mut stmt = conn.prepare("SELECT name, noted_at FROM relay_bundles WHERE status='rejected'")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut held = HashSet::new();
+    for row in rows {
+        let (name, noted_at) = row?;
+        if let Some(booked) = parse_iso_utc(&noted_at)
+            && (now - booked).num_seconds() < REJECTED_BACKOFF_SECONDS
+        {
+            held.insert(name);
+        }
+    }
+    Ok(held)
+}
+
 fn pull_core(
     conn: &Connection,
     master: &[u8],
@@ -1104,6 +1124,7 @@ fn pull_core(
     };
     let known = names("applied")?;
     let half_applied = names("applying")?;
+    let held_back = held_back(conn)?;
     // the union of the listings in first-seen order (site order, then listing order), each name with its sites
     let mut pending: Vec<(String, Vec<usize>)> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
@@ -1116,7 +1137,7 @@ fn pull_core(
                 continue;
             }
         };
-        for name in listing.into_iter().filter(|name| !known.contains(name)) {
+        for name in listing.into_iter().filter(|name| !known.contains(name) && !held_back.contains(name)) {
             match at.get(&name) {
                 Some(&slot) => pending[slot].1.push(index),
                 None => {
@@ -1184,6 +1205,8 @@ fn apply_pending(
     for (name, holders) in pending {
         let mut fetched: Option<(Vec<u8>, bundle::Bundle)> = None;
         let mut failed = 0usize;
+        // the report of each failed copy, counted only if the name ends rejected
+        let mut failed_at: Vec<usize> = Vec::new();
         let mut first_reason: Option<String> = None;
         for &index in holders {
             if skipped[index] {
@@ -1201,7 +1224,7 @@ fn apply_pending(
                     continue;
                 }
                 Err(error) => {
-                    reports[report].rejected += 1;
+                    failed_at.push(report);
                     failed += 1;
                     first_reason.get_or_insert_with(|| error.reason().to_string());
                     continue;
@@ -1214,7 +1237,7 @@ fn apply_pending(
                     break;
                 }
                 Err(rejected) => {
-                    reports[report].rejected += 1;
+                    failed_at.push(report);
                     failed += 1;
                     first_reason.get_or_insert(rejected.reason);
                 }
@@ -1223,6 +1246,9 @@ fn apply_pending(
         let Some((blob, bundle)) = fetched else {
             if failed == holders.len() {
                 let reason = first_reason.unwrap_or_default();
+                for &report in &failed_at {
+                    reports[report].rejected += 1;
+                }
                 writer.stats.files_failed += 1;
                 conn.execute(
                     "INSERT OR REPLACE INTO relay_bundles(name, direction, status, noted_at, reason) \
@@ -1561,6 +1587,8 @@ pub struct Chain {
     pub bundles: i64,
     pub records: i64,
     pub last_seq: i64,
+    /// `max(created_utc)` of the chain's applied bundles, UTC ISO as stored.
+    pub last_at: Option<String>,
     /// The id is this store's own (`relay_device`); false for every row while it has pushed nothing.
     pub is_self: bool,
 }
@@ -1570,7 +1598,7 @@ fn chains(conn: &Connection) -> Result<Vec<Chain>, SyncError> {
         .query_row("SELECT device_id FROM relay_device WHERE id=1", [], |r| r.get(0))
         .optional()?;
     let mut stmt = conn.prepare(
-        "SELECT device_id, count(*), sum(records), max(device_seq) FROM relay_bundles \
+        "SELECT device_id, count(*), sum(records), max(device_seq), max(created_utc) FROM relay_bundles \
          WHERE status='applied' AND device_id IS NOT NULL GROUP BY device_id ORDER BY device_id",
     )?;
     let mapped = stmt.query_map([], |r| {
@@ -1579,17 +1607,19 @@ fn chains(conn: &Connection) -> Result<Vec<Chain>, SyncError> {
             r.get::<_, i64>(1)?,
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in mapped {
-        let (device_id, bundles, records, last_seq) = row?;
+        let (device_id, bundles, records, last_seq, last_at) = row?;
         out.push(Chain {
             is_self: own.as_deref() == Some(device_id.as_str()),
             device_id,
             bundles,
             records: records.unwrap_or(0),
             last_seq: last_seq.unwrap_or(0),
+            last_at,
         });
     }
     Ok(out)
@@ -1684,7 +1714,7 @@ pub fn status_value(report: &StatusReport) -> serde_json::Value {
         .iter()
         .map(|c| {
             serde_json::json!({"chain": c.device_id, "bundles": c.bundles, "records": c.records,
-                "last_seq": c.last_seq, "self": c.is_self})
+                "last_seq": c.last_seq, "self": c.is_self, "last_at": c.last_at})
         })
         .collect();
     serde_json::json!({

@@ -346,7 +346,7 @@ fn late_bundles_are_applied_and_rejected_ones_retried() {
         vec![(garbage.clone(), "authentication_failed".to_string())]
     );
     assert_eq!(r.status, "partial");
-    // a late bundle is applied on the next pull; the garbage is retried and rejected again
+    // a late bundle is applied on the next pull; the garbage booked a moment ago is held back (BL-4b)
     import(
         &a,
         &fit_drop(tmp.path(), "d2", &["monitoring_cycles_resolution"]),
@@ -354,10 +354,8 @@ fn late_bundles_are_applied_and_rejected_ones_retried() {
     let second = push(&a, &relay).bundles[0].clone();
     let r2 = pull(&b, &relay);
     assert_eq!(r2.applied, vec![second]);
-    assert_eq!(
-        r2.rejected,
-        vec![(garbage, "authentication_failed".to_string())]
-    );
+    assert!(r2.rejected.is_empty(), "{r2:?}");
+    assert_eq!(r2.status, "ok");
     assert_eq!(keys_of(&a), keys_of(&b));
     let report = sync::status(b.conn()).expect("status");
     assert_eq!(report.bundles.get("pulled_applied"), Some(&2));
@@ -369,13 +367,13 @@ fn late_bundles_are_applied_and_rejected_ones_retried() {
         (report.chains[0].bundles, report.chains[0].last_seq, report.chains[0].is_self),
         (2, 2, false)
     );
-    // the relay import run of a pull that rejected something is partial (both pulls did)
+    // the relay import run of a pull that rejected something is partial (only the first did)
     assert_eq!(
         count(
             b.conn(),
             "SELECT count(*) FROM import_runs WHERE transport='relay' AND status='partial'"
         ),
-        2
+        1
     );
 }
 

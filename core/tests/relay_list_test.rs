@@ -258,7 +258,8 @@ fn a_pull_falls_through_a_bad_copy_to_the_next_site_and_applies_each_name_once()
     assert!(pulled.applied.contains(&shared) && pulled.applied.contains(&lonely));
     assert!(pulled.rejected.is_empty(), "a bad copy on one site is not a rejection");
     assert_eq!(pulled.status, "ok");
-    assert_eq!((reports[0].rejected, reports[0].pulled), (1, 0));
+    // BL-4b: the counter marks a site only when the name ends rejected
+    assert_eq!((reports[0].rejected, reports[0].pulled), (0, 0));
     assert_eq!((reports[1].rejected, reports[1].pulled), (0, 2));
     assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles WHERE status='rejected'"), 0);
     assert_eq!(count(b.conn(), "SELECT count(*) FROM relay_bundles WHERE direction='pulled' AND status='applied'"), 2);
@@ -281,6 +282,105 @@ fn a_name_every_site_rejects_is_rejected_once() {
     let pulled = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
     assert_eq!((pulled.applied.len(), pulled.rejected.len(), pulled.status), (0, 1, "partial"));
     assert_eq!((reports[0].rejected, reports[1].rejected), (1, 1));
+}
+
+fn booked(conn: &Connection, name: &str) -> String {
+    conn.query_row(
+        "SELECT noted_at FROM relay_bundles WHERE name=? AND status='rejected'",
+        [name],
+        |r| r.get(0),
+    )
+    .expect("the rejected booking")
+}
+
+#[test]
+fn a_rejected_name_is_not_fetched_again_for_a_day_and_the_run_is_ok() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let roots = three_roots(tmp.path());
+    let a = device();
+    import_day(&a, tmp.path(), "2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let (sites, mut reports) = open(&roots[..1]);
+    let first = push_all(a.conn(), &master(), &sites, &mut reports).expect("push").bundles[0].clone();
+    let object = first.split_once('/').expect("name").1.to_string();
+    fs::write(roots[0].join(account_for(&master())).join(&object), b"not a bundle").expect("damage");
+
+    let b = device();
+    let (sites, mut reports) = open(&roots[..1]);
+    let run1 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 1");
+    assert_eq!((run1.rejected.len(), run1.status, reports[0].rejected), (1, "partial", 1));
+    // a second bundle arrives: the garbage is held back (nothing fetched, nothing counted), the run is clean
+    import_day(&a, tmp.path(), "2025-06-16", 5000, "2025-06-16T12:00:00.0");
+    let (sites, mut reports) = open(&roots[..1]);
+    let second = push_all(a.conn(), &master(), &sites, &mut reports).expect("push 2").bundles[0].clone();
+    let (sites, mut reports) = open(&roots[..1]);
+    let run2 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 2");
+    assert_eq!(run2.applied, vec![second]);
+    assert!(run2.rejected.is_empty(), "{run2:?}");
+    assert_eq!((run2.status, reports[0].rejected, reports[0].pulled), ("ok", 0, 1));
+    // a booking 23 h old still holds the name back; one 25 h old is retried once and booked again with a new time
+    let at = |hours: u64| disconect_core::time::iso_from_unix(disconect_core::time::now_unix() - hours * 3600);
+    b.conn()
+        .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![at(23), first])
+        .expect("age");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run3 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 3");
+    assert_eq!((run3.rejected.len(), run3.status, reports[0].rejected), (0, "ok", 0));
+    b.conn()
+        .execute("UPDATE relay_bundles SET noted_at=? WHERE name=?", rusqlite::params![at(25), first])
+        .expect("age");
+    let (sites, mut reports) = open(&roots[..1]);
+    let run4 = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull 4");
+    assert_eq!((run4.rejected.len(), run4.status, reports[0].rejected), (1, "partial", 1));
+    assert!(booked(b.conn(), &first) > at(1), "the booking carries the new time");
+}
+
+#[test]
+fn a_copy_damaged_on_site_one_and_good_on_site_two_marks_site_one_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let roots = three_roots(tmp.path());
+    let a = device();
+    import_day(&a, tmp.path(), "2025-06-15", 4000, "2025-06-15T12:00:00.0");
+    let (both, mut reports) = open(&roots[..2]);
+    let name = push_all(a.conn(), &master(), &both, &mut reports).expect("push").bundles[0].clone();
+    let object = name.split_once('/').expect("name").1;
+    fs::write(roots[0].join(account_for(&master())).join(object), b"not a bundle").expect("damage");
+    let b = device();
+    let (sites, mut reports) = open(&roots[..2]);
+    let pulled = pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull");
+    assert_eq!(pulled.applied, vec![name]);
+    assert!(pulled.rejected.is_empty());
+    assert_eq!(pulled.status, "ok");
+    assert_eq!((reports[0].rejected, reports[0].pulled), (0, 0));
+    assert_eq!((reports[1].rejected, reports[1].pulled), (0, 1));
+}
+
+#[test]
+fn a_chains_last_at_is_the_newest_applied_bundles_created_utc() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let roots = three_roots(tmp.path());
+    let a = device();
+    for (day, steps) in [("2025-06-15", 4000), ("2025-06-16", 5000)] {
+        import_day(&a, tmp.path(), day, steps, &format!("{day}T12:00:00.0"));
+        let (sites, mut reports) = open(&roots[..1]);
+        push_all(a.conn(), &master(), &sites, &mut reports).expect("push");
+    }
+    let b = device();
+    let (sites, mut reports) = open(&roots[..1]);
+    assert_eq!(pull_all(b.conn(), &master(), &sites, &mut reports).expect("pull").applied.len(), 2);
+    // pin two distinct header times (the pushes above may share a second), the newer one on the second bundle
+    b.conn()
+        .execute(
+            "UPDATE relay_bundles SET created_utc=CASE device_seq WHEN 1 THEN '2026-03-01T10:00:00Z' ELSE '2026-03-03T08:30:00Z' END \
+             WHERE status='applied'",
+            [],
+        )
+        .expect("set times");
+    let report = disconect_core::relay::sync::status(b.conn()).expect("status");
+    assert_eq!(report.chains.len(), 1);
+    assert_eq!(report.chains[0].bundles, 2);
+    assert_eq!(report.chains[0].last_at.as_deref(), Some("2026-03-03T08:30:00Z"));
+    let value = disconect_core::relay::sync::status_value(&report);
+    assert_eq!(value["chains"][0]["last_at"], "2026-03-03T08:30:00Z");
 }
 
 #[test]

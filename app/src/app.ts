@@ -721,7 +721,7 @@ type SyncStatus = {
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
   relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
   relay_kind?: "folder" | "lan" | "mixed" | null; // 19a: what the relay list holds; the timer runs only with a folder in it
-  chains?: { chain: string; bundles: number; records: number; last_seq: number; self: boolean }[]; // 19b: counts per writer chain (the random id its sync bookkeeping minted, never a hardware id); absent until the core says it
+  chains?: { chain: string; bundles: number; records: number; last_seq: number; self: boolean; last_at?: string }[]; // 19b: counts per writer chain (the random id its sync bookkeeping minted, never a hardware id); absent until the core says it
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
@@ -1335,7 +1335,9 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     const kv4 = el("dl", "kv");
     for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
       const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
-      kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.chain.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}`));
+      // BL-4b: last_at is the newest applied bundle's header time (UTC ISO); absent from an older core
+      const last = c.last_at ? ` · last sent ${new Date(c.last_at).toLocaleString()}` : "";
+      kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.chain.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}${last}`));
     }
     sent.append(kv4);
     sent.append(el("p", "caption muted", "Each device is shown by a random name it picked the first time it sent something. A device that was forgotten and paired again shows up as a new line; its old line stays."));
