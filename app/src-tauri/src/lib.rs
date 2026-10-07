@@ -530,13 +530,7 @@ fn lock_after_absence(app: &tauri::AppHandle) {
     let state = app.state::<Core>();
     let Ok(core) = core_of(&state) else { return };
     if tauri::async_runtime::block_on(core.call("key.lock", serde_json::json!({}))).is_ok() {
-        // hold the cover over the old screen until the page has painted Unlock (`cover_release`), or the failsafe
-        cover::hold();
-        let handle = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(COVER_FAILSAFE);
-            let _ = handle.run_on_main_thread(cover::release);
-        });
+        // the cover was already held by cover.rs (it decides at DidBecomeActive); the page releases it after painting Unlock
         let _ = app.emit("core://locked", serde_json::json!({}));
     }
 }

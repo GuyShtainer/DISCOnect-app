@@ -58,11 +58,27 @@ fn show(mtm: MainThreadMarker) {
 /// page has not painted Unlock yet. `release` (the page, after painting, or the failsafe thread) takes it off.
 static HELD_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Keep the cover on through the next DidBecomeActive.
-pub fn hold() {
+/// When the app last resigned active (wall clock, as the away rule is: a sleeping phone still counts as away).
+static LEFT_AT: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
+
+/// Decided here, in the same main-thread notification that would take the cover off, because the page's lock arrives
+/// later than DidBecomeActive: an absence that will lock keeps the cover on (the shell locks in `lock_after_absence`).
+fn hold_for_absence() -> bool {
+    let left = LEFT_AT.lock().ok().and_then(|mut slot| slot.take());
+    let Some(left) = left else { return false };
+    if !crate::away_requires_lock(left, std::time::SystemTime::now(), crate::away_limit()) {
+        return false;
+    }
     if let Ok(mut slot) = HELD_SINCE.lock() {
         *slot = Some(Instant::now());
     }
+    // the failsafe: the cover comes off even if the page never paints Unlock
+    std::thread::spawn(|| {
+        std::thread::sleep(crate::COVER_FAILSAFE);
+        // SAFETY: a block that captures nothing, handed to the main queue; `release` runs on the main thread there.
+        unsafe { NSOperationQueue::mainQueue().addOperationWithBlock(&RcBlock::new(release)) };
+    });
+    true
 }
 
 /// Drop the hold and take the cover off (main thread). Idempotent.
@@ -93,13 +109,17 @@ pub fn install(mtm: MainThreadMarker) {
     let main = NSOperationQueue::mainQueue();
     let on_resign = RcBlock::new(|_: NonNull<NSNotification>| {
         if let Some(mtm) = MainThreadMarker::new() {
+            if let Ok(mut slot) = LEFT_AT.lock() {
+                *slot = Some(std::time::SystemTime::now());
+            }
             show(mtm);
         }
     });
     let on_active = RcBlock::new(|_: NonNull<NSNotification>| {
         if let Some(mtm) = MainThreadMarker::new() {
+            let held_now = hold_for_absence();
             let held = HELD_SINCE.lock().ok().and_then(|slot| *slot);
-            if !crate::cover_hold_stays(held, Instant::now()) {
+            if !held_now && !crate::cover_hold_stays(held, Instant::now()) {
                 hide(mtm);
             }
         }

@@ -3457,10 +3457,17 @@ window.addEventListener("hashchange", () => {
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => void route());
 // 12-F row 5c: the shell dropped the master after five minutes away (`key.lock`, in Rust); draw Unlock, never the old screen
 void core.onCoreEvent("locked", () => {
-  void route().then(() => {
-    // the shell holds its cover across the lock; release it once Unlock has been painted (it has its own failsafe)
-    if (PHONE) requestAnimationFrame(() => requestAnimationFrame(() => void phone.coverRelease().catch(() => undefined)));
-  });
+  void route();
+  if (!PHONE) return;
+  // the shell holds its cover across the lock: take it off only once the page really shows Unlock (the route may be
+  // answered by a newer route, so look at the page, frame by frame; the shell's own failsafe covers a page that never gets there)
+  const until = Date.now() + 1400;
+  const look = (): void => {
+    const unlocked = document.querySelector("main h1, .main h1")?.textContent?.trim() === "Unlock";
+    if (unlocked || Date.now() > until) requestAnimationFrame(() => void phone.coverRelease().catch(() => undefined));
+    else requestAnimationFrame(look);
+  };
+  requestAnimationFrame(look);
 });
 void core.onCoreEvent("restarted", () => {
   if (pairOffer || pairPhase !== "idle") endOfferState({ text: "The core stopped; the offer is gone.", error: true });
