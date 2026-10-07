@@ -373,13 +373,14 @@ fn sync_relay_add_remove_list_and_a_run_over_the_whole_list() {
     let mut lines = out.lines();
     assert!(lines.next().expect("first").starts_with("pushed 1 bundle(s): 2 record(s), 0 range(s)"));
     assert_eq!(lines.next(), Some(format!("  site {id1} folder: pushed 1, healed 0, behind 0, pulled 0, rejected 0").as_str()));
-    assert_eq!(lines.next(), Some(format!("  site {id2} folder: pushed 1, healed 0, behind 0, pulled 0, rejected 0").as_str()));
+    assert_eq!(lines.next(), Some(format!("  site {id2} cloud folder: pushed 1, healed 0, behind 0, pulled 0, rejected 0").as_str()));
     // B shares the list file (same HOME) and pulls once from the union
     let pulled: Value = serde_json::from_str(&stdout(&cli.run(&b, &["--json", "sync", "pull"]))).expect("json");
     assert_eq!(pulled["applied"].as_array().map(Vec::len), Some(1));
     assert_eq!(pulled["sites"][0]["pulled"], 1);
     assert_eq!(pulled["sites"][1]["pulled"], 0, "the second site's copy is not fetched when the first applied it");
     assert_eq!(pulled["sites"][1]["error"], Value::Null);
+    assert_eq!((pulled["sites"][0]["label"].as_str(), pulled["sites"][1]["label"].as_str()), (Some(""), Some("cloud")));
 
     // removing the serving entry leaves a list with no server; the last removal leaves nothing to sync with
     assert_eq!(code(&cli.run(&a, &["sync", "relay", "remove", &id1])), 0);
@@ -387,4 +388,63 @@ fn sync_relay_add_remove_list_and_a_run_over_the_whole_list() {
     assert_eq!(left.lines().count(), 1);
     assert_eq!(code(&cli.run(&a, &["sync", "relay", "remove", &id2])), 0);
     assert_eq!(code(&cli.run(&a, &["sync", "push"])), 2);
+}
+
+fn relay_file(cli: &Cli) -> PathBuf {
+    cli.home.join(".disconect/relay.json")
+}
+
+#[test]
+fn an_empty_list_is_no_relay() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_da, a) = encrypted_copy();
+    let folder = tmp.path().join("s1");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let place = folder.to_str().expect("utf8");
+    std::fs::create_dir_all(relay_file(&cli).parent().expect("parent")).expect("mkdir");
+    std::fs::write(relay_file(&cli), "{\"relays\": []}").expect("write");
+
+    let listed = cli.run(&a, &["sync", "relay", "list"]);
+    assert_eq!((code(&listed), stdout(&listed)), (0, String::new()), "prints nothing");
+    let json: Value = serde_json::from_str(&stdout(&cli.run(&a, &["--json", "sync", "relay", "list"]))).expect("json");
+    assert_eq!(json, serde_json::json!({"relays": []}));
+    assert_eq!(code(&cli.run(&a, &["sync", "push"])), 2, "no relay to sync with");
+    // add appends to it
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", place])), 0);
+    let one: Value = serde_json::from_str(&stdout(&cli.run(&a, &["--json", "sync", "relay", "list"]))).expect("json");
+    assert_eq!(one["relays"].as_array().map(Vec::len), Some(1));
+    // removing the last entry deletes the file, and the next add works
+    let id = one["relays"][0]["id"].as_str().expect("id").to_string();
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "remove", &id])), 0);
+    assert!(!relay_file(&cli).exists(), "the emptied list is no file");
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", place])), 0);
+    assert!(relay_file(&cli).exists());
+}
+
+#[test]
+fn remember_replaces_a_list_of_one_and_refuses_a_longer_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_da, a) = encrypted_copy();
+    let (s1, s2, s3) = (tmp.path().join("s1"), tmp.path().join("s2"), tmp.path().join("s3"));
+    for folder in [&s1, &s2, &s3] {
+        std::fs::create_dir_all(folder).expect("mkdir");
+    }
+    let (p1, p2, p3) = (s1.to_str().expect("utf8"), s2.to_str().expect("utf8"), s3.to_str().expect("utf8"));
+    // zero entries and one entry: --remember keeps replacing with the one-entry list
+    assert_eq!(code(&cli.run(&a, &["sync", "push", "--relay", p1, "--remember"])), 0);
+    assert_eq!(code(&cli.run(&a, &["sync", "push", "--relay", p2, "--remember"])), 0);
+    let list = disconect_core::relay::config::read_list(&relay_file(&cli)).expect("list");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].config, disconect_core::relay::config::RelayConfig::Folder(p2.to_string()));
+    // two entries: refused, the file untouched
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", p1])), 0);
+    let before = std::fs::read(relay_file(&cli)).expect("read");
+    let refused = cli.run(&a, &["sync", "push", "--relay", p3, "--remember"]);
+    assert_eq!(code(&refused), 2);
+    assert!(stderr(&refused).contains("the relay list has more than one entry; use sync relay add"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read(relay_file(&cli)).expect("read"), before);
+    // without --remember a one-off relay still runs over a longer list
+    assert_eq!(code(&cli.run(&a, &["sync", "push", "--relay", p3])), 0);
 }

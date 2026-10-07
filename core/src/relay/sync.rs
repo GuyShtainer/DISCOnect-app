@@ -160,11 +160,14 @@ pub struct Site {
     pub report: usize,
 }
 
-/// What one site did in one run: `sync.run`'s `sites` rows. `error` is a reason word, never a path or an OS text.
+/// What one site did in one run: `sync.run`'s `sites` rows. `error` is a stable site word (see
+/// [`RelayError::site_word`], plus the words `open_sites` adds), never a path or an OS text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteReport {
     pub id: String,
     pub kind: &'static str,
+    /// The entry's label (`""` when it has none): user text, never a path.
+    pub label: String,
     pub pushed: usize,
     pub healed: usize,
     pub behind: usize,
@@ -178,6 +181,7 @@ impl SiteReport {
         SiteReport {
             id: id.to_string(),
             kind,
+            label: String::new(),
             pushed: 0,
             healed: 0,
             behind: 0,
@@ -191,6 +195,7 @@ impl SiteReport {
         serde_json::json!({
             "id": self.id,
             "kind": self.kind,
+            "label": self.label,
             "pushed": self.pushed,
             "healed": self.healed,
             "behind": self.behind,
@@ -201,7 +206,7 @@ impl SiteReport {
     }
 
     fn fail(&mut self, error: &RelayError) {
-        self.error.get_or_insert(error.reason());
+        self.error.get_or_insert(error.site_word());
     }
 }
 
@@ -210,11 +215,16 @@ impl SiteReport {
 pub struct SiteSpec {
     pub id: String,
     pub config: RelayConfig,
+    /// The entry's label (`""` for none); echoed in the site's report.
+    pub label: String,
     /// The shell could not reach the folder (an unmounted volume, a revoked bookmark): reported, never opened.
     pub unavailable: bool,
     /// A folder whose root may be missing is opened anyway and the first put creates it (the legacy single
     /// folder and the entry this device serves); otherwise a missing root is `unavailable`.
     pub create_root: bool,
+    /// A `lan` address also has to be an address class the phone may sync with (an IP literal, private or
+    /// on-link; see `serve::join::lan_address_class_ok`): set for the entries a shell injects per call.
+    pub check_address: bool,
 }
 
 impl SiteSpec {
@@ -222,8 +232,10 @@ impl SiteSpec {
         SiteSpec {
             id: entry.id.clone(),
             config: entry.config.clone(),
+            label: entry.label.clone(),
             unavailable: false,
             create_root: entry.serve,
+            check_address: false,
         }
     }
 }
@@ -260,6 +272,7 @@ pub fn open_sites(specs: &[SiteSpec], master: &[u8]) -> (Vec<Site>, Vec<SiteRepo
             RelayConfig::Lan(_) => "lan",
         };
         let mut report = SiteReport::new(&spec.id, kind);
+        report.label = spec.label.clone();
         let opened: Result<Box<dyn Relay + Send>, &'static str> = if spec.unavailable {
             Err("unavailable")
         } else {
@@ -267,17 +280,22 @@ pub fn open_sites(specs: &[SiteSpec], master: &[u8]) -> (Vec<Site>, Vec<SiteRepo
                 RelayConfig::Folder(folder) => {
                     let root = keys::expand_user(Path::new(folder));
                     match folder_identity(&root) {
-                        None if spec.create_root && !root.exists() => Ok(Box::new(FolderRelay::new(root))),
+                        None if spec.create_root && !root.exists() => Ok(Box::new(FolderRelay::creating_root(root))),
                         None => Err("unavailable"),
                         Some(identity) if folders.contains(&identity) => Err("same_relay"),
                         Some(identity) => {
                             folders.push(identity);
-                            Ok(Box::new(FolderRelay::new(root)))
+                            Ok(Box::new(if spec.create_root {
+                                FolderRelay::creating_root(root)
+                            } else {
+                                FolderRelay::new(root)
+                            }))
                         }
                     }
                 }
                 RelayConfig::Lan(url) => match parse_base_url(url) {
                     Err(_) => Err("bad_url"),
+                    Ok(base) if spec.check_address && !crate::serve::join::lan_address_class_ok(&base) => Err("bad_url"),
                     Ok(base) if urls.contains(&base) => Err("same_relay"),
                     Ok(base) => match LanRelay::new(&base, master) {
                         Ok(relay) => {
@@ -533,9 +551,10 @@ fn heal(
     let pushed: Vec<(String, Header)> = {
         let mut stmt = conn.prepare(
             "SELECT name, device_id, device_seq, prev, created_utc FROM relay_bundles \
-             WHERE direction='pushed' AND status='applied' ORDER BY device_seq",
+             WHERE direction='pushed' AND status='applied' AND name LIKE ? ORDER BY device_seq",
         )?;
-        let mapped = stmt.query_map([], |r| {
+        // only this account's names: after a key rotation whose forget failed, the old account's rows stay
+        let mapped = stmt.query_map(params![format!("{account}/%")], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 Header {
@@ -555,7 +574,7 @@ fn heal(
         if faults[index].is_some() {
             continue;
         }
-        let listing: HashSet<String> = match relay.list(&account) {
+        let listing: HashSet<String> = match relay.list_present(&account) {
             Ok(names) => names.into_iter().collect(),
             Err(error) => {
                 reports[*report].fail(&error);
@@ -573,7 +592,13 @@ fn heal(
                 break;
             }
             let (records, ranges) = linked_rows(conn, name)?;
-            let data = pack(master, name, CORE, header, &records, &ranges)?;
+            let Ok(data) = pack(master, name, CORE, header, &records, &ranges) else {
+                // one name that cannot be packed is this site's `io_error`, never the run's
+                let error = RelayError::Io(std::io::Error::other("pack"));
+                reports[*report].fail(&error);
+                faults[index] = Some(error);
+                break;
+            };
             if reports[*report].healed > 0 && bytes + data.len() > HEAL_BYTES_PER_SITE {
                 reports[*report].behind = rest;
                 break;

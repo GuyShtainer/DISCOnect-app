@@ -65,7 +65,7 @@ fn device() -> Device {
 }
 
 fn relay_in(dir: &Path) -> FolderRelay {
-    FolderRelay::new(dir.join("relay"))
+    FolderRelay::creating_root(dir.join("relay"))
 }
 
 fn write(dir: &Path, relative: &str, text: &str) {

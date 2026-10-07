@@ -321,6 +321,9 @@ fn adhoc_relay(args: &Args) -> Result<Option<RelayConfig>, (u8, String)> {
     }
     if args.remember {
         let path = relay_config().ok_or((1, "cannot remember the relay: HOME is not set".to_string()))?;
+        if path.exists() && relay_cfg::read_list(&path).is_some_and(|entries| entries.len() > 1) {
+            return Err((EXIT_USAGE, "usage: the relay list has more than one entry; use sync relay add".to_string()));
+        }
         if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
             return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
         }
@@ -342,6 +345,7 @@ fn relay_list() -> Result<Vec<RelayEntry>, (u8, String)> {
         .as_ref()
         .filter(|p| p.exists())
         .and_then(|p| relay_cfg::read_list(p))
+        .filter(|entries| !entries.is_empty())
         .ok_or_else(|| no_relay_error(config.as_ref()))
 }
 
@@ -529,8 +533,9 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
 
 /// One line per site: what the run did there and, when it failed, the reason word.
 fn site_line(report: &sync::SiteReport) -> String {
+    let label = if report.label.is_empty() { String::new() } else { format!(" {}", report.label) };
     let mut line = format!(
-        "  site {} {}: pushed {}, healed {}, behind {}, pulled {}, rejected {}",
+        "  site {}{label} {}: pushed {}, healed {}, behind {}, pulled {}, rejected {}",
         report.id, report.kind, report.pushed, report.healed, report.behind, report.pulled, report.rejected
     );
     if let Some(error) = report.error {
@@ -652,6 +657,9 @@ fn run_relay_list(args: &Args) -> Result<(), (u8, String)> {
                     format!("{}  {kind}  {place}  {label}{}", e.id, if e.serve { "  serves" } else { "" })
                 })
                 .collect();
+            if lines.is_empty() && !args.json {
+                return Ok(()); // no relay: nothing to print
+            }
             emit(args.json, json!({"relays": entries.iter().map(entry_json).collect::<Vec<_>>()}), lines.join("\n"));
             Ok(())
         }
@@ -691,7 +699,12 @@ fn run_relay_list(args: &Args) -> Result<(), (u8, String)> {
             if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
                 return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
             }
-            write_relay_list(&path, &entries)?;
+            if entries.is_empty() {
+                // the last entry: no file at all (an empty list reads as no relay either way)
+                std::fs::remove_file(&path).map_err(|e| (1, format!("cannot write the relay config: {}", e.kind())))?;
+            } else {
+                write_relay_list(&path, &entries)?;
+            }
             emit(args.json, json!({"removed": id}), format!("removed relay {id}"));
             Ok(())
         }
@@ -759,7 +772,7 @@ fn run_pair_offer(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, 
     // the joiner bootstraps from what was last pushed: push first, then release the write lock
     {
         let opened = store::open_for_write_with(db, "pair", 10.0, Some(&master)).map_err(|e| (open_error_code(&e), e.to_string()))?;
-        let relay = FolderRelay::new(folder.clone());
+        let relay = FolderRelay::creating_root(folder.clone());
         sync::push(opened.conn(), &*master, &relay).map_err(|e| (sync_exit(&e), e.to_string()))?;
     }
     let log: disconect_core::relay::lan_server::Logger = std::sync::Arc::new(|method, status| eprintln!("{method} {status}"));

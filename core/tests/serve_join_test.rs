@@ -383,7 +383,7 @@ fn mac(ttl: Option<u64>) -> Mac {
     {
         let opened = store::open_for_write_with(&db, "test", 5.0, Some(&master)).expect("open");
         import_path(opened.conn(), &drop_dir, None, None).expect("import");
-        relay_sync::push(opened.conn(), master.as_slice(), &FolderRelay::new(folder.clone())).expect("push");
+        relay_sync::push(opened.conn(), master.as_slice(), &FolderRelay::creating_root(folder.clone())).expect("push");
     }
     let env = Env {
         shared: serving::new_state(),

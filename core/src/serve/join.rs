@@ -336,14 +336,12 @@ fn never_a_pairing_address(ip: IpAddr) -> bool {
 }
 
 /// One up interface address and its prefix length (from `getifaddrs`).
-#[cfg(any(target_os = "ios", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Iface {
     addr: IpAddr,
     prefix: u8,
 }
 
-#[cfg(any(target_os = "ios", test))]
 fn is_private(ip: IpAddr) -> bool {
     match unmapped(ip) {
         // 10/8, 172.16/12, 192.168/16, CGNAT 100.64/10
@@ -356,14 +354,12 @@ fn is_private(ip: IpAddr) -> bool {
     }
 }
 
-#[cfg(any(target_os = "ios", test))]
 fn is_loopback(ip: IpAddr) -> bool {
     unmapped(ip).is_loopback()
 }
 
 /// `ip` inside the subnet of one of `ifaces` (same family; a prefix of 0 would make everything on-link, so
 /// it counts for nothing).
-#[cfg(any(target_os = "ios", test))]
 fn on_link(ip: IpAddr, ifaces: &[Iface]) -> bool {
     let ip = unmapped(ip);
     ifaces.iter().any(|iface| {
@@ -387,7 +383,6 @@ fn on_link(ip: IpAddr, ifaces: &[Iface]) -> bool {
 /// Stage 2 (iOS only): is `ip` a plausible address for the Mac on this phone's network? Loopback only when
 /// the build allows it (simulator or debug); private ranges (RFC1918, CGNAT, ULA) yes; anything else only
 /// when it is on-link.
-#[cfg(any(target_os = "ios", test))]
 fn reachable_class(ip: IpAddr, loopback_ok: bool, ifaces: &[Iface]) -> bool {
     if is_loopback(ip) {
         return loopback_ok;
@@ -453,6 +448,24 @@ fn check_reachable_class(url: &str) -> Result<(), Failure> {
     } else {
         Err(pair_failed(NOT_ON_LINK))
     }
+}
+
+/// Whether `url` (a LAN relay base address) is an address class the phone may sync with: the pairing joiner's
+/// checks, run on the address alone: an IP literal (no DNS name), not a class that is never a pairing address,
+/// then loopback only in a debug or simulator build, otherwise private or on-link (the on-link test needs this
+/// phone's interfaces, so off iOS only the private ranges and debug loopback pass). Used by `open_sites` for the
+/// `lan` entries a shell injects per call.
+pub(crate) fn lan_address_class_ok(url: &str) -> bool {
+    let Some(ip) = offer_ip(url) else { return false };
+    if never_a_pairing_address(ip) {
+        return false;
+    }
+    let loopback_ok = cfg!(any(target_abi = "sim", debug_assertions));
+    #[cfg(target_os = "ios")]
+    let ifaces = up_interfaces();
+    #[cfg(not(target_os = "ios"))]
+    let ifaces: Vec<Iface> = Vec::new();
+    reachable_class(ip, loopback_ok, &ifaces)
 }
 
 /// The prefix of `pair.join`, in order, before any network call (and so before a key is drawn): the shape,

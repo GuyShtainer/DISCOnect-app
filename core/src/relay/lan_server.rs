@@ -145,7 +145,7 @@ impl Ctx {
 
     pub fn with_limits(folder: impl Into<PathBuf>, master: &[u8], limits: Limits) -> Ctx {
         Ctx {
-            relay: FolderRelay::new(folder),
+            relay: FolderRelay::creating_root(folder),
             account: account_for(master),
             key: token_key(master),
             limits,

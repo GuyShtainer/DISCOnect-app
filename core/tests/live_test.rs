@@ -256,7 +256,7 @@ fn relay_carries_the_live_record_and_the_peer_stores_the_bytes() {
     let path = dir_a.path().join("live-p.jsonl");
     write_lines(&path, &live_lines());
     import_path(a.conn(), &path, None, None).expect("import");
-    let relay = FolderRelay::new(dir_a.path().join("relay"));
+    let relay = FolderRelay::creating_root(dir_a.path().join("relay"));
     sync::push(a.conn(), &master, &relay).expect("push");
     let result = sync::pull(b.conn(), &master, &relay).expect("pull");
     assert_eq!((result.records_new, result.records_invalid), (1, 0));

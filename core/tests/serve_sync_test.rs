@@ -267,7 +267,7 @@ fn a_folder_relay_pushes_then_pulls_with_events_and_counts_only() {
             "push": {"bundles": 1, "records": 2, "ranges": 0},
             "pull": {"applied": 0, "rejected": 0, "records_new": 0, "records_duplicate": 0,
                      "records_invalid": 0, "conflicts": 0, "ranges_new": 0, "records_repaired": 0, "records_kept": 0, "gaps": 0, "status": "ok"},
-            "sites": [{"id": "default", "kind": "folder", "pushed": 1, "healed": 0, "behind": 0, "pulled": 0,
+            "sites": [{"id": "default", "kind": "folder", "label": "", "pushed": 1, "healed": 0, "behind": 0, "pulled": 0,
                        "rejected": 0, "error": null}],
             "status": "ok"
         })
@@ -433,8 +433,13 @@ fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
 }
 
 fn site_row(id: &str, pushed: i64, healed: i64, pulled: i64, error: Value) -> Value {
-    json!({"id": id, "kind": "folder", "pushed": pushed, "healed": healed, "behind": 0, "pulled": pulled,
+    json!({"id": id, "kind": "folder", "label": "", "pushed": pushed, "healed": healed, "behind": 0, "pulled": pulled,
            "rejected": 0, "error": error})
+}
+
+fn labelled(mut row: Value, label: &str) -> Value {
+    row["label"] = json!(label);
+    row
 }
 
 #[test]
@@ -460,7 +465,7 @@ fn a_relays_param_replaces_the_list_for_the_call_and_status_echoes_the_sites() {
     let lines = rig.send(3, "sync.run", json!({"relays": relays}));
     let result = &only_response(&lines)["result"];
     let sites = json!([
-        site_row("0000000a", 1, 0, 0, Value::Null),
+        labelled(site_row("0000000a", 1, 0, 0, Value::Null), "one"),
         site_row("0000000b", 1, 0, 0, Value::Null),
         site_row("0000000c", 0, 0, 0, json!("unavailable")),
         site_row("0000000d", 0, 0, 0, json!("unavailable")),
@@ -543,4 +548,54 @@ fn the_configured_list_runs_when_no_relays_param_is_given_and_a_failing_site_is_
     );
     let status = rig.send(3, "sync.status", json!({}));
     assert_eq!(status[0]["result"]["relay_url"], "http://127.0.0.1:9");
+}
+
+#[test]
+fn an_empty_relay_list_answers_not_found_and_a_public_lan_address_is_refused() {
+    let (_da, a) = encrypted_store(true);
+    relay_json(&a, json!({"relays": []}));
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    for (id, method) in [(2, "sync.run"), (3, "relay.addresses")] {
+        let reply = rig.send(id, method, json!({}));
+        assert_eq!(reply[0]["error"]["code"], "not_found", "{method}");
+        assert_eq!(reply[0]["error"]["message"], "no relay is configured (relay.json in the data folder)");
+    }
+    // a per-call list of one `lan` entry must be an IP literal on a private or local network
+    for url in ["http://8.8.8.8:24816", "http://mac.local:24816"] {
+        let reply = rig.send(4, "sync.run", json!({"relays": [{"id": "0000000a", "kind": "lan", "url": url}]}));
+        assert_eq!(reply[0]["error"]["code"], "bad_params", "{url}");
+        assert_eq!(
+            reply[0]["error"]["message"],
+            "relays: a LAN relay address must be an IP address on a private or local network, not a name"
+        );
+    }
+}
+
+#[test]
+fn a_lan_site_in_the_list_is_partial_while_the_mac_is_away_and_carries_its_label() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let one = tmp.path().join("one");
+    std::fs::create_dir_all(&one).expect("mkdir");
+    let (_da, a) = encrypted_store(true);
+    // a port nothing listens on
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    relay_json(
+        &a,
+        json!({"relays": [
+            {"id": "0000000a", "kind": "folder", "path": one, "label": "disk"},
+            {"id": "0000000b", "kind": "lan", "url": url, "label": "mac"},
+        ]}),
+    );
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let lines = rig.send(2, "sync.run", json!({}));
+    let result = &only_response(&lines)["result"];
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["sites"][0]["label"], "disk");
+    assert_eq!(result["sites"][0]["error"], Value::Null);
+    assert_eq!((result["sites"][1]["label"].as_str(), result["sites"][1]["kind"].as_str()), (Some("mac"), Some("lan")));
+    assert_eq!(result["sites"][1]["error"], "unreachable");
 }

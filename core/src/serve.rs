@@ -80,7 +80,7 @@ use crate::time::now_instant;
 use crate::write_lock::LockError;
 use crate::wirejson::{self, Id, Json, PyStr};
 
-mod join;
+pub(crate) mod join;
 pub use join::{JoinHooks, MAX_OFFER_TEXT};
 use join::JoinHub;
 
@@ -1297,10 +1297,11 @@ fn relays_param(value: &Json) -> Result<Vec<relay_sync::SiteSpec>, Failure> {
             Some(Json::Bool(flag)) => *flag,
             Some(_) => return Err(bad()),
         };
-        match item.get("label") {
-            None | Some(Json::Null) | Some(Json::Str(_)) => {}
+        let label = match item.get("label") {
+            None | Some(Json::Null) => String::new(),
+            Some(Json::Str(text)) => text.to_text().ok_or_else(bad)?,
             Some(_) => return Err(bad()),
-        }
+        };
         let config = match text("kind").as_deref() {
             Some("folder") => match text("path") {
                 Some(path) => relay_config::RelayConfig::Folder(path),
@@ -1317,7 +1318,7 @@ fn relays_param(value: &Json) -> Result<Vec<relay_sync::SiteSpec>, Failure> {
         if specs.iter().any(|spec| spec.id == id) {
             return Err(bad());
         }
-        specs.push(relay_sync::SiteSpec { id, config, unavailable, create_root: false });
+        specs.push(relay_sync::SiteSpec { id, config, label, unavailable, create_root: false, check_address: true });
     }
     Ok(specs)
 }
@@ -1338,7 +1339,11 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     let entries = match per_call {
         Some(Json::Array(items)) if items.is_empty() => return Err(not_found()),
         Some(_) => None,
-        None => Some(relay_config::read_list(&relay_json_path(&session.db_path)).ok_or_else(not_found)?),
+        None => Some(
+            relay_config::read_list(&relay_json_path(&session.db_path))
+                .filter(|entries| !entries.is_empty())
+                .ok_or_else(not_found)?,
+        ),
     };
     let Some(master) = session.unlocked_master().cloned() else {
         return Err(Failure::serve(
@@ -1362,6 +1367,12 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         relay_config::check_lan_url(url).map_err(|rule| {
             Failure::serve("bad_params", format!("{}: {rule}", if per_call.is_some() { "relays" } else { "relay.json" }))
         })?;
+        if per_call.is_some() && !join::lan_address_class_ok(url) {
+            return Err(Failure::serve(
+                "bad_params",
+                "relays: a LAN relay address must be an IP address on a private or local network, not a name",
+            ));
+        }
     }
     if session
         .import_slot
@@ -1406,7 +1417,7 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
 /// (`busy`, the CLI's `resolve_master` refusal, which `key.unlock` does not apply). Parameter shapes come after.
 fn relay_prefix(session: &Session) -> Result<Site, Failure> {
     session.require_unlocked()?;
-    let entries = relay_config::read_list(&relay_json_path(&session.db_path)).ok_or_else(|| {
+    let entries = relay_config::read_list(&relay_json_path(&session.db_path)).filter(|entries| !entries.is_empty()).ok_or_else(|| {
         Failure::serve(
             "not_found",
             "no relay is configured (relay.json in the data folder)",
@@ -1517,7 +1528,7 @@ fn pair_push(job: &PairJob) -> Result<(), Failure> {
         let _ = job.channel.write_line(&line);
     };
     emit(sync_event("pair", "push", "start", None));
-    let relay = FolderRelay::new(job.site.folder.clone());
+    let relay = FolderRelay::creating_root(job.site.folder.clone());
     let pushed = relay_sync::push(store.conn(), job.site.master.as_slice(), &relay)?;
     let counts = json!({"bundles": pushed.bundles.len(), "records": pushed.records, "ranges": pushed.ranges});
     emit(sync_event("pair", "push", "done", Some(&counts)));

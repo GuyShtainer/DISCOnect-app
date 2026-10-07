@@ -68,6 +68,37 @@ impl RelayError {
 }
 
 impl RelayError {
+    /// The stable word a site report carries for this failure (`SiteReport::error`). The Python twin and the
+    /// app copy this table; it never holds a path, an address or an OS text.
+    ///
+    /// | failure                                   | word            |
+    /// |-------------------------------------------|-----------------|
+    /// | `TooLarge`                                | `too_large`     |
+    /// | `BadName`                                 | `bad_name`      |
+    /// | `Unreachable`, `Status(_)`                | `unreachable`   |
+    /// | `Unauthorized`                            | `refused`       |
+    /// | `Unverified`                              | `unverified`    |
+    /// | `Io` NotFound, NotADirectory              | `missing`       |
+    /// | `Io` PermissionDenied                     | `no_permission` |
+    /// | any other `Io`                            | `io_error`      |
+    ///
+    /// `open_sites` adds `unavailable`, `same_relay`, `bad_url` and `unsupported_transport`.
+    pub fn site_word(&self) -> &'static str {
+        use std::io::ErrorKind as K;
+        match self {
+            RelayError::TooLarge => "too_large",
+            RelayError::BadName => "bad_name",
+            RelayError::Unreachable | RelayError::Status(_) => "unreachable",
+            RelayError::Unauthorized { .. } => "refused",
+            RelayError::Unverified => "unverified",
+            RelayError::Io(error) => match error.kind() {
+                K::NotFound | K::NotADirectory => "missing",
+                K::PermissionDenied => "no_permission",
+                _ => "io_error",
+            },
+        }
+    }
+
     /// True when the failure says nothing about the object being read: the relay could not be
     /// reached, refused the token or broke. A pull stops on these (nothing is marked, the next pull
     /// retries) instead of recording the bundle as `rejected`.
@@ -90,6 +121,11 @@ pub trait Relay {
     /// Remove one object (`FileNotFoundError` when it is not there). Nothing in a push or pull
     /// deletes; pairing and tests do.
     fn delete(&self, name: &str) -> Result<(), RelayError>;
+    /// The names a heal may count as present: [`Relay::list`] by default. A folder also counts an evicted
+    /// iCloud placeholder (`.<32 hex>.icloud`), which a `get` could not read but which is the same object.
+    fn list_present(&self, account: &str) -> Result<Vec<String>, RelayError> {
+        self.list(account)
+    }
 }
 
 fn is_hex(text: &str, length: usize) -> bool {
@@ -109,11 +145,19 @@ pub fn is_object_name(name: &str) -> bool {
 /// match the name pattern (temp files, strangers) is ignored.
 pub struct FolderRelay {
     root: PathBuf,
+    create_root: bool,
 }
 
 impl FolderRelay {
+    /// A folder whose root must already exist: a `put` into a root that is gone (an unmounted volume) fails
+    /// `NotFound` and creates nothing; only the `<account>` level is created.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        FolderRelay { root: root.into() }
+        FolderRelay { root: root.into(), create_root: false }
+    }
+
+    /// A folder the first `put` may create from nothing (the relay this device serves, the legacy single relay).
+    pub fn creating_root(root: impl Into<PathBuf>) -> Self {
+        FolderRelay { root: root.into(), create_root: true }
     }
 
     pub fn root(&self) -> &Path {
@@ -128,7 +172,17 @@ impl Relay for FolderRelay {
         }
         let target = self.root.join(name);
         let parent = target.parent().ok_or(RelayError::BadName)?;
-        fs::create_dir_all(parent)?;
+        if self.create_root {
+            fs::create_dir_all(parent)?;
+        } else {
+            if !self.root.is_dir() {
+                return Err(RelayError::Io(std::io::ErrorKind::NotFound.into()));
+            }
+            match fs::create_dir(parent) {
+                Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error.into()),
+                _ => {}
+            }
+        }
         let mut token = [0u8; 8];
         getrandom::fill(&mut token).map_err(|e| std::io::Error::other(e.to_string()))?;
         let temp = parent.join(format!(".tmp-{}", hex::encode(token)));
@@ -185,6 +239,28 @@ impl Relay for FolderRelay {
         names.sort();
         Ok(names)
     }
+
+    fn list_present(&self, account: &str) -> Result<Vec<String>, RelayError> {
+        let mut names = self.list(account)?;
+        let folder = self.root.join(account);
+        if let Ok(entries) = fs::read_dir(&folder) {
+            for entry in entries.flatten() {
+                let Some(file) = entry.file_name().to_str().map(str::to_string) else { continue };
+                let evicted = file
+                    .strip_prefix('.')
+                    .and_then(|rest| rest.strip_suffix(".icloud"))
+                    .filter(|object| is_hex(object, 32));
+                if let Some(object) = evicted {
+                    let name = format!("{account}/{object}");
+                    if is_object_name(&name) && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +276,7 @@ mod tests {
     #[test]
     fn folder_relay_ignores_strangers_and_temp_files() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let relay = FolderRelay::new(dir.path().join("relay"));
+        let relay = FolderRelay::creating_root(dir.path().join("relay"));
         relay.put(&name('a'), b"abc").expect("put");
         fs::write(
             dir.path().join("relay").join(ACCOUNT).join(".tmp-deadbeef"),
@@ -233,7 +309,7 @@ mod tests {
     #[test]
     fn a_missing_object_reads_as_file_not_found_and_an_oversized_one_as_too_large() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let relay = FolderRelay::new(dir.path().join("relay"));
+        let relay = FolderRelay::creating_root(dir.path().join("relay"));
         let missing = relay.get(&name('c')).expect_err("missing");
         assert_eq!(missing.reason(), "FileNotFoundError");
         relay.put(&name('d'), b"x").expect("put");
@@ -251,7 +327,7 @@ mod tests {
     #[test]
     fn delete_removes_one_object_and_validates_the_name() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let relay = FolderRelay::new(dir.path().join("relay"));
+        let relay = FolderRelay::creating_root(dir.path().join("relay"));
         relay.put(&name('a'), b"abc").expect("put");
         relay.put(&name('b'), b"def").expect("put");
         relay.delete(&name('a')).expect("delete");

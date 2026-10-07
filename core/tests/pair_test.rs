@@ -83,7 +83,7 @@ impl Offerer {
         let opened = store::open_for_write_with(&db, "test", 5.0, Some(&secret)).expect("open");
         import_path(opened.conn(), &fit_drop(tmp.path(), "fits", &MONITORING), None, None).expect("import");
         let folder = tmp.path().join("relay");
-        sync::push(opened.conn(), &*secret, &FolderRelay::new(&folder)).expect("push");
+        sync::push(opened.conn(), &*secret, &FolderRelay::creating_root(&folder)).expect("push");
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&log);
         let logger: Logger = Arc::new(move |m, s| sink.lock().expect("log").push((m.to_string(), s)));
