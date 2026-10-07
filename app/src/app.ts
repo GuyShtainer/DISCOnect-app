@@ -766,6 +766,8 @@ const autoSync = {
   timer: null as ReturnType<typeof setTimeout> | null,
   at: null as Date | null, // the last run that reached the core (ok or failed), for the walk line and the focus rule
   line: "", // the walk line under the switch: "Synced on its own at HH:MM · N new" or the failure, once
+  running: false, // a tick holds the core's one task slot: Sync now and Start an offer wait for it instead of hearing busy
+  pending: null as Promise<void> | null,
 };
 function autoSyncLoad(): void {
   try { autoSync.on = localStorage.getItem(AUTO_SYNC_STORE) !== "off"; } catch { autoSync.on = true; }
@@ -776,19 +778,31 @@ function autoSyncSet(on: boolean): void {
   if (!on) autoSync.line = "";
 }
 async function autoSyncRun(): Promise<void> {
-  if (PHONE || !autoSync.on || locked() || syncRun.running || pairPushing) return;
+  if (PHONE || !autoSync.on || locked() || syncRun.running || pairPushing || autoSync.running || current() === "sync/pair") return;
+  autoSync.running = true;
+  autoSync.pending = autoSyncTick().finally(() => { autoSync.running = false; autoSync.pending = null; });
+  await autoSync.pending;
+}
+async function autoSyncTick(): Promise<void> {
   const clock = (d: Date): string => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  let fresh = 0; // records this tick brought in: a data screen on show is redrawn so "on its own" is seen, not just said
   try {
     const r = await core.call<{ pull: { applied: number; records_new: number; status: string }; sites?: SiteRow[]; status?: string }>("sync.run", { auto: true });
+    if (!autoSync.on) return; // switched off while the run was out: its result is dropped
     autoSync.at = new Date();
-    const failed = (r.sites ?? []).filter((x) => x.error && x.error !== "not_auto").length;
-    autoSync.line = `Synced on its own at ${clock(autoSync.at)} · ${r.pull.records_new} new${r.status === "partial" || r.pull.status === "partial" ? " (partial)" : ""}${failed > 0 ? ` · ${failed} of ${r.sites?.length ?? 0} relays could not be used; see Relays below` : ""}`;
+    const polled = (r.sites ?? []).filter((x) => x.error !== "not_auto"); // a network relay is never polled, so it is not counted
+    const failed = polled.filter((x) => x.error).length;
+    fresh = r.pull.records_new;
+    autoSync.line = `Synced on its own at ${clock(autoSync.at)} · ${fresh} new${r.status === "partial" || r.pull.status === "partial" ? " (partial)" : ""}${failed > 0 ? ` · ${failed} of ${polled.length} relays could not be used; see Relays below` : ""}`;
   } catch (e) {
     if (core.isCoreError(e) && (e.code === "busy" || e.code === "locked" || e.code === "not_found" || e.code === "not_folder")) return; // nothing to do this tick; the next one looks again
+    if (!autoSync.on) return;
     autoSync.at = new Date();
     autoSync.line = `Could not sync on its own at ${clock(autoSync.at)}. ${coreLine(e)}`;
   }
-  syncRedraw();
+  // the Sync screen shows the line; a data screen shows the new records; the pairing view is never rebuilt under a code being typed
+  const here = current();
+  if (here === "sync" || (fresh > 0 && ["today", "sleep", "trend", "health", "watch"].includes(here.split("/")[0]))) void route();
 }
 function autoSyncSchedule(delay: number): void {
   if (PHONE) return;
@@ -860,6 +874,7 @@ function onSyncProgress(payload: unknown): void {
   if (p.op === "import") {
     onImportProgress(p);
   } else if (p.op === "sync") {
+    if (!syncRun.running) return; // a tick's progress (19a) never writes the click's steps; its own line says what it did
     const key = p.phase === "pull" ? "pull" : "push";
     syncRun[key] = p.state === "done" ? "done" : "now";
     if (p.state === "done") {
@@ -1011,6 +1026,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
 
   // ---- Sync now ----
   const runSync = async (): Promise<void> => {
+    if (autoSync.pending) await autoSync.pending; // a tick holds the task slot: wait for it rather than hear busy
     syncRun.running = true;
     syncRun.push = "idle"; syncRun.pull = "idle"; syncRun.pushNote = ""; syncRun.pullNote = ""; syncRun.result = "";
     redraw();
@@ -1044,6 +1060,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   const startOffer = async (): Promise<void> => {
     const l = listen();
     if (!l) return;
+    if (autoSync.pending) await autoSync.pending; // a tick holds the task slot: wait for it rather than hear busy
     pairEnding = null;
     pairNoDevice = false;
     pairDigitsTried = false;
@@ -1256,7 +1273,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   stat.append(kv2);
   const actions = el("div", "actions");
   const now = el("button", "", "Sync now") as HTMLButtonElement;
-  now.disabled = syncRun.running || pairPushing;
+  now.disabled = syncRun.running || pairPushing || autoSync.running;
   now.onclick = () => void runSync();
   const pairBtn = el("a", "button", "Pair a device") as HTMLAnchorElement;
   pairBtn.href = "#/sync/pair";
@@ -1272,7 +1289,8 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     sw.append(box);
     stat.append(sw);
     const rule = status.relay_kind === "mixed" ? " A network relay is never polled on its own: Sync now reaches it." : "";
-    stat.append(el("p", "caption muted", autoSync.on ? (autoSync.line || `Every 5 minutes while the app is open, and when you come back to it.${rule}`) : "Off. Sync now still works."));
+    const line = autoSync.running ? "Syncing on its own…" : autoSync.line || "Every 5 minutes while the app is open, and when you come back to it.";
+    stat.append(el("p", "caption muted", autoSync.on ? `${line}${rule}` : "Off. Sync now still works."));
   }
   if (syncRun.running || syncRun.push !== "idle") {
     stat.append(stepsList([
@@ -3876,13 +3894,13 @@ void (async () => {
     if (as >= 0 && /^\d{1,4}$/.test(args[as + 1] ?? "")) { autoSync.first = Number(args[as + 1]) * 1000; autoSync.every = autoSync.first; }
   }
   await phoneEndStrayJoin(); // a reload mid-join ends that join before any screen is drawn (phone only; a no-op elsewhere)
+  autoSyncLoad(); // before the first draw, so the Sync screen's switch shows the stored choice
   const target = args.includes("--sync-pair") ? "sync/pair" : wanted;
   if (target && current() !== target) {
     location.hash = `#/${target}`; // hashchange runs route()
   } else {
     await route();
   }
-  autoSyncLoad();
   autoSyncSchedule(autoSync.first); // 19a: the desktop's own timer; a no-op on the phone
   if (import.meta.env.DEV) {
     if (PHONE) {
