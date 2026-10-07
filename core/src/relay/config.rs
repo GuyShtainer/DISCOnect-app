@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Which relay a device uses: `relay.json` beside the store (`{"folder": path}` or
-//! `{"lan": "http://host:port"}`), shared with the Python CLI, which reads the same file. No
-//! secret lives there: the LAN token derives from the master key at the moment of use.
+//! Which relays a device uses: `relay.json` beside the store, shared with the Python CLI, which reads the same
+//! file. The list form is `{"relays": [{id, kind, path | url, label?, serve?}, ...]}`; the legacy forms
+//! `{"folder": path}` (one entry that serves) and `{"lan": "http://host:port"}` still read. No secret lives
+//! there: the LAN token derives from the master key at the moment of use.
 
 use std::path::Path;
 
@@ -9,6 +10,7 @@ use serde_json::Value;
 
 use super::folder::{FolderRelay, Relay};
 use super::lan::{LanRelay, parse_base_url};
+use crate::canon;
 use crate::keys;
 
 /// The relay a configuration names.
@@ -29,22 +31,88 @@ impl RelayConfig {
             RelayConfig::Folder(text.to_string())
         }
     }
-
-    /// The `relay.json` key and value.
-    pub fn entry(&self) -> (&'static str, &str) {
-        match self {
-            RelayConfig::Folder(folder) => ("folder", folder),
-            RelayConfig::Lan(url) => ("lan", url),
-        }
-    }
 }
 
-/// The configuration in `relay.json`, or `None` when the file is missing, unreadable, not an
-/// object, or names nothing. A non-empty `lan` string wins over `folder` (the Python core reads the
-/// same two keys in the same order and refuses `lan`).
-pub fn read(path: &Path) -> Option<RelayConfig> {
+/// One relay of a device's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEntry {
+    /// `default` (a legacy file) or 1-32 lowercase hex characters (written: 8, see [`new_id`]).
+    pub id: String,
+    pub config: RelayConfig,
+    pub label: String,
+    /// The entry this device serves to others (`relay.serve`, `pair.offer`): a folder, at most one per list.
+    pub serve: bool,
+}
+
+/// `default`, or 1-32 characters of `[0-9a-f]`.
+pub fn valid_id(id: &str) -> bool {
+    id == "default"
+        || (!id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// A fresh entry id: 8 lowercase hex characters from the operating system's randomness.
+pub fn new_id() -> String {
+    let mut random = [0u8; 4];
+    if getrandom::fill(&mut random).is_err() {
+        // no randomness: a time-derived id still keeps ids distinct within one list
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        random = now.to_be_bytes();
+    }
+    hex::encode(random)
+}
+
+/// One `relays` element, or `None` when it is malformed (the whole file is then unreadable).
+fn parse_entry(value: &Value) -> Option<RelayEntry> {
+    let object = value.as_object()?;
+    let id = object.get("id")?.as_str()?;
+    if !valid_id(id) {
+        return None;
+    }
+    let text_of = |key: &str| object.get(key).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let config = match object.get("kind")?.as_str()? {
+        "folder" => RelayConfig::Folder(text_of("path")?.to_string()),
+        "lan" => RelayConfig::Lan(text_of("url")?.to_string()),
+        _ => return None,
+    };
+    let label = match object.get("label") {
+        None => "",
+        Some(Value::String(text)) => text,
+        Some(_) => return None,
+    };
+    let serve = match object.get("serve") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return None,
+    };
+    if serve && matches!(config, RelayConfig::Lan(_)) {
+        return None;
+    }
+    Some(RelayEntry {
+        id: id.to_string(),
+        config,
+        label: label.to_string(),
+        serve,
+    })
+}
+
+/// The list in `relay.json`, or `None` when the file is missing, unreadable, not an object, or names nothing.
+///
+/// `{"relays": [{id, kind: "folder" | "lan", path | url, label?, serve?}, ...]}` wins when `relays` is an array
+/// (the legacy keys are then ignored). Any malformed entry, a repeated id, more than one `serve: true` or an empty
+/// array makes the whole file unreadable. A legacy `{"folder": ...}` is the one entry `default` with `serve: true`;
+/// a legacy `{"lan": ...}` is the one entry `default` (a non-empty `lan` string wins over `folder`, as ever).
+pub fn read_list(path: &Path) -> Option<Vec<RelayEntry>> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
+    if let Some(items) = value.get("relays").and_then(Value::as_array) {
+        let entries: Vec<RelayEntry> = items.iter().map(parse_entry).collect::<Option<_>>()?;
+        let mut seen = std::collections::HashSet::new();
+        let distinct = entries.iter().all(|e| seen.insert(e.id.as_str()));
+        let serving = entries.iter().filter(|e| e.serve).count();
+        return (!entries.is_empty() && distinct && serving <= 1).then_some(entries);
+    }
     let text_of = |key: &str| {
         value
             .get(key)
@@ -52,9 +120,85 @@ pub fn read(path: &Path) -> Option<RelayConfig> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    text_of("lan")
-        .map(RelayConfig::Lan)
-        .or_else(|| text_of("folder").map(RelayConfig::Folder))
+    let (config, serve) = match (text_of("lan"), text_of("folder")) {
+        (Some(url), _) => (RelayConfig::Lan(url), false),
+        (None, Some(folder)) => (RelayConfig::Folder(folder), true),
+        (None, None) => return None,
+    };
+    Some(vec![RelayEntry {
+        id: "default".to_string(),
+        config,
+        label: String::new(),
+        serve,
+    }])
+}
+
+/// What a legacy single-relay reader sees: the first entry's configuration.
+pub fn read(path: &Path) -> Option<RelayConfig> {
+    read_list(path)?.into_iter().next().map(|entry| entry.config)
+}
+
+/// Write `entries` as the list form (sorted keys, `label` only when set, `serve` only when true), creating the
+/// parent folder. More than one `serve` entry is refused.
+pub fn write_list(path: &Path, entries: &[RelayEntry]) -> std::io::Result<()> {
+    if entries.iter().filter(|e| e.serve).count() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only one relay can serve",
+        ));
+    }
+    let items = entries
+        .iter()
+        .map(|entry| {
+            let (kind, place) = match &entry.config {
+                RelayConfig::Folder(folder) => ("path", folder),
+                RelayConfig::Lan(url) => ("url", url),
+            };
+            let mut members = vec![
+                ("id".to_string(), canon::Value::Str(entry.id.clone())),
+                (
+                    "kind".to_string(),
+                    canon::Value::Str(if kind == "path" { "folder" } else { "lan" }.to_string()),
+                ),
+                (kind.to_string(), canon::Value::Str(place.clone())),
+            ];
+            if !entry.label.is_empty() {
+                members.push(("label".to_string(), canon::Value::Str(entry.label.clone())));
+            }
+            if entry.serve {
+                members.push(("serve".to_string(), canon::Value::Bool(true)));
+            }
+            canon::Value::Object(members)
+        })
+        .collect();
+    let text = canon::dumps_spaced(&canon::Value::Object(vec![(
+        "relays".to_string(),
+        canon::Value::Array(items),
+    )]));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{text}\n"))
+}
+
+/// The entry this device serves: the one with `serve: true`, when it is a folder.
+pub fn serve_entry(entries: &[RelayEntry]) -> Option<&RelayEntry> {
+    entries
+        .iter()
+        .find(|e| e.serve && matches!(e.config, RelayConfig::Folder(_)))
+}
+
+/// The address of the first `lan` entry as configured (`sync.status.relay_url` shows its base).
+pub fn first_lan_url(entries: &[RelayEntry]) -> Option<String> {
+    entries.iter().find_map(|e| match &e.config {
+        RelayConfig::Lan(url) => Some(url.clone()),
+        RelayConfig::Folder(_) => None,
+    })
+}
+
+/// [`open`] on an entry.
+pub fn open_entry(entry: &RelayEntry, master: &[u8]) -> Result<Box<dyn Relay + Send>, String> {
+    open(&entry.config, master)
 }
 
 /// Open the relay a configuration names. `master` derives the LAN token. The error text states a
@@ -126,5 +270,100 @@ mod tests {
             RelayConfig::Folder("/some/folder".into())
         );
         assert!(open(&RelayConfig::Lan("https://x:1".into()), &[1; 32]).is_err());
+    }
+
+    fn entry(id: &str, config: RelayConfig, label: &str, serve: bool) -> RelayEntry {
+        RelayEntry { id: id.into(), config, label: label.into(), serve }
+    }
+
+    #[test]
+    fn the_legacy_forms_read_as_one_entry_named_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("relay.json");
+        for (text, want) in [
+            (r#"{"folder": "/r"}"#, Some(entry("default", RelayConfig::Folder("/r".into()), "", true))),
+            (r#"{"lan": "http://x:1"}"#, Some(entry("default", RelayConfig::Lan("http://x:1".into()), "", false))),
+            (r#"{"folder": "/r", "lan": "http://x:1"}"#, Some(entry("default", RelayConfig::Lan("http://x:1".into()), "", false))),
+            (r#"{"folder": 5}"#, None),
+            (r#"{}"#, None),
+        ] {
+            std::fs::write(&path, text).expect("write");
+            assert_eq!(read_list(&path), want.map(|e| vec![e]), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_list_form_wins_and_every_malformed_case_reads_as_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("relay.json");
+        let good = r#"{"relays": [{"id": "0a1b2c3d", "kind": "folder", "path": "/a", "label": "cloud", "serve": true},
+                                  {"id": "default", "kind": "lan", "url": "http://h:2"}], "folder": "/ignored"}"#;
+        std::fs::write(&path, good).expect("write");
+        assert_eq!(
+            read_list(&path),
+            Some(vec![
+                entry("0a1b2c3d", RelayConfig::Folder("/a".into()), "cloud", true),
+                entry("default", RelayConfig::Lan("http://h:2".into()), "", false),
+            ])
+        );
+        for bad in [
+            r#"{"relays": []}"#,
+            r#"{"relays": [5]}"#,
+            r#"{"relays": [{"kind": "folder", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "ABCD", "kind": "folder", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "", "kind": "folder", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "0123456789abcdef0123456789abcdef0", "kind": "folder", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "ftp", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": ""}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "lan", "path": "/a"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "label": 5}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "serve": "yes"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "lan", "url": "http://h:2", "serve": true}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a"}, {"id": "ab", "kind": "folder", "path": "/b"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "serve": true}, {"id": "cd", "kind": "folder", "path": "/b", "serve": true}]}"#,
+        ] {
+            std::fs::write(&path, bad).expect("write");
+            assert_eq!(read_list(&path), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn write_list_round_trips_in_sorted_keys_and_refuses_two_servers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deeper").join("relay.json");
+        let entries = vec![
+            entry("0a1b2c3d", RelayConfig::Folder("~/Cloud".into()), "cloud", true),
+            entry("deadbeef", RelayConfig::Lan("http://h:2".into()), "", false),
+        ];
+        write_list(&path, &entries).expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "{\"relays\": [{\"id\": \"0a1b2c3d\", \"kind\": \"folder\", \"label\": \"cloud\", \"path\": \"~/Cloud\", \"serve\": true}, \
+             {\"id\": \"deadbeef\", \"kind\": \"lan\", \"url\": \"http://h:2\"}]}\n"
+        );
+        assert_eq!(read_list(&path), Some(entries.clone()));
+        let two = vec![
+            entry("aa", RelayConfig::Folder("/a".into()), "", true),
+            entry("bb", RelayConfig::Folder("/b".into()), "", true),
+        ];
+        assert!(write_list(&path, &two).is_err());
+        assert_eq!(read_list(&path), Some(entries), "a refused write leaves the file");
+    }
+
+    #[test]
+    fn new_ids_are_eight_hex_and_the_serve_and_lan_helpers_pick_the_right_entry() {
+        let id = new_id();
+        assert!(id.len() == 8 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{id}");
+        assert!(valid_id(&id) && valid_id("default") && !valid_id("Default") && !valid_id("xyz"));
+        let list = vec![
+            entry("aa", RelayConfig::Lan("http://h:2".into()), "", false),
+            entry("bb", RelayConfig::Folder("/b".into()), "", true),
+            entry("cc", RelayConfig::Lan("http://k:3".into()), "", false),
+        ];
+        assert_eq!(serve_entry(&list).map(|e| e.id.as_str()), Some("bb"));
+        assert_eq!(first_lan_url(&list).as_deref(), Some("http://h:2"));
+        assert_eq!(serve_entry(&list[..1]), None);
+        assert_eq!(first_lan_url(&list[1..2]), None);
     }
 }

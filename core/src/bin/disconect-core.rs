@@ -53,7 +53,7 @@ use disconect_core::mcp_start as mcp;
 use disconect_core::home;
 use disconect_core::identity;
 use disconect_core::serve;
-use disconect_core::relay::config::{self as relay_cfg, RelayConfig};
+use disconect_core::relay::config::{self as relay_cfg, RelayConfig, RelayEntry};
 use disconect_core::relay::folder::{Relay, RelayError};
 use disconect_core::pair::{EXPIRY_S, PairError};
 use disconect_core::pair_client;
@@ -93,6 +93,12 @@ struct Args {
     pair_action: Option<String>,
     relay_file: Option<PathBuf>,
     i_saw_paired: bool,
+    /// `sync relay add|remove|list`.
+    relay_action: Option<String>,
+    /// The folder or address of `add`, the id of `remove`.
+    relay_arg: Option<String>,
+    label: Option<String>,
+    serve_flag: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -103,6 +109,7 @@ fn parse_args() -> Result<Args, String> {
     let mut listen = None;
     let (mut streams, mut force) = (Vec::new(), false);
     let (mut pair_action, mut relay_file, mut i_saw_paired) = (None, None, false);
+    let (mut relay_action, mut relay_arg, mut label, mut serve_flag) = (None, None, None, false);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--db" => db = Some(PathBuf::from(it.next().ok_or("--db needs a path")?)),
@@ -122,12 +129,26 @@ fn parse_args() -> Result<Args, String> {
             "--force" => force = true,
             "--relay-file" => relay_file = Some(PathBuf::from(it.next().ok_or("--relay-file needs a path")?)),
             "--i-saw-paired" => i_saw_paired = true,
+            "--label" => label = Some(it.next().ok_or("--label needs a text")?),
+            "--serve" => serve_flag = true,
             "status" | "init" | "import" | "reparse" | "sync" | "serve" | "mcp" | "relay-serve" | "pair" if command.is_none() => command = Some(arg),
             "offer" | "join" if command.as_deref() == Some("pair") && pair_action.is_none() => pair_action = Some(arg),
-            "push" | "pull" | "status" | "forget"
+            "push" | "pull" | "status" | "forget" | "relay"
                 if command.as_deref() == Some("sync") && sync_action.is_none() =>
             {
                 sync_action = Some(arg);
+            }
+            "add" | "remove" | "list"
+                if sync_action.as_deref() == Some("relay") && relay_action.is_none() =>
+            {
+                relay_action = Some(arg);
+            }
+            _ if sync_action.as_deref() == Some("relay")
+                && matches!(relay_action.as_deref(), Some("add" | "remove"))
+                && relay_arg.is_none()
+                && !arg.starts_with("--") =>
+            {
+                relay_arg = Some(arg);
             }
             _ if command.as_deref() == Some("import") && import_path.is_none() && !arg.starts_with("--") => {
                 import_path = Some(PathBuf::from(arg));
@@ -151,6 +172,10 @@ fn parse_args() -> Result<Args, String> {
         pair_action,
         relay_file,
         i_saw_paired,
+        relay_action,
+        relay_arg,
+        label,
+        serve_flag,
     })
 }
 
@@ -272,57 +297,75 @@ fn relay_config() -> Option<PathBuf> {
     home::relay_config_path()
 }
 
-/// The relay `--relay` or `relay.json` names (`_relay_for`); no secrets live there. `master` derives
-/// the LAN token when the relay is an `http://` address.
-fn relay_config_for(args: &Args) -> Result<RelayConfig, (u8, String)> {
-    let config = relay_config();
-    let mut chosen = args
-        .relay
-        .as_deref()
-        .filter(|r| !r.is_empty())
-        .map(RelayConfig::from_arg);
-    if chosen.is_none()
-        && let Some(path) = config.as_ref().filter(|p| p.exists())
-    {
-        chosen = relay_cfg::read(path);
-    }
-    let Some(chosen) = chosen else {
-        let shown = config.as_ref().map_or_else(
-            || format!("~/{}/{}", identity::DATA_DIR, home::RELAY_CONFIG_NAME),
-            |p| p.display().to_string(),
-        );
-        return Err((
-            EXIT_USAGE,
-            format!("usage: no relay folder: pass --relay <folder> or write {{\"folder\": ...}} to {shown}"),
-        ));
+/// The usage error of a command that finds no relay anywhere.
+fn no_relay_error(config: Option<&PathBuf>) -> (u8, String) {
+    let shown = config.map_or_else(
+        || format!("~/{}/{}", identity::DATA_DIR, home::RELAY_CONFIG_NAME),
+        |p| p.display().to_string(),
+    );
+    (
+        EXIT_USAGE,
+        format!("usage: no relay folder: pass --relay <folder> or write {{\"folder\": ...}} to {shown}"),
+    )
+}
+
+/// The one relay `--relay` names, for this run only; with `--remember` it becomes the whole list (one entry:
+/// a new id, `serve` for a folder).
+fn adhoc_relay(args: &Args) -> Result<Option<RelayConfig>, (u8, String)> {
+    let Some(text) = args.relay.as_deref().filter(|r| !r.is_empty()) else {
+        return Ok(None);
     };
+    let chosen = RelayConfig::from_arg(text);
     if let RelayConfig::Lan(url) = &chosen {
         relay_cfg::check_lan_url(url).map_err(|rule| (EXIT_USAGE, format!("usage: {rule}")))?;
     }
-    if args.relay.is_some() && args.remember {
-        let path = config.ok_or((1, "cannot remember the relay: HOME is not set".to_string()))?;
-        let (key, value) = chosen.entry();
-        let text = disconect_core::canon::dumps_spaced(&disconect_core::canon::Value::Object(vec![(
-            key.to_string(),
-            disconect_core::canon::Value::Str(value.to_string()),
-        )]));
+    if args.remember {
+        let path = relay_config().ok_or((1, "cannot remember the relay: HOME is not set".to_string()))?;
         if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
             return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
         }
-        let write = || -> std::io::Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, format!("{text}\n"))
-        };
-        write().map_err(|e| (1, format!("cannot write the relay config: {}", e.kind())))?;
+        let serve = matches!(chosen, RelayConfig::Folder(_));
+        let entry = RelayEntry { id: relay_cfg::new_id(), config: chosen.clone(), label: String::new(), serve };
+        write_relay_list(&path, &[entry])?;
     }
-    Ok(chosen)
+    Ok(Some(chosen))
 }
 
-fn relay_for(args: &Args, master: &[u8]) -> Result<Box<dyn Relay>, (u8, String)> {
-    let config = relay_config_for(args)?;
-    match relay_cfg::open(&config, master) {
+fn write_relay_list(path: &std::path::Path, entries: &[RelayEntry]) -> Result<(), (u8, String)> {
+    relay_cfg::write_list(path, entries).map_err(|e| (1, format!("cannot write the relay config: {}", e.kind())))
+}
+
+/// The list in `relay.json` (a usage error when there is none).
+fn relay_list() -> Result<Vec<RelayEntry>, (u8, String)> {
+    let config = relay_config();
+    config
+        .as_ref()
+        .filter(|p| p.exists())
+        .and_then(|p| relay_cfg::read_list(p))
+        .ok_or_else(|| no_relay_error(config.as_ref()))
+}
+
+/// The folder a command that serves one uses: `--relay <folder>`, else the entry of `relay.json` that serves.
+fn serve_folder(args: &Args, command: &str) -> Result<PathBuf, (u8, String)> {
+    let not_a_folder = || (EXIT_USAGE, format!("usage: {command} serves a folder, not an http:// address"));
+    let config = match adhoc_relay(args)? {
+        Some(config) => config,
+        None => {
+            let entries = relay_list()?;
+            match relay_cfg::serve_entry(&entries) {
+                Some(entry) => entry.config.clone(),
+                None => return Err(not_a_folder()),
+            }
+        }
+    };
+    match config {
+        RelayConfig::Folder(folder) => Ok(expand_user(&folder)),
+        RelayConfig::Lan(_) => Err(not_a_folder()),
+    }
+}
+
+fn relay_for(config: &RelayConfig, master: &[u8]) -> Result<Box<dyn Relay>, (u8, String)> {
+    match relay_cfg::open(config, master) {
         Ok(relay) => Ok(relay),
         Err(rule) => Err((EXIT_USAGE, format!("usage: {rule}"))),
     }
@@ -402,7 +445,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
     let action = args
         .sync_action
         .as_deref()
-        .ok_or((EXIT_USAGE, "sync needs an action: push | pull | status | forget".to_string()))?;
+        .ok_or((EXIT_USAGE, "sync needs an action: push | pull | status | forget | relay".to_string()))?;
     let failed = |e: SyncError| (sync_exit(&e), e.to_string());
     let open_err = |e: StoreError| (open_error_code(&e), e.to_string());
     match action {
@@ -423,6 +466,7 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
             emit(args.json, payload, status_text(&report));
             Ok(())
         }
+        "relay" => run_relay_list(args),
         _ => {
             let master = store::resolve_master(db_of(args)?, source).map_err(open_err)?;
             let Some(master) = master else {
@@ -431,43 +475,227 @@ fn run_sync(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, String
                     format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
                 ));
             };
-            let relay = relay_for(args, master.as_slice())?;
-            let opened =
-                store::open_for_write_with(db_of(args)?, "sync", 10.0, Some(&master)).map_err(open_err)?;
-            if action == "push" {
-                let result = sync::push(opened.conn(), &*master, &*relay).map_err(failed)?;
-                emit(
-                    args.json,
-                    json!({"bundles": result.bundles, "records": result.records, "ranges": result.ranges}),
-                    format!(
-                        "pushed {} bundle(s): {} record(s), {} range(s)",
-                        result.bundles.len(),
-                        result.records,
-                        result.ranges
-                    ),
-                );
-                return Ok(());
+            let adhoc = adhoc_relay(args)?;
+            if let Some(config) = adhoc {
+                // `--relay`: this one relay for this run, as ever
+                let relay = relay_for(&config, master.as_slice())?;
+                let opened = store::open_for_write_with(db_of(args)?, "sync", 10.0, Some(&master)).map_err(open_err)?;
+                return if action == "push" {
+                    let result = sync::push(opened.conn(), &*master, &*relay).map_err(failed)?;
+                    print_push(args, &result, None);
+                    Ok(())
+                } else {
+                    let result = sync::pull(opened.conn(), &*master, &*relay).map_err(failed)?;
+                    print_pull(args, &result, None);
+                    if result.status == "ok" { Ok(()) } else { Err((1, String::new())) }
+                };
             }
-            let result = sync::pull(opened.conn(), &*master, &*relay).map_err(failed)?;
-            emit(
-                args.json,
-                pull_json(&result),
-                format!(
-                    "pulled {} bundle(s): {} new, {} duplicate, {} invalid, {} conflict(s), {} new range(s); rejected {}; gaps {}; repaired {}; kept for a later decoder {}",
-                    result.applied.len(),
-                    result.records_new,
-                    result.records_duplicate,
-                    result.records_invalid,
-                    result.conflicts,
-                    result.ranges_new,
-                    result.rejected.len(),
-                    result.gaps.len(),
-                    result.records_repaired,
-                    result.records_kept
-                ),
-            );
+            // no `--relay`: every relay of the list. A list of one raises its relay's failure as the error
+            // (the single-relay behaviour); a longer list names each site's failure and ends partial.
+            let entries = relay_list()?;
+            let specs: Vec<sync::SiteSpec> = entries.iter().map(sync::SiteSpec::from_entry).collect();
+            let strict = specs.len() == 1;
+            if let [only] = specs.as_slice()
+                && let RelayConfig::Lan(url) = &only.config
+            {
+                relay_cfg::check_lan_url(url).map_err(|rule| (EXIT_USAGE, format!("usage: {rule}")))?;
+            }
+            let (sites, mut reports) = sync::open_sites(&specs, master.as_slice());
+            let opened = store::open_for_write_with(db_of(args)?, "sync", 10.0, Some(&master)).map_err(open_err)?;
+            let shown = |reports: &[sync::SiteReport]| (!strict || reports.iter().any(|r| r.error.is_some())).then(|| reports.to_vec());
+            if action == "push" {
+                let result = if strict {
+                    sync::push_strict(opened.conn(), master.as_slice(), &sites, &mut reports)
+                } else {
+                    sync::push_all(opened.conn(), master.as_slice(), &sites, &mut reports)
+                }
+                .map_err(failed)?;
+                let sites_shown = shown(&reports);
+                print_push(args, &result, sites_shown.as_deref());
+                return if result.partial || reports.iter().any(|r| r.error.is_some()) { Err((1, String::new())) } else { Ok(()) };
+            }
+            let result = if strict {
+                sync::pull_strict(opened.conn(), master.as_slice(), &sites, &mut reports)
+            } else {
+                sync::pull_all(opened.conn(), master.as_slice(), &sites, &mut reports)
+            }
+            .map_err(failed)?;
+            let sites_shown = shown(&reports);
+            print_pull(args, &result, sites_shown.as_deref());
             if result.status == "ok" { Ok(()) } else { Err((1, String::new())) }
         }
+    }
+}
+
+/// One line per site: what the run did there and, when it failed, the reason word.
+fn site_line(report: &sync::SiteReport) -> String {
+    let mut line = format!(
+        "  site {} {}: pushed {}, healed {}, behind {}, pulled {}, rejected {}",
+        report.id, report.kind, report.pushed, report.healed, report.behind, report.pulled, report.rejected
+    );
+    if let Some(error) = report.error {
+        line.push_str(&format!(", error {error}"));
+    }
+    line
+}
+
+/// Print a payload and its text, plus the sites (a line each; `"sites"` in the JSON) when there are some to show.
+fn emit_with_sites(args: &Args, mut payload: Value, text: String, sites: Option<&[sync::SiteReport]>) {
+    let mut text = text;
+    if let Some(sites) = sites {
+        for report in sites {
+            text.push('\n');
+            text.push_str(&site_line(report));
+        }
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("sites".into(), Value::Array(sites.iter().map(sync::SiteReport::value).collect()));
+        }
+    }
+    emit(args.json, payload, text);
+}
+
+fn print_push(args: &Args, result: &sync::PushResult, sites: Option<&[sync::SiteReport]>) {
+    emit_with_sites(
+        args,
+        json!({"bundles": result.bundles, "records": result.records, "ranges": result.ranges}),
+        format!(
+            "pushed {} bundle(s): {} record(s), {} range(s)",
+            result.bundles.len(),
+            result.records,
+            result.ranges
+        ),
+        sites,
+    );
+}
+
+fn print_pull(args: &Args, result: &PullResult, sites: Option<&[sync::SiteReport]>) {
+    emit_with_sites(
+        args,
+        pull_json(result),
+        format!(
+            "pulled {} bundle(s): {} new, {} duplicate, {} invalid, {} conflict(s), {} new range(s); rejected {}; gaps {}; repaired {}; kept for a later decoder {}",
+            result.applied.len(),
+            result.records_new,
+            result.records_duplicate,
+            result.records_invalid,
+            result.conflicts,
+            result.ranges_new,
+            result.rejected.len(),
+            result.gaps.len(),
+            result.records_repaired,
+            result.records_kept
+        ),
+        sites,
+    );
+}
+
+/// Who a folder is for the duplicate check: its (device, inode) when it exists, else the expanded path.
+fn folder_key(folder: &str) -> String {
+    let path = expand_user(folder);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.is_dir()
+        {
+            return format!("{}:{}", meta.dev(), meta.ino());
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Whether two configurations name the same relay: folders by [`folder_key`], addresses by their parsed base.
+fn same_relay(a: &RelayConfig, b: &RelayConfig) -> bool {
+    match (a, b) {
+        (RelayConfig::Folder(x), RelayConfig::Folder(y)) => folder_key(x) == folder_key(y),
+        (RelayConfig::Lan(x), RelayConfig::Lan(y)) => relay_cfg::lan_base_url(x) == relay_cfg::lan_base_url(y),
+        _ => false,
+    }
+}
+
+fn entry_json(entry: &RelayEntry) -> Value {
+    let (key, place) = match &entry.config {
+        RelayConfig::Folder(folder) => ("path", folder),
+        RelayConfig::Lan(url) => ("url", url),
+    };
+    let kind = if key == "path" { "folder" } else { "lan" };
+    let mut object = json!({"id": entry.id, "kind": kind, "label": entry.label, "serve": entry.serve});
+    if let Some(map) = object.as_object_mut() {
+        map.insert(key.into(), json!(place));
+    }
+    object
+}
+
+/// `sync relay add <folder|url> [--label <text>] [--serve]`, `sync relay remove <id>`, `sync relay list`: the
+/// only commands (with `--remember`) that rewrite `relay.json`. They need no key and no store.
+fn run_relay_list(args: &Args) -> Result<(), (u8, String)> {
+    let action = args
+        .relay_action
+        .as_deref()
+        .ok_or((EXIT_USAGE, "usage: sync relay needs an action: add <folder|url> | remove <id> | list".to_string()))?;
+    let path = relay_config().ok_or((1, "HOME is not set".to_string()))?;
+    let mut entries: Vec<RelayEntry> = if path.exists() {
+        relay_cfg::read_list(&path).ok_or((EXIT_USAGE, "usage: relay.json is not a relay list this build reads; fix or remove it".to_string()))?
+    } else {
+        Vec::new()
+    };
+    match action {
+        "list" => {
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|e| {
+                    let (kind, place) = match &e.config {
+                        RelayConfig::Folder(folder) => ("folder", folder),
+                        RelayConfig::Lan(url) => ("lan", url),
+                    };
+                    let label = if e.label.is_empty() { "-" } else { e.label.as_str() };
+                    format!("{}  {kind}  {place}  {label}{}", e.id, if e.serve { "  serves" } else { "" })
+                })
+                .collect();
+            emit(args.json, json!({"relays": entries.iter().map(entry_json).collect::<Vec<_>>()}), lines.join("\n"));
+            Ok(())
+        }
+        "add" => {
+            let text = args.relay_arg.as_deref().ok_or((EXIT_USAGE, "usage: sync relay add needs a folder or an http:// address".to_string()))?;
+            let config = RelayConfig::from_arg(text);
+            if let RelayConfig::Lan(url) = &config {
+                relay_cfg::check_lan_url(url).map_err(|rule| (EXIT_USAGE, format!("usage: {rule}")))?;
+                if args.serve_flag {
+                    return Err((EXIT_USAGE, "usage: only a folder can serve".to_string()));
+                }
+            }
+            if args.serve_flag && entries.iter().any(|e| e.serve) {
+                return Err((EXIT_USAGE, "usage: only one relay can serve".to_string()));
+            }
+            if entries.iter().any(|e| same_relay(&e.config, &config)) {
+                return Err((EXIT_USAGE, "usage: that relay is already in the list".to_string()));
+            }
+            let mut id = relay_cfg::new_id();
+            while entries.iter().any(|e| e.id == id) {
+                id = relay_cfg::new_id();
+            }
+            entries.push(RelayEntry { id: id.clone(), config, label: args.label.clone().unwrap_or_default(), serve: args.serve_flag });
+            if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
+                return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
+            }
+            write_relay_list(&path, &entries)?;
+            emit(args.json, json!({"added": id}), format!("added relay {id}"));
+            Ok(())
+        }
+        "remove" => {
+            let id = args.relay_arg.as_deref().ok_or((EXIT_USAGE, "usage: sync relay remove needs an id".to_string()))?;
+            let Some(at) = entries.iter().position(|e| e.id == id) else {
+                return Err((EXIT_USAGE, "usage: no relay with that id".to_string()));
+            };
+            entries.remove(at);
+            if let Some(moved) = disconect_core::home::moved_legacy_home(&path) {
+                return Err((EXIT_NOT_CONFIGURED, moved.to_string()));
+            }
+            write_relay_list(&path, &entries)?;
+            emit(args.json, json!({"removed": id}), format!("removed relay {id}"));
+            Ok(())
+        }
+        _ => Err((EXIT_USAGE, "usage: sync relay needs an action: add <folder|url> | remove <id> | list".to_string())),
     }
 }
 
@@ -484,10 +712,7 @@ fn run_relay_serve(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8,
             format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
         ));
     };
-    let folder = match relay_config_for(args)? {
-        RelayConfig::Folder(folder) => expand_user(&folder),
-        RelayConfig::Lan(_) => return Err((EXIT_USAGE, "usage: relay-serve serves a folder, not an http:// address".into())),
-    };
+    let folder = serve_folder(args, "relay-serve")?;
     let listen = args.listen.as_deref().unwrap_or("127.0.0.1:0");
     // method and status only: no path, no object name, no address of a peer
     let log: disconect_core::relay::lan_server::Logger = std::sync::Arc::new(|method, status| eprintln!("{method} {status}"));
@@ -529,10 +754,7 @@ fn run_pair_offer(args: &Args, source: PassphraseSource<'_>) -> Result<(), (u8, 
             format!("the relay needs an encrypted store: run '{} key init' first", identity::COMMAND),
         ));
     };
-    let folder = match relay_config_for(args)? {
-        RelayConfig::Folder(folder) => expand_user(&folder),
-        RelayConfig::Lan(_) => return Err((EXIT_USAGE, "usage: pair offer serves a folder, not an http:// address".into())),
-    };
+    let folder = serve_folder(args, "pair offer")?;
     let key_file_bytes = std::fs::read(keys::key_path_for(db)).map_err(|_| (1, "cannot read the key file".to_string()))?;
     // the joiner bootstraps from what was last pushed: push first, then release the write lock
     {

@@ -87,10 +87,12 @@ fn push_pull_status_forget_through_the_binary_and_the_shared_config() {
         "{}",
         stdout(&pushed)
     );
-    // the config is Python's shape: {"folder": path}
-    let config =
-        std::fs::read_to_string(cli.home.join(".disconect/relay.json")).expect("config written");
-    assert_eq!(config, format!("{{\"folder\": \"{relay_arg}\"}}\n"));
+    // `--remember` writes the list form: one serving folder entry with a new 8-hex id
+    let remembered = disconect_core::relay::config::read_list(&cli.home.join(".disconect/relay.json")).expect("list");
+    assert_eq!(remembered.len(), 1);
+    assert_eq!(remembered[0].config, disconect_core::relay::config::RelayConfig::Folder(relay_arg.to_string()));
+    assert!(remembered[0].serve);
+    assert_eq!(remembered[0].id.len(), 8);
 
     // B pulls through the remembered folder
     let pulled = cli.run(&b, &["sync", "pull"]);
@@ -319,4 +321,70 @@ fn reparse_json_failures_carry_the_records_stream() {
     let keys: Vec<&str> = failures[0].as_object().expect("object").keys().map(String::as_str).collect();
     assert_eq!(keys, ["error", "file", "kind", "stream"], "Python's `_dry_run` failure keys");
     assert_eq!(failures[0]["stream"], stream.as_str());
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn sync_relay_add_remove_list_and_a_run_over_the_whole_list() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cli = Cli::new(tmp.path());
+    let (_da, a) = encrypted_copy();
+    let (_db, b) = encrypted_copy();
+    let (s1, s2, s3) = (tmp.path().join("s1"), tmp.path().join("s2"), tmp.path().join("s3"));
+    std::fs::create_dir_all(&s2).expect("mkdir");
+    std::fs::create_dir_all(&s3).expect("mkdir");
+    let (p1, p2, p3) = (s1.to_str().expect("utf8"), s2.to_str().expect("utf8"), s3.to_str().expect("utf8"));
+
+    let none = cli.run(&a, &["sync", "relay", "list"]);
+    assert_eq!((code(&none), stdout(&none).trim()), (0, ""));
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", p1, "--serve"])), 0);
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", p2, "--label", "cloud"])), 0);
+    // refusals: the same relay twice (by folder), a second server, a serving address, an unknown id
+    let again = cli.run(&a, &["sync", "relay", "add", p2]);
+    assert_eq!(code(&again), 2);
+    assert!(stderr(&again).contains("that relay is already in the list"), "{}", stderr(&again));
+    let second = cli.run(&a, &["sync", "relay", "add", p3, "--serve"]);
+    assert_eq!(code(&second), 2);
+    assert!(stderr(&second).contains("only one relay can serve"), "{}", stderr(&second));
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "add", "http://127.0.0.1:9", "--serve"])), 2);
+    let unknown = cli.run(&a, &["sync", "relay", "remove", "ffffffff"]);
+    assert_eq!(code(&unknown), 2);
+    assert!(stderr(&unknown).contains("no relay with that id"), "{}", stderr(&unknown));
+
+    let listed: Value = serde_json::from_str(&stdout(&cli.run(&a, &["--json", "sync", "relay", "list"]))).expect("json");
+    let relays = listed["relays"].as_array().expect("relays");
+    assert_eq!(relays.len(), 2);
+    assert_eq!((relays[0]["path"].as_str(), relays[0]["serve"].as_bool()), (Some(p1), Some(true)));
+    assert_eq!((relays[1]["path"].as_str(), relays[1]["label"].as_str(), relays[1]["serve"].as_bool()), (Some(p2), Some("cloud"), Some(false)));
+    let (id1, id2) = (relays[0]["id"].as_str().expect("id").to_string(), relays[1]["id"].as_str().expect("id").to_string());
+    let text = stdout(&cli.run(&a, &["sync", "relay", "list"]));
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.lines().next().expect("line").starts_with(&id1) && text.contains("cloud") && text.contains("serves"), "{text}");
+
+    // a run over the list: the serving folder is created on first use, every site gets a line
+    let imported = cli.run(&a, &["import", drop_folder(tmp.path()).to_str().expect("utf8")]);
+    assert_eq!(code(&imported), 0);
+    let pushed = cli.run(&a, &["sync", "push"]);
+    assert_eq!(code(&pushed), 0, "{}", stderr(&pushed));
+    let out = stdout(&pushed);
+    let mut lines = out.lines();
+    assert!(lines.next().expect("first").starts_with("pushed 1 bundle(s): 2 record(s), 0 range(s)"));
+    assert_eq!(lines.next(), Some(format!("  site {id1} folder: pushed 1, healed 0, behind 0, pulled 0, rejected 0").as_str()));
+    assert_eq!(lines.next(), Some(format!("  site {id2} folder: pushed 1, healed 0, behind 0, pulled 0, rejected 0").as_str()));
+    // B shares the list file (same HOME) and pulls once from the union
+    let pulled: Value = serde_json::from_str(&stdout(&cli.run(&b, &["--json", "sync", "pull"]))).expect("json");
+    assert_eq!(pulled["applied"].as_array().map(Vec::len), Some(1));
+    assert_eq!(pulled["sites"][0]["pulled"], 1);
+    assert_eq!(pulled["sites"][1]["pulled"], 0, "the second site's copy is not fetched when the first applied it");
+    assert_eq!(pulled["sites"][1]["error"], Value::Null);
+
+    // removing the serving entry leaves a list with no server; the last removal leaves nothing to sync with
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "remove", &id1])), 0);
+    let left = stdout(&cli.run(&a, &["sync", "relay", "list"]));
+    assert_eq!(left.lines().count(), 1);
+    assert_eq!(code(&cli.run(&a, &["sync", "relay", "remove", &id2])), 0);
+    assert_eq!(code(&cli.run(&a, &["sync", "push"])), 2);
 }

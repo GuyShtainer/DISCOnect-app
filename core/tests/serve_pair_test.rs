@@ -593,6 +593,25 @@ fn the_prefix_runs_in_order_on_all_five_methods() {
         let reply = live.call(method, params.clone());
         assert_eq!(error_of(&reply), ("bad_params", "this device is a joiner; it serves nothing"), "{method}");
     }
+    // (3b) a list without a serving entry serves nothing; with one (a folder) the prefix passes; the legacy
+    // `{"folder"}` is a serving entry
+    relay_json(
+        &unconfigured,
+        json!({"relays": [{"id": "0000000a", "kind": "folder", "path": "/somewhere"}, {"id": "0000000b", "kind": "lan", "url": "http://127.0.0.1:9"}]}),
+    );
+    for (method, params) in prefixed.iter().map(|call| (&call.0, &call.1)) {
+        let reply = live.call(method, params.clone());
+        assert_eq!(error_of(&reply), ("bad_params", "this device is a joiner; it serves nothing"), "{method}");
+    }
+    let folder = tempfile::tempdir().expect("tempdir");
+    for body in [
+        json!({"relays": [{"id": "0000000b", "kind": "lan", "url": "http://127.0.0.1:9"}, {"id": "0000000a", "kind": "folder", "path": folder.path(), "serve": true}]}),
+        json!({"folder": folder.path()}),
+    ] {
+        relay_json(&unconfigured, body);
+        let reply = live.call("relay.serve", json!({"on": false}));
+        assert_eq!(reply["result"], json!({"serving": false, "url": null}));
+    }
     // (4) a plaintext store has nothing to derive a relay from
     let dir = tempfile::tempdir().expect("tempdir");
     let plain = dir.path().join("plain.db");

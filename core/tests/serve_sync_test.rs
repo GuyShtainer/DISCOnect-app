@@ -177,7 +177,7 @@ fn the_checks_run_in_order_locked_then_no_relay_then_no_key() {
         status[0]["result"],
         json!({"bundles": {}, "records_unsent": 0, "records_seen": 0, "conflicts": 0,
                "superseded": 0, "gaps": [], "last_pushed_at": null, "last_pulled_at": null,
-               "serving": null, "relay_url": null})
+               "serving": null, "relay_url": null, "relays": null})
     );
     let none = rig.send(2, "sync.run", json!({}));
     assert_eq!(none[0]["error"]["code"], "not_found");
@@ -266,7 +266,10 @@ fn a_folder_relay_pushes_then_pulls_with_events_and_counts_only() {
         json!({
             "push": {"bundles": 1, "records": 2, "ranges": 0},
             "pull": {"applied": 0, "rejected": 0, "records_new": 0, "records_duplicate": 0,
-                     "records_invalid": 0, "conflicts": 0, "ranges_new": 0, "records_repaired": 0, "records_kept": 0, "gaps": 0, "status": "ok"}
+                     "records_invalid": 0, "conflicts": 0, "ranges_new": 0, "records_repaired": 0, "records_kept": 0, "gaps": 0, "status": "ok"},
+            "sites": [{"id": "default", "kind": "folder", "pushed": 1, "healed": 0, "behind": 0, "pulled": 0,
+                       "rejected": 0, "error": null}],
+            "status": "ok"
         })
     );
     let status = rig_a.send(11, "sync.status", json!({}));
@@ -427,4 +430,117 @@ fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
         "{error}"
     );
     drop(thread);
+}
+
+fn site_row(id: &str, pushed: i64, healed: i64, pulled: i64, error: Value) -> Value {
+    json!({"id": id, "kind": "folder", "pushed": pushed, "healed": healed, "behind": 0, "pulled": pulled,
+           "rejected": 0, "error": error})
+}
+
+#[test]
+fn a_relays_param_replaces_the_list_for_the_call_and_status_echoes_the_sites() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (one, two, three) = (tmp.path().join("one"), tmp.path().join("two"), tmp.path().join("three"));
+    for folder in [&one, &two, &three] {
+        std::fs::create_dir_all(folder).expect("mkdir");
+    }
+    let (_da, a) = encrypted_store(true);
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    // no relay.json at all: the param is the list; before the first run `relays` is null
+    assert_eq!(rig.send(2, "sync.status", json!({}))[0]["result"]["relays"], Value::Null);
+    let missing = tmp.path().join("not mounted");
+    let relays = json!([
+        {"id": "0000000a", "kind": "folder", "path": one, "label": "one"},
+        {"id": "0000000b", "kind": "folder", "path": two},
+        {"id": "0000000c", "kind": "folder", "path": missing},
+        {"id": "0000000d", "kind": "folder", "unavailable": true},
+        {"id": "0000000e", "kind": "folder", "path": one},
+    ]);
+    let lines = rig.send(3, "sync.run", json!({"relays": relays}));
+    let result = &only_response(&lines)["result"];
+    let sites = json!([
+        site_row("0000000a", 1, 0, 0, Value::Null),
+        site_row("0000000b", 1, 0, 0, Value::Null),
+        site_row("0000000c", 0, 0, 0, json!("unavailable")),
+        site_row("0000000d", 0, 0, 0, json!("unavailable")),
+        site_row("0000000e", 0, 0, 0, json!("same_relay")),
+    ]);
+    assert_eq!(result["sites"], sites);
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["push"]["bundles"], 1);
+    assert!(!missing.exists(), "a missing root is never created");
+    let status = rig.send(4, "sync.status", json!({}));
+    assert_eq!(status[0]["result"]["relays"], sites, "the last run's sites");
+
+    // a clean run over a legacy-free three-site list: heal after an emptied site, status ok
+    let account = disconect_core::relay::bundle::account_for(&master());
+    std::fs::remove_dir_all(two.join(&account)).expect("empty a site");
+    let relays = json!([
+        {"id": "0000000a", "kind": "folder", "path": one},
+        {"id": "0000000b", "kind": "folder", "path": two},
+        {"id": "0000000c", "kind": "folder", "path": three},
+    ]);
+    let lines = rig.send(5, "sync.run", json!({"relays": relays}));
+    let result = &only_response(&lines)["result"];
+    assert_eq!(
+        result["sites"],
+        json!([
+            site_row("0000000a", 0, 0, 0, Value::Null),
+            site_row("0000000b", 0, 1, 0, Value::Null),
+            site_row("0000000c", 0, 1, 0, Value::Null),
+        ])
+    );
+    assert_eq!(result["status"], "ok");
+
+    // the shape and the empty list
+    let empty = rig.send(6, "sync.run", json!({"relays": []}));
+    assert_eq!(empty[0]["error"]["code"], "not_found");
+    assert_eq!(empty[0]["error"]["message"], "no relay is configured (relay.json in the data folder)");
+    for bad in [
+        json!("x"),
+        json!([5]),
+        json!([{"id": "0000000a", "kind": "folder"}]),
+        json!([{"id": "NOPE", "kind": "folder", "path": "/x"}]),
+        json!([{"id": "0000000a", "kind": "ftp", "path": "/x"}]),
+        json!([{"id": "0000000a", "kind": "folder", "path": "/x"}, {"id": "0000000a", "kind": "folder", "path": "/y"}]),
+    ] {
+        let reply = rig.send(7, "sync.run", json!({"relays": bad}));
+        assert_eq!(reply[0]["error"]["code"], "bad_params", "{bad}");
+        assert_eq!(reply[0]["error"]["message"], "relays: each entry needs an id, a kind and a path or url");
+    }
+}
+
+#[test]
+fn the_configured_list_runs_when_no_relays_param_is_given_and_a_failing_site_is_partial() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+    std::fs::create_dir_all(&one).expect("mkdir");
+    let (_da, a) = encrypted_store(true);
+    // one entry serves (created on first use), the other is an unmounted folder
+    relay_json(
+        &a,
+        json!({"relays": [
+            {"id": "0000000a", "kind": "folder", "path": one},
+            {"id": "0000000b", "kind": "folder", "path": two},
+        ]}),
+    );
+    let mut rig = Rig::new(&a);
+    rig.unlock();
+    let lines = rig.send(2, "sync.run", json!({}));
+    let result = &only_response(&lines)["result"];
+    assert_eq!(result["status"], "partial");
+    assert_eq!(result["sites"][0], site_row("0000000a", 1, 0, 0, Value::Null));
+    assert_eq!(result["sites"][1], site_row("0000000b", 0, 0, 0, json!("unavailable")));
+    assert!(!two.exists());
+    // a lan entry anywhere makes relay_url the first one's base
+    relay_json(
+        &a,
+        json!({"relays": [
+            {"id": "0000000a", "kind": "folder", "path": one},
+            {"id": "0000000b", "kind": "lan", "url": "http://127.0.0.1:9/"},
+        ]}),
+    );
+    let status = rig.send(3, "sync.status", json!({}));
+    assert_eq!(status[0]["result"]["relay_url"], "http://127.0.0.1:9");
 }

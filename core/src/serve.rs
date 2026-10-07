@@ -70,7 +70,7 @@ use crate::read::mcp_paths;
 use crate::read::queries::{self, MAX_DAILY_DAYS, MAX_SAMPLE_DAYS};
 use crate::redact::redact_text;
 use crate::relay::config as relay_config;
-use crate::relay::folder::{FolderRelay, Relay, RelayError};
+use crate::relay::folder::{FolderRelay, RelayError};
 use crate::relay::serving::{self, Env, Hooks, Refusal, Shared, Site};
 use crate::relay::sync::{self as relay_sync, SyncError};
 use crate::sources::{self, SourceError};
@@ -408,6 +408,8 @@ pub struct Session {
     relay_hooks: Hooks,
     /// The phone's join in flight, its joiners and the master hand-back (see [`join::JoinHub`]).
     join: Arc<JoinHub>,
+    /// The `sites` of the last `sync.run` (null in `sync.status.relays` before the first); process memory only.
+    last_sites: Arc<Mutex<Option<Value>>>,
 }
 
 impl Session {
@@ -424,6 +426,7 @@ impl Session {
             relay: serving::new_state(),
             relay_hooks: Hooks::default(),
             join: Arc::new(JoinHub::new()),
+            last_sites: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1150,12 +1153,12 @@ fn relay_json_path(db_path: &Path) -> PathBuf {
     home::relay_config_beside(db_path)
 }
 
-/// `relay_url` of `sync.status`: the normalised base address of the LAN relay `relay.json` names, else null.
+/// `relay_url` of `sync.status`: the normalised base address of the first LAN relay `relay.json` names, else null.
 fn relay_url_value(path: &Path) -> Value {
-    match relay_config::read(path) {
-        Some(relay_config::RelayConfig::Lan(url)) => relay_config::lan_base_url(&url).map_or(Value::Null, Value::String),
-        _ => Value::Null,
-    }
+    relay_config::read_list(path)
+        .and_then(|entries| relay_config::first_lan_url(&entries))
+        .and_then(|url| relay_config::lan_base_url(&url))
+        .map_or(Value::Null, Value::String)
 }
 
 /// The relay counts of the store (`sync status`): read-only, so a store older than the relay
@@ -1171,6 +1174,9 @@ fn sync_status(session: &mut Session, _call: &Call) -> Result<Value, Failure> {
         // The address this device pulls from, `http://host:port` from `relay.json`; null with no LAN relay named
         // (a folder relay has no address). Never a path, a credential or a folder name.
         object.insert("relay_url".into(), relay_url_value(&relay_json_path(&session.db_path)));
+        // The `sites` of the last `sync.run` of this session; null before the first.
+        let last = session.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        object.insert("relays".into(), last.unwrap_or(Value::Null));
     }
     Ok(status)
 }
@@ -1180,7 +1186,9 @@ struct SyncJob {
     id: Id,
     db_path: PathBuf,
     master: Secret32,
-    relay: Box<dyn Relay + Send>,
+    /// The relays of this run, opened in the worker.
+    specs: Vec<relay_sync::SiteSpec>,
+    last_sites: Arc<Mutex<Option<Value>>>,
     channel: Arc<Channel>,
     slot: Arc<AtomicBool>,
 }
@@ -1200,7 +1208,9 @@ fn sync_event(op: &str, phase: &str, state: &str, counts: Option<&Value>) -> Str
 }
 
 /// `sync.run`: push, then pull, over one connection and one hold of the write lock (never waiting
-/// for it). Counts only: bundle names are random per push and nothing in a UI needs them.
+/// for it), over every relay of the list. Counts only: bundle names are random per push and nothing in a UI
+/// needs them. A list of one raises its relay's failure as the error (the single-relay behaviour); a longer
+/// list reports each site's failure in `sites` and the run is `partial`.
 fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
     let store = store::open_for_write_with(&job.db_path, "sync", 0.0, Some(&job.master))?;
     let conn = store.conn();
@@ -1208,12 +1218,28 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         // the bridge being gone is not the sync's problem: EOF on stdin ends the process
         let _ = job.channel.write_line(&line);
     };
+    let (sites, mut reports) = relay_sync::open_sites(&job.specs, job.master.as_slice());
+    let strict = job.specs.len() == 1;
+    let sites_value = |reports: &[relay_sync::SiteReport]| Value::Array(reports.iter().map(relay_sync::SiteReport::value).collect());
+    let keep = |reports: &[relay_sync::SiteReport]| {
+        *job.last_sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sites_value(reports));
+    };
     emit(sync_event("sync", "push", "start", None));
-    let pushed = relay_sync::push(conn, job.master.as_slice(), &*job.relay)?;
+    let pushed = if strict {
+        relay_sync::push_strict(conn, job.master.as_slice(), &sites, &mut reports)
+    } else {
+        relay_sync::push_all(conn, job.master.as_slice(), &sites, &mut reports)
+    };
+    let pushed = pushed.inspect_err(|_| keep(&reports))?;
     let push = json!({"bundles": pushed.bundles.len(), "records": pushed.records, "ranges": pushed.ranges});
     emit(sync_event("sync", "push", "done", Some(&push)));
     emit(sync_event("sync", "pull", "start", None));
-    let pulled = relay_sync::pull(conn, job.master.as_slice(), &*job.relay)?;
+    let pulled = if strict {
+        relay_sync::pull_strict(conn, job.master.as_slice(), &sites, &mut reports)
+    } else {
+        relay_sync::pull_all(conn, job.master.as_slice(), &sites, &mut reports)
+    };
+    let pulled = pulled.inspect_err(|_| keep(&reports))?;
     let pull = json!({
         "applied": pulled.applied.len(),
         "rejected": pulled.rejected.len(),
@@ -1228,7 +1254,14 @@ fn run_sync(job: &SyncJob) -> Result<Value, Failure> {
         "status": pulled.status,
     });
     emit(sync_event("sync", "pull", "done", Some(&pull)));
-    Ok(json!({"push": push, "pull": pull}))
+    keep(&reports);
+    let partial = pushed.partial || pulled.status != "ok" || reports.iter().any(|r| r.error.is_some());
+    Ok(json!({
+        "push": push,
+        "pull": pull,
+        "sites": sites_value(&reports),
+        "status": if partial { "partial" } else { "ok" },
+    }))
 }
 
 fn sync_worker(job: SyncJob) {
@@ -1246,17 +1279,67 @@ fn sync_worker(job: SyncJob) {
     let _ = job.channel.write_line(&line);
 }
 
-/// Start a push-then-pull over the relay `relay.json` names; the answer is sent when it finishes.
-/// Checked in this order: unlocked (`locked`), a relay configured (`not_found`), an encrypted store
-/// (`not_encrypted`), the slot shared with `import.run` (`busy`).
+/// `relays` of `sync.run`: the list this call uses instead of `relay.json`'s. Each element is an object
+/// `{"id", "kind": "folder" | "lan", "path" | "url", "label"?, "unavailable"?}`; `path` may be left out of an
+/// `unavailable` folder (the shell could not reach it). Ids are [`relay_config::valid_id`] and distinct.
+fn relays_param(value: &Json) -> Result<Vec<relay_sync::SiteSpec>, Failure> {
+    let bad = || Failure::serve("bad_params", "relays: each entry needs an id, a kind and a path or url");
+    let Json::Array(items) = value else { return Err(bad()) };
+    let mut specs: Vec<relay_sync::SiteSpec> = Vec::new();
+    for item in items {
+        let text = |key: &str| match item.get(key) {
+            Some(Json::Str(text)) if !text.is_empty() => text.to_text(),
+            _ => None,
+        };
+        let id = text("id").filter(|id| relay_config::valid_id(id)).ok_or_else(bad)?;
+        let unavailable = match item.get("unavailable") {
+            None | Some(Json::Null) => false,
+            Some(Json::Bool(flag)) => *flag,
+            Some(_) => return Err(bad()),
+        };
+        match item.get("label") {
+            None | Some(Json::Null) | Some(Json::Str(_)) => {}
+            Some(_) => return Err(bad()),
+        }
+        let config = match text("kind").as_deref() {
+            Some("folder") => match text("path") {
+                Some(path) => relay_config::RelayConfig::Folder(path),
+                None if unavailable => relay_config::RelayConfig::Folder(String::new()),
+                None => return Err(bad()),
+            },
+            Some("lan") => match text("url") {
+                Some(url) => relay_config::RelayConfig::Lan(url),
+                None if unavailable => relay_config::RelayConfig::Lan(String::new()),
+                None => return Err(bad()),
+            },
+            _ => return Err(bad()),
+        };
+        if specs.iter().any(|spec| spec.id == id) {
+            return Err(bad());
+        }
+        specs.push(relay_sync::SiteSpec { id, config, unavailable, create_root: false });
+    }
+    Ok(specs)
+}
+
+/// Start a push-then-pull over the relays of the call's `relays` param, else of `relay.json`; the answer is sent
+/// when it finishes. Checked in this order: unlocked (`locked`), a relay configured (`not_found`; an empty
+/// `relays` counts as none), an encrypted store (`not_encrypted`), the shape of `relays` (`bad_params`), the slot
+/// shared with `import.run` (`busy`).
 fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
     session.require_unlocked()?;
-    let config = relay_config::read(&relay_json_path(&session.db_path)).ok_or_else(|| {
+    let not_found = || {
         Failure::serve(
             "not_found",
             "no relay is configured (relay.json in the data folder)",
         )
-    })?;
+    };
+    let per_call = call.params.get("relays");
+    let entries = match per_call {
+        Some(Json::Array(items)) if items.is_empty() => return Err(not_found()),
+        Some(_) => None,
+        None => Some(relay_config::read_list(&relay_json_path(&session.db_path)).ok_or_else(not_found)?),
+    };
     let Some(master) = session.unlocked_master().cloned() else {
         return Err(Failure::serve(
             "not_encrypted",
@@ -1266,8 +1349,20 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
             ),
         ));
     };
-    let relay = relay_config::open(&config, master.as_slice())
-        .map_err(|rule| Failure::serve("bad_params", format!("relay.json: {rule}")))?;
+    let specs = match (per_call, entries) {
+        (Some(value), _) => relays_param(value)?,
+        (None, Some(entries)) => entries.iter().map(relay_sync::SiteSpec::from_entry).collect(),
+        (None, None) => return Err(not_found()),
+    };
+    if let [only] = specs.as_slice()
+        && !only.unavailable
+        && let relay_config::RelayConfig::Lan(url) = &only.config
+    {
+        // a list of one with a malformed address is refused before anything is opened
+        relay_config::check_lan_url(url).map_err(|rule| {
+            Failure::serve("bad_params", format!("{}: {rule}", if per_call.is_some() { "relays" } else { "relay.json" }))
+        })?;
+    }
     if session
         .import_slot
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1282,7 +1377,8 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
         id: call.id.clone(),
         db_path: session.db_path.clone(),
         master,
-        relay,
+        specs,
+        last_sites: Arc::clone(&session.last_sites),
         channel: Arc::clone(&session.channel),
         slot: Arc::clone(&session.import_slot),
     };
@@ -1305,20 +1401,20 @@ fn sync_run(session: &mut Session, call: &Call) -> Result<(), Failure> {
 // ---- relay and pairing (serve mode) ----
 
 /// The checks `relay.addresses`, `relay.serve`, `pair.offer`, `pair.confirm` and `pair.cancel` share, in this
-/// order on both cores: unlocked (`locked`); a relay configured (`not_found`, the `sync.run` text); a `lan`
-/// relay serves nothing (`bad_params`); an encrypted store (`not_encrypted`); no `<keys>.next` rotation file
+/// order on both cores: unlocked (`locked`); a relay configured (`not_found`, the `sync.run` text); a list
+/// without a `serve` folder entry serves nothing (`bad_params`); an encrypted store (`not_encrypted`); no `<keys>.next` rotation file
 /// (`busy`, the CLI's `resolve_master` refusal, which `key.unlock` does not apply). Parameter shapes come after.
 fn relay_prefix(session: &Session) -> Result<Site, Failure> {
     session.require_unlocked()?;
-    let config = relay_config::read(&relay_json_path(&session.db_path)).ok_or_else(|| {
+    let entries = relay_config::read_list(&relay_json_path(&session.db_path)).ok_or_else(|| {
         Failure::serve(
             "not_found",
             "no relay is configured (relay.json in the data folder)",
         )
     })?;
-    let folder = match config {
-        relay_config::RelayConfig::Folder(folder) => keys::expand_user(Path::new(&folder)),
-        relay_config::RelayConfig::Lan(_) => {
+    let folder = match relay_config::serve_entry(&entries).map(|entry| &entry.config) {
+        Some(relay_config::RelayConfig::Folder(folder)) => keys::expand_user(Path::new(folder)),
+        _ => {
             return Err(Failure::serve(
                 "bad_params",
                 "this device is a joiner; it serves nothing",

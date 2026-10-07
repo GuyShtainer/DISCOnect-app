@@ -636,10 +636,12 @@ fn the_binary_serves_and_syncs_over_lan_with_a_remembered_address() {
         "{}",
         text(&pushed)
     );
-    assert_eq!(
-        fs::read_to_string(cli.home.join(".disconect/relay.json")).expect("config"),
-        format!("{{\"lan\": \"{}\"}}\n", served.url)
-    );
+    // `--remember` writes the list form: one entry, a new 8-hex id, no label, not serving
+    let remembered = disconect_core::relay::config::read_list(&cli.home.join(".disconect/relay.json")).expect("list");
+    assert_eq!(remembered.len(), 1);
+    assert_eq!(remembered[0].config, disconect_core::relay::config::RelayConfig::Lan(served.url.clone()));
+    assert!(!remembered[0].serve && remembered[0].label.is_empty());
+    assert_eq!(remembered[0].id.len(), 8);
     let pulled = cli.run(&b, &["sync", "pull"]);
     assert_eq!(
         code(&pulled),
