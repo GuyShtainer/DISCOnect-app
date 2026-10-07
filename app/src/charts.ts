@@ -3,6 +3,7 @@
 // covered get a hatched band from the status-not-covered token.
 import * as echarts from "echarts";
 import { scopeWord } from "./identity";
+import { fmtValue } from "./format";
 
 export type Series = { scope: string; unit: string | null; days: { day: string; value: number | null; status: string; completeness?: number | null }[] };
 
@@ -77,10 +78,6 @@ function stepTip(i: number): void {
 }
 
 /** Group digits with a thin space like the rest of the app; one decimal under 100. */
-function numWord(v: number): string {
-  return Math.abs(v) >= 100 ? Math.round(v).toLocaleString("en").replace(/,/g, "\u202f") : String(Math.round(v * 10) / 10);
-}
-
 /** One series' words for one day: "<scope word> <value> <unit>" or "<scope word> no data", then ", <n> % of the day"
  * when the core measured how much of the day the value rests on; a live series with no session that day says
  * nothing (a session claims no day). */
@@ -91,7 +88,7 @@ function seriesWords(series: Series[], i: number): string[] {
     const v = d?.value ?? null;
     if (v === null && s.scope === "live") continue;
     const share = typeof d?.completeness === "number" && v !== null ? `, ${d.completeness} % of the day` : "";
-    out.push(`${scopeWord(s.scope)} ${v === null ? "no data" : `${numWord(v)}${s.unit ? ` ${s.unit}` : ""}`}${share}`);
+    out.push(`${scopeWord(s.scope)} ${fmtValue(v, s.unit ?? null)}${share}`);
   }
   return out;
 }
@@ -170,15 +167,34 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
     stepTip(Math.max(0, Math.min(last, to)));
   };
   host.onblur = () => chart.dispatchAction({ type: "hideTip" });
-  const observer = new ResizeObserver(() => {
-    chart.resize();
-    chart.setOption(build(chart.getWidth())); // the band-label gate is in pixels, so a new width re-decides it
-  });
-  active = { chart, observer, readout, days, latest, setReadout };
   const hatch = token("--status-not-covered");
   const gap = hatchedDays(series);
-  function build(width: number) {
+  const runs = gapRuns(series.find((t) => t.scope !== "live")?.days ?? [], gap);
+  // the band-label gate is in pixels (a band narrower than LABEL_MIN_PX cannot hold the words), so a new width
+  // re-decides it, as does the tooltip's on/off at 720 px; nothing else in the option depends on the width, so a
+  // resize that leaves every decision as it was only resizes the canvas (BL-6: the observer's first callback and
+  // every drag tick used to rebuild it all)
+  const labelShows = (width: number): boolean[] => {
     const plotWidth = width - GRID.left - GRID.right;
+    const d = series.find((t) => t.scope !== "live")?.days ?? [];
+    return runs.map(([a, b]) => (plotWidth * runDays(d, a, b)) / d.length >= LABEL_MIN_PX);
+  };
+  let drawn = "";
+  const draw = (width: number): void => {
+    const shows = labelShows(width);
+    const tip = width > 720; // under 720 px the readout row does the tooltip's job
+    const key = `${tip ? "t" : "r"}${shows.map((x) => (x ? "1" : "0")).join("")}`;
+    if (key === drawn) return;
+    drawn = key;
+    chart.setOption(build(shows, tip));
+  };
+  const observer = new ResizeObserver(() => {
+    chart.resize();
+    draw(chart.getWidth());
+  });
+  active = { chart, observer, readout, days, latest, setReadout };
+  function build(shows: boolean[], tip: boolean) {
+    const hatchPattern = hatchImage(hatch); // one canvas per draw
     return {
     backgroundColor: "transparent",
     animation: false,
@@ -186,7 +202,7 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
     tooltip: {
       trigger: "axis",
       confine: true,
-      showContent: width > 720, // under 720 px the readout row does that job; the cursor line still shows
+      showContent: tip, // under 720 px the readout row does that job; the cursor line still shows
       backgroundColor: token("--surface-raised"),
       borderColor: token("--hairline"),
       textStyle: { color: token("--ink") },
@@ -253,13 +269,13 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
       markArea: i === series.findIndex((t) => t.scope !== "live")
         ? {
             silent: true,
-            itemStyle: { color: { image: hatchImage(hatch), repeat: "repeat" }, opacity: 0.6 },
+            itemStyle: { color: { image: hatchPattern, repeat: "repeat" }, opacity: 0.6 },
             label: { show: true, position: "insideBottom", color: token("--ink-muted"), formatter: "not covered" },
             // a band narrower than LABEL_MIN_PX cannot hold the words: adjacent labels collided and the
             // right-edge one clipped; the caption's count still names every band
-            data: gapRuns(s.days, gap).map(([a, b]) => [
+            data: runs.map(([a, b], r) => [
               // category ordinals: a day owns the slot from index-0.5 to index+0.5, so a 1-day run has width
-              { xAxis: s.days.findIndex((d) => d.day === a) - 0.5, label: { show: (plotWidth * runDays(s.days, a, b)) / s.days.length >= LABEL_MIN_PX } },
+              { xAxis: s.days.findIndex((d) => d.day === a) - 0.5, label: { show: shows[r] ?? false } },
               { xAxis: s.days.findIndex((d) => d.day === b) + 0.5 },
             ]),
           }
@@ -267,6 +283,6 @@ export function drawTrend(host: HTMLElement, series: Series[], title: string): v
     })),
     };
   }
-  chart.setOption(build(host.clientWidth));
+  draw(host.clientWidth);
   observer.observe(host);
 }

@@ -72,13 +72,37 @@ fn failed(error: &CoreError) -> Value {
 
 /// Call `import.run` through the door and tell `emit` ("core://import", payload) what happens. The counts of the
 /// core's answer ride on `done`; a core error (including `busy`) is a `failed` carrying the core's code.
+/// A drop that lands while a sync tick or a click holds the core's one task slot hears `busy` for well under a
+/// second (BL-6, 19a review): the drop waits for the slot this long, in these steps, before it fails.
+pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+pub const BUSY_TRIES: usize = 8;
+
 pub async fn run_import(door: &dyn CoreDoor, emit: &(dyn Fn(&str, Value) + Sync), path: &Path, kind: Kind) {
+    run_import_waiting(door, emit, path, kind, BUSY_WAIT, BUSY_TRIES).await;
+}
+
+/// [`run_import`] with the wait for a busy slot as parameters (the tests run it in milliseconds).
+pub async fn run_import_waiting(
+    door: &dyn CoreDoor,
+    emit: &(dyn Fn(&str, Value) + Sync),
+    path: &Path,
+    kind: Kind,
+    wait: std::time::Duration,
+    tries: usize,
+) {
     emit("core://import", json!({ "state": "started", "kind": kind.word() }));
     let transport = match kind {
         Kind::Export => "export",
         Kind::Usb => "usb",
     };
-    let answer = door.call("import.run", json!({ "path": path.to_string_lossy(), "transport": transport })).await;
+    let params = json!({ "path": path.to_string_lossy(), "transport": transport });
+    let mut answer = door.call("import.run", params.clone()).await;
+    let mut left = tries;
+    while left > 0 && answer.as_ref().is_err_and(|e| e.code == "busy") {
+        tokio::time::sleep(wait).await;
+        answer = door.call("import.run", params.clone()).await;
+        left -= 1;
+    }
     let payload = match answer {
         Ok(counts) => {
             let n = |k: &str| counts.get(k).cloned().unwrap_or(Value::Null);
@@ -216,6 +240,49 @@ mod tests {
             let answer = self.0.clone();
             Box::pin(async move { answer })
         }
+    }
+
+    /// Busy for the first `n` calls, then the answer (a tick that holds the slot and lets go).
+    struct BusyThen(usize, Result<Value, CoreError>, Mutex<Vec<(String, Value)>>);
+
+    impl CoreDoor for BusyThen {
+        fn call<'a>(&'a self, method: &'a str, params: Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, CoreError>> + Send + 'a>> {
+            let mut calls = self.2.lock().expect("calls");
+            calls.push((method.to_string(), params));
+            let answer = if calls.len() <= self.0 { Err(CoreError::new("busy", "an import or a sync is already running")) } else { self.1.clone() };
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn drive_waiting(door: &dyn CoreDoor, kind: Kind, tries: usize) -> Vec<Value> {
+        let seen = Mutex::new(Vec::new());
+        let emit = |name: &str, payload: Value| {
+            assert_eq!(name, "core://import");
+            seen.lock().expect("seen").push(payload);
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("runtime");
+        rt.block_on(run_import_waiting(door, &emit, Path::new("/scratch/in"), kind, std::time::Duration::from_millis(1), tries));
+        seen.into_inner().expect("seen")
+    }
+
+    #[test]
+    fn a_drop_that_hears_busy_waits_for_the_slot_and_then_imports() {
+        let counts = json!({ "run_id": 3, "files": 1, "ok": 1, "partial": 0, "duplicate": 0, "failed": 0 });
+        let door = BusyThen(3, Ok(counts), Mutex::new(Vec::new()));
+        let events = drive_waiting(&door, Kind::Export, BUSY_TRIES);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0], json!({ "state": "started", "kind": "export" }));
+        assert_eq!(events[1]["state"], "done");
+        assert_eq!(events[1]["run_id"], 3);
+        assert_eq!(door.2.lock().expect("calls").len(), 4, "three busy answers, then the import");
+    }
+
+    #[test]
+    fn a_drop_that_hears_busy_past_the_wait_fails_with_the_core_code() {
+        let door = BusyThen(usize::MAX, Ok(json!({})), Mutex::new(Vec::new()));
+        let events = drive_waiting(&door, Kind::Usb, BUSY_TRIES);
+        assert_eq!(events[1]["code"], "busy");
+        assert_eq!(door.2.lock().expect("calls").len(), BUSY_TRIES + 1, "the first try and every retry");
     }
 
     fn drive(door: &Fake, kind: Kind) -> Vec<Value> {

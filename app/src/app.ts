@@ -5,6 +5,7 @@ import * as core from "./core";
 import * as phone from "./phone";
 import qrcode from "qrcode-generator";
 import { AI_NOTICE, DISCLAIMER, NOTICE, OFF_NETWORK, PRODUCT, PROVIDERS, SUPPORT_EMPTY, SUPPORT_INTRO, SUPPORT_NETWORK, SUPPORT_UNAVAILABLE, metricLabel, neutralText, scopeWord, metricHue } from "./identity";
+import { fmt, fmtValue } from "./format";
 import { disposeCharts, drawTrend, hatchedDays, showTipOn, type Series } from "./charts";
 
 // Build-time constant (vite.config.ts `define`): true only in the iOS build. Every `PHONE` branch below is the phone's.
@@ -110,12 +111,6 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text = ""):
 
 function scopeTag(scope: string): HTMLElement {
   return el("span", `caption scope-${scope}`, scopeWord(scope));
-}
-
-function fmt(value: number | null, unit: string | null): string {
-  if (value === null || value === undefined) return "no data";
-  const n = Math.abs(value) >= 100 ? Math.round(value).toLocaleString("en").replace(/,/g, "\u202f") : (Math.round(value * 10) / 10).toString();
-  return unit && unit !== "score" && unit !== "steps" ? `${n} ${unit}` : n;
 }
 
 function missingWord(status: string): string {
@@ -504,14 +499,6 @@ function todayCard(row: TodayRow, todayDay: string): HTMLElement {
 }
 
 /** `fmt`, with minutes of an hour or more read as hours and minutes ("7 h 00 min"). */
-function fmtValue(value: number | null, unit: string | null): string {
-  if (value !== null && unit === "min" && Math.abs(value) >= 60) {
-    const total = Math.round(Math.abs(value));
-    return `${value < 0 ? "−" : ""}${Math.floor(total / 60)} h ${String(total % 60).padStart(2, "0")} min`;
-  }
-  return fmt(value, unit);
-}
-
 // ---- Watch (the live link, Bet 9 follow-up) -----------------------------------------------
 // The lab's Python reads the watch over Bluetooth as a child of the app; every reading arrives as an event and
 // is also collected in the lab's raw folder on this Mac. The screen only draws the latest value per metric.
