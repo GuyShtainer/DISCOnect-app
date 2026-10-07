@@ -1335,8 +1335,10 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     const kv4 = el("dl", "kv");
     for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
       const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
-      // BL-4b: last_at is the newest applied bundle's header time (UTC ISO); absent from an older core
-      const last = c.last_at ? ` · last sent ${new Date(c.last_at).toLocaleString()}` : "";
+      // BL-4b: last_at is the newest applied bundle's header time (UTC ISO; a peer's header is only checked to be a
+      // string, so an unreadable one draws nothing rather than "Invalid Date"); absent from an older core
+      const lastAt = c.last_at ? new Date(c.last_at) : null;
+      const last = lastAt && !isNaN(lastAt.getTime()) ? ` · last sent ${lastAt.toLocaleString()}` : "";
       kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.chain.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}${last}`));
     }
     sent.append(kv4);
