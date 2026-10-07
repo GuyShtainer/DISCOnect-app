@@ -720,6 +720,7 @@ type SyncStatus = {
   gaps: unknown[]; last_pushed_at: string | null; last_pulled_at: string | null;
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
   relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
+  chains?: { device_id: string; bundles: number; records: number; last_seq: number; self: boolean }[]; // 19b: counts per device chain; absent until the core says it
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
@@ -899,7 +900,8 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       phonePull.running = true; phonePull.failure = null; phonePull.result = "";
       syncRedraw();
       try {
-        const r = await core.call<{ pull: { applied: number; records_new: number; status: string } }>("sync.run");
+        const r = await core.call<{ push?: { bundles: number }; pull: { applied: number; records_new: number; status: string } }>("sync.run");
+        phonePull.sent = r.push?.bundles ?? 0;
         phonePull.result = `Pulled ${r.pull.applied} ${r.pull.applied === 1 ? "bundle" : "bundles"}, ${r.pull.records_new} new records${r.pull.status === "partial" ? " (not all of it yet)" : ""}.`;
       } catch (e) {
         phonePull.failure = phoneSyncFailure(e);
@@ -907,7 +909,9 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       phonePull.running = false;
       syncRedraw();
     };
-    phoneSync(out, status, statusErr, pull);
+    let produced: phone.Produced | null = null;
+    try { produced = await phone.liveProduced(); } catch { produced = null; }
+    phoneSync(out, status, statusErr, pull, produced);
     return;
   }
   let addrs: RelayAddresses | null = null;
@@ -3079,7 +3083,7 @@ async function screenPhoneSettings(out: ParentNode): Promise<void> {
 }
 
 // ---- The phone's Sync ----
-const phonePull = { running: false, failure: null as { lead: string; text: string } | null, result: "" };
+const phonePull = { running: false, failure: null as { lead: string; text: string } | null, result: "", sent: null as number | null };
 
 /** The three things a pull can say that a person can act on, in plain words; anything else is one fixed sentence. */
 function phoneSyncFailure(e: unknown): { lead: string; text: string } {
@@ -3099,8 +3103,38 @@ function phoneSyncFailure(e: unknown): { lead: string; text: string } {
   return { lead: "The pull did not finish", text: "Pull again. If it keeps failing, close and reopen the app." };
 }
 
+/** "From this phone" (19b): what this phone recorded itself and what it has sent. Counts and times only. */
+function phoneProduced(status: SyncStatus | null, p: phone.Produced | null): HTMLElement {
+  const card = pcard("From this phone");
+  card.append(el("h2", "heading", neutralText("From this phone")));
+  const sessions = p?.sessions ?? 0;
+  if (sessions === 0) {
+    card.append(ptext("p", "caption muted", "Nothing recorded on this phone yet."));
+  }
+  const fmt = (secs: number, withDay: boolean): string =>
+    new Date(secs * 1000).toLocaleString("en-GB", withDay ? { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" } : { hour: "2-digit", minute: "2-digit" });
+  const span = p?.last_from != null && p.last_to != null ? `${fmt(p.last_from, true)} to ${fmt(p.last_to, false)}` : "none yet";
+  const unsent = status?.records_unsent ?? 0;
+  const mine = (status?.chains ?? []).find((c) => c.self);
+  const sent = phonePull.sent !== null
+    ? `${phonePull.sent} ${phonePull.sent === 1 ? "bundle" : "bundles"}`
+    : mine ? `${mine.bundles} ${mine.bundles === 1 ? "bundle" : "bundles"} so far` : "not yet this time";
+  const rows: [string, string][] = [
+    ["Sessions imported", String(sessions)],
+    ["Readings held", String(p?.readings ?? 0)],
+    ["Last session", span],
+    ["Waiting to send", String(unsent)],
+    ["Sent", sent],
+  ];
+  if (mine) rows.push(["Records sent so far", String(mine.records)]);
+  const kv = el("dl", "kv");
+  for (const [k, v] of rows) kv.append(el("dt", "", k), el("dd", "value-small", neutralText(v)));
+  card.append(kv);
+  return card;
+}
+
 /** Drawn from screenSync (the lint pins every user-started call there); `pull` is its one network call. */
-function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.CoreError | null, pull: () => Promise<void>): void {
+function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.CoreError | null, pull: () => Promise<void>, produced: phone.Produced | null): void {
   header(out, "Sync", "This phone pulls what is new from your Mac, on your network.");
   // no store yet (a key file landed, the first pull has not): the pull below makes it, so only the rows are missing
   if (!status && statusErr?.code !== "not_found") {
@@ -3130,6 +3164,7 @@ function phoneSync(out: ParentNode, status: SyncStatus | null, statusErr: core.C
   }
   if (phonePull.result) mac.append(el("p", "body", phonePull.result));
   out.append(mac);
+  out.append(phoneProduced(status, produced));
   if (status && !unreachable) {
     const stat = pcard("Status");
     stat.append(el("h2", "heading", "Status"));
@@ -3795,6 +3830,11 @@ void (async () => {
       setTimeout(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button.danger")).find((b) => b.textContent === "Forget this phone")?.click(), 4500);
       // and a real click on the result's own Done button, which returns the app to Pair Start
       setTimeout(() => Array.from(document.querySelectorAll("button")).find((b) => b.textContent === "Done")?.click(), 9000);
+    }
+    // evidence runs (the phone): one synthetic live session written into the container and imported natively; the
+    // Sync screen is drawn again once the shell has answered
+    if (PHONE && args.includes("--debug-live-seed")) {
+      setTimeout(() => void phone.liveDebugSeed().then(syncRedraw, syncRedraw), 800);
     }
     // evidence runs: a real click on the Sync screen's own "Sync now" button (the network call
     // still comes from a click, never from the page's own code path)
