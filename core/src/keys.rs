@@ -75,10 +75,12 @@ pub struct KeyFile {
     pub wraps: Vec<Value>,
 }
 
-/// `Path.expanduser()` for a leading `~` or `~/`: `$HOME` stands in for the home directory.
-/// (`~name` is left alone; Python would look `name` up in the password database.)
+/// A leading `~` or `~/` stands for `$HOME`; the Python twin is `storage/home.expand_user`. `~name` is left alone
+/// (the password database is never consulted), an unset or empty `$HOME` leaves the `~` as written, and `./~/a` is
+/// a folder named `~`.
 pub fn expand_user(path: &Path) -> PathBuf {
-    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    match (path.strip_prefix("~"), home) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => path.to_path_buf(),
     }
@@ -338,6 +340,8 @@ mod home_expansion {
         assert_eq!(expand_user(Path::new("~nobody")), Path::new("~nobody"));
         assert_eq!(expand_user(Path::new("/abs/~")), Path::new("/abs/~"));
         assert_eq!(expand_user(Path::new("rel/~/x")), Path::new("rel/~/x"));
+        assert_eq!(expand_user(Path::new("./~/a")), Path::new("./~/a"));
+        assert_eq!(expand_user(Path::new("~\\x")), Path::new("~\\x"));
         assert_eq!(expand_user(Path::new("~")), PathBuf::from(&home));
         assert_eq!(expand_user(Path::new("~/")), PathBuf::from(&home));
         assert_eq!(expand_user(Path::new("~/a/b")), PathBuf::from(&home).join("a/b"));

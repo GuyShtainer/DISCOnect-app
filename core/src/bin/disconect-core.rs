@@ -603,7 +603,8 @@ fn folder_key(folder: &str) -> String {
             return format!("{}:{}", meta.dev(), meta.ino());
         }
     }
-    path.to_string_lossy().into_owned()
+    // the Python CLI's fallback is `str(Path)`: `~/x/` and `/h/x` are one key there too
+    path.components().collect::<PathBuf>().to_string_lossy().into_owned()
 }
 
 /// Whether two configurations name the same relay: folders by [`folder_key`], addresses by their parsed base.
