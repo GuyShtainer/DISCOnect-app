@@ -329,3 +329,34 @@ fn a_midnight_hour_resolves_each_sample_of_one_pair() {
         .map(|(day, status)| (day.to_string(), status));
     assert_eq!(got, want);
 }
+
+/// 7b-12 review, minor — twin of `test_completeness_dst_night_twin`: the day bounds read the offset nearest
+/// to each UTC midnight while a reading is dated by the offset nearest to itself, so with an offset moment
+/// between a reading and the UTC midnight the reading's worn seconds land on the day next to the one its value
+/// averages into. Spring-forward night (+1 h at 01:00Z), a file an hour before the change and one after it:
+/// the hour before is "present" on 03-29 and 03-29 has no completeness at all. Harmless for a fixed-zone watch.
+#[test]
+fn completeness_dst_night_twin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = writable(dir.path());
+    let conn = store.conn();
+    let moment = |day: u32, hour: u32, minute: u32| {
+        chrono::NaiveDate::from_ymd_opt(2025, 3, day).expect("date").and_hms_opt(hour, minute, 0).expect("time").and_utc().timestamp()
+    };
+    let first = raw(conn, "fit:monitoring_b", "2025-03-29T22:00:00Z", "2025-03-30T01:30:00Z");
+    let second = raw(conn, "fit:monitoring_b", "2025-03-30T01:30:00Z", "2025-03-31T00:00:00Z");
+    for (stamp, offset, raw_id) in [("2025-03-29T22:00:00Z", 3600, first), ("2025-03-30T01:30:00Z", 7200, second)] {
+        conn.execute("INSERT INTO clock_offsets(ts_utc, offset_s, raw_record_id) VALUES(?1, ?2, ?3)", rusqlite::params![stamp, offset, raw_id])
+            .expect("offset");
+    }
+    minutes(conn, first, "heart_rate", "device", moment(29, 22, 0), moment(30, 1, 30), 60);
+    minutes(conn, second, "heart_rate", "device", moment(30, 1, 30), moment(31, 0, 0), 60);
+    let statuses = coverage::day_statuses(conn, Contract::get().expect("contract"), "heart_rate", "device", "2025-03-29", "2025-03-31")
+        .expect("statuses");
+    let want = [("2025-03-29", "present"), ("2025-03-30", "present"), ("2025-03-31", "present")].map(|(day, status)| (day.to_string(), status));
+    assert_eq!(statuses, want);
+    assert_eq!(
+        shares(conn, "heart_rate", "device", "2025-03-29", "2025-03-31"),
+        vec![("2025-03-29".to_string(), None), ("2025-03-30".to_string(), Some(100)), ("2025-03-31".to_string(), Some(100))]
+    );
+}
