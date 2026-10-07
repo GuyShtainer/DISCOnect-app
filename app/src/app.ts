@@ -721,7 +721,7 @@ type SyncStatus = {
   serving: null | { url: string; keep: boolean; offer: null | "open" | "bound" | "released" | "delivered" };
   relay_url?: string | null; // the LAN relay's http://host:port from relay.json; null or absent: none to show
   relay_kind?: "folder" | "lan" | "mixed" | null; // 19a: what the relay list holds; the timer runs only with a folder in it
-  chains?: { device_id: string; bundles: number; records: number; last_seq: number; self: boolean }[]; // 19b: counts per device chain; absent until the core says it
+  chains?: { chain: string; bundles: number; records: number; last_seq: number; self: boolean }[]; // 19b: counts per writer chain (the random id its sync bookkeeping minted, never a hardware id); absent until the core says it
   relays?: SiteRow[] | null; // 19d: the sites of this session's last sync.run; null or absent before the first
 };
 /** One relay of the list, as `sync.run` reported it (19d): counts and a reason word, never a path or an address. */
@@ -1323,7 +1323,9 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
   out.append(sites);
 
   // 19b: what each writer sent, from the chains the store holds (counts only; the writer id is the random id the
-  // device's sync bookkeeping minted, never a hardware id or a key — decision 7's honest card below still holds)
+  // device's sync bookkeeping minted, never a hardware id or a key — decision 7's honest card below still holds).
+  // A chain is a writer id, not a device: a device that forgot and paired again writes a new chain and its old one
+  // stays on every store while its bundles stay on the relay; `records` counts what the chain's bundles carried.
   const chains = status.chains ?? [];
   const sent = el("section", "card");
   sent.append(el("h2", "heading", "What each device sent"));
@@ -1333,17 +1335,17 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     const kv4 = el("dl", "kv");
     for (const c of [...chains].sort((a, b) => Number(b.self) - Number(a.self))) {
       const one = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
-      kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.device_id.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}`));
+      kv4.append(el("dt", "", c.self ? "This Mac" : `Device · ${c.chain.slice(0, 8)}`), el("dd", "value-small", `${one(c.bundles, "bundle")} · ${one(c.records, "record")}`));
     }
     sent.append(kv4);
-    sent.append(el("p", "caption muted", "A device is known by the id its sync bookkeeping made up at its first push; after a forget on that device it shows up here as a new one."));
+    sent.append(el("p", "caption muted", "Each device is shown by a random name it picked the first time it sent something. A device that was forgotten and paired again shows up as a new line; its old line stays."));
   }
   out.append(sent);
 
   // design decision 7: no device list, the honest card
   const devices = el("section", "card");
   devices.append(el("h2", "heading", "Devices that hold your key"));
-  devices.append(el("p", "body", "Every paired device holds the same key, so this Mac cannot tell them apart and keeps no list."));
+  devices.append(el("p", "body", "Every paired device holds the same key, so this Mac cannot list who holds it: the card above shows only the devices that have sent something."));
   devices.append(el("p", "caption muted", "To shut one device out: rotate the key with the command line (disconect key rotate-recovery), then pair the devices you keep again."));
   out.append(devices);
 }
