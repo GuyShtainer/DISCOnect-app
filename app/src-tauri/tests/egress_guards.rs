@@ -636,9 +636,8 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
     assert!(disconect_app_lib::method_refusal("data.today").is_ok());
 }
 
-/// 19d (attack finding A6): the page never names a relay. `core_call` refuses a `relays` key on `sync.run` before the
-/// core sees it, with a fixed text; a plain `sync.run` and `relays` on any other method pass (the core refuses those
-/// shapes itself).
+/// 19d (attack finding A6): the page never names a relay. `core_call` refuses a `relays` key on every method before
+/// the core sees it, with a fixed text; a plain `sync.run` passes.
 #[test]
 fn the_generic_core_door_refuses_a_relay_list_from_the_page() {
     let lib = text(&manifest().join("src").join("lib.rs"));
@@ -647,7 +646,8 @@ fn the_generic_core_door_refuses_a_relay_list_from_the_page() {
     let err = disconect_app_lib::params_refusal("sync.run", &serde_json::json!({"relays": []})).expect_err("a relay list from the page");
     assert_eq!((err.code.as_str(), err.message.as_str()), ("refused", "that parameter is not available to the page"));
     assert!(disconect_app_lib::params_refusal("sync.run", &serde_json::json!({})).is_ok());
-    assert!(disconect_app_lib::params_refusal("sync.status", &serde_json::json!({"relays": []})).is_ok());
+    // every method, every platform: the iOS shell's own list is added after this check, natively
+    assert!(disconect_app_lib::params_refusal("sync.status", &serde_json::json!({"relays": []})).is_err());
 }
 
 #[test]

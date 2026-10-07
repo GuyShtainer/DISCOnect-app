@@ -161,7 +161,7 @@ fn file_url(path: &Path) -> Result<Retained<NSURL>, String> {
 }
 
 /// `NSURLIsExcludedFromBackupKey = YES` on `path`.
-fn exclude_from_backup(path: &Path) -> Result<(), String> {
+pub(crate) fn exclude_from_backup(path: &Path) -> Result<(), String> {
     let url = file_url(path)?;
     let yes = NSNumber::new_bool(true);
     let value: &AnyObject = &yes;

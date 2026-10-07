@@ -226,3 +226,12 @@ html.scanning .topbar { display: none; }
 .phone .steps { flex-direction: column; gap: var(--space-2); }
 .phone .row.head { flex-direction: column; align-items: flex-start; gap: var(--space-1); } /* the subtitle below the title, never beside it */
 html.scanning .main { padding-top: calc(env(safe-area-inset-top) + var(--space-4)); }
+
+/* the phone's Relays card (19d): rows in the card, neutral text, no hue */
+ul.relays { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+li.relay { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3) 0; border-top: 1px solid var(--hairline); }
+li.relay:first-child { border-top: 0; }
+li.relay p { margin: 0; }
+.relay-head { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); }
+.relay-name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+li.relay .actions input[type="text"], .field input[type="text"] { flex: 1 1 160px; min-width: 0; }
