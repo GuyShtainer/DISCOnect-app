@@ -1075,7 +1075,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
     } else if (pairPhase === "pushing") {
       left.append(el("p", "body", "Sending your data to the relay first…"));
     } else {
-      if (pairPhase === "done") left.append(el("p", "body", "Done — the other device holds your key. Start a new offer to pair another device."));
+      if (pairPhase === "done") left.append(el("p", "body", "Paired — the other device holds your key. Start a new offer to pair another device."));
       left.append(addressSelect());
       const start = el("button", "", "Start an offer") as HTMLButtonElement;
       start.disabled = !listen() || syncRun.running;
@@ -1090,7 +1090,7 @@ async function screenSync(out: ParentNode, later: Later, pairing: boolean): Prom
       { text: "Offer shown — scan it or paste the text on the other device", state: offerOpen || pairPhase === "done" ? "done" : pairPhase === "pushing" ? "now" : "idle" },
       { text: "A device answered", state: reached ? "done" : offerOpen ? "now" : "idle" },
       { text: "Type the code the other device shows", state: typed ? "done" : pairPhase === "bound" || serving?.offer === "bound" ? "now" : "idle" },
-      { text: "Done — the device holds your key", state: pairPhase === "done" ? "done" : pairPhase === "released" ? "now" : "idle" },
+      { text: "Paired — the device holds your key", state: pairPhase === "done" ? "done" : pairPhase === "released" ? "now" : "idle" },
     ]));
     const input = el("input", "code-input") as HTMLInputElement;
     input.type = "text";
@@ -2270,7 +2270,8 @@ function pairFailure(e: unknown): void {
     } else if (m.startsWith("Cancelled.")) {
       pairError("other", "Pairing stopped", m);
     } else if (m.startsWith("Not paired.")) {
-      pairError("other", declinedByUi ? "You chose not to pair" : "Pairing stopped", m);
+      // always after the release (the Mac's Cancel is disabled by then): never ask for a Cancel there; the phone's own words
+      pairError("other", declinedByUi ? "You chose not to pair" : "Pairing stopped", "Nothing was saved on this phone. Your Mac may say Paired; it keeps no record of this phone. Start a new offer on your Mac to pair.");
     } else {
       pairError("other", "Pairing did not finish", m);
     }
@@ -2327,7 +2328,7 @@ async function phoneAnswer(yes: boolean): Promise<void> {
   try {
     await core.call("pair.land", { confirm: yes });
     if (yes && pp.v === "confirm") { setPair({ v: "landing", done: [] }); debugReloadOnce("landing"); }
-    // a no: the join answers "Not paired. Cancel on your Mac too." and that frame is drawn from its rejection
+    // a no: the join answers "Not paired. …" and that frame is drawn from its rejection (pairFailure, in the phone's words)
   } catch (e) {
     pairFailure(e);
   } finally {
@@ -3552,7 +3553,7 @@ void (async () => {
         ["--debug-pair-landing", { v: "landing", done: ["relay"] }],
         ["--debug-pair-joining", { v: "joining", host: "192.168.1.20", exp: soon, reached: false }],
         ["--debug-pair-clock", { v: "error", kind: "clock", lead: "This phone's clock is off", text: "This offer is too far ahead of this phone's clock. Check the date and time on this phone.", exp: soon + 3 * 3600 }],
-        ["--debug-pair-notpaired", { v: "error", kind: "other", lead: "Pairing stopped", text: "Not paired. Nothing was saved on this phone.", exp: null }],
+        ["--debug-pair-notpaired", { v: "error", kind: "other", lead: "Pairing stopped", text: "Nothing was saved on this phone. Your Mac may say Paired; it keeps no record of this phone. Start a new offer on your Mac to pair.", exp: null }],
         ["--debug-pair-failed", { v: "error", kind: "other", lead: "Pairing did not finish", text: "Your Mac refused this request. Cancel on your Mac and start a new offer.", exp: null }],
       ];
       for (const [flag, view] of frames) if (args.includes(flag)) setPair(view);
