@@ -396,9 +396,11 @@ fn debug_keychain_proof_door(app: &tauri::AppHandle, startup_notes: &[String]) {
 
 /// How long the phone may be away (not the active app) before its master key leaves memory: 12-F pitch, "The master in
 /// memory". Debug builds read `DISCONECT_DEBUG_AWAY_SECS` instead (evidence runs); that code is compiled out of release.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 const AWAY_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[cfg(debug_assertions)]
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 fn away_limit() -> std::time::Duration {
     std::env::var("DISCONECT_DEBUG_AWAY_SECS")
         .ok()
@@ -407,6 +409,7 @@ fn away_limit() -> std::time::Duration {
 }
 
 #[cfg(not(debug_assertions))]
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 fn away_limit() -> std::time::Duration {
     AWAY_LIMIT
 }
