@@ -209,3 +209,17 @@ input.invalid { border-color: var(--status-failed); }
 .sheet-shade { position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 3; background: var(--ink); opacity: 0.4; }
 .sheet { position: fixed; z-index: 4; left: 0; right: 0; bottom: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; padding: var(--space-4) calc(var(--space-4) + env(safe-area-inset-right)) calc(var(--space-4) + env(safe-area-inset-bottom)) calc(var(--space-4) + env(safe-area-inset-left)); gap: var(--space-3); max-height: 90vh; overflow-y: auto; }
 .phone .card p { margin: 0; }
+
+/* ---- The phone's pairing screens (12-F row 4): tokens only ---- */
+.stack { display: flex; flex-direction: column; gap: var(--space-2); }
+.center { text-align: center; }
+.bigcode { display: block; text-align: center; font-family: var(--font-mono); font-size: 40px; line-height: 48px; font-weight: 500; letter-spacing: 0.08em; }
+.phone textarea { min-height: 120px; padding: var(--space-3); border: 1px solid var(--hairline); border-radius: var(--radius-md); background: var(--surface); color: var(--ink); font: inherit; font-family: var(--font-mono); width: 100%; box-sizing: border-box; }
+/* the scan screen: the camera is drawn behind the (transparent) page, so only the page's own words and buttons sit on a ground */
+html.scanning, html.scanning body, html.scanning .shell, html.scanning .main { background: transparent; }
+html.scanning .topbar { display: none; }
+.scan-top, .scan-bottom { background: var(--surface); border-radius: var(--radius-lg); padding: var(--space-3) var(--space-4); display: flex; flex-direction: column; gap: var(--space-2); }
+.camera { min-height: 340px; display: flex; align-items: center; justify-content: center; }
+.finder { width: 220px; height: 220px; border: 2px solid var(--accent); border-radius: var(--radius-lg); }
+.phone .steps { flex-direction: column; gap: var(--space-2); }
+html.scanning .main { padding-top: calc(env(safe-area-inset-top) + var(--space-4)); }

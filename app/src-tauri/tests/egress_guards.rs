@@ -608,6 +608,8 @@ fn the_generic_core_door_forwards_only_the_methods_the_page_calls_and_never_impo
     assert!(used.contains("data.today") && used.contains("key.unlock"), "the scanner sees the calls: {used:?}");
     // the phone's own method is on the phone's list only (the next test); the desktop list is the first one
     used.remove("pair.forget");
+    used.remove("pair.join");
+    used.remove("pair.land");
     assert!(used.is_subset(&allowed), "a method the page calls is missing from ALLOWED_METHODS: {:?}", used.difference(&allowed).collect::<Vec<_>>());
     assert!(!allowed.contains("import.run"), "an import starts only from the OS drop, never from the page");
     let lib = text(&manifest().join("src").join("lib.rs"));
@@ -631,7 +633,8 @@ fn the_phones_method_list_drops_the_four_server_side_methods_and_adds_only_forge
     let added: BTreeSet<String> = phone.difference(&desktop).cloned().collect();
     assert_eq!(added, ["key.lock", "pair.forget", "pair.join", "pair.land"].map(String::from).into_iter().collect(), "the phone's list adds only its own forget, lock, join and land methods");
     let page = app_dir().join("src").join("app.ts");
-    assert!(text(&page).contains("\"pair.forget\""), "the page calls the method the phone's list adds");
+    let page_text = text(&page);
+    assert!(page_text.contains("\"pair.forget\"") && page_text.contains("\"pair.join\"") && page_text.contains("\"pair.land\""), "the page calls the methods the phone's list adds");
 }
 
 #[test]
@@ -659,4 +662,43 @@ fn the_page_hears_a_drag_only_as_a_bare_over_flag_and_a_release_build_drops_debu
         assert!(!lib[attr..n].contains("\n}\n"), "--debug-window sits outside a `#[cfg(debug_assertions)]` item");
     }
     assert!(lib.contains("fn debug_window_size") && lib.contains("config.width = w;"), "the door sets the built window's size");
+}
+
+/// 12-F row 4: the screen-awake switch and the debug offer file are iOS commands. Neither is compiled for a desktop
+/// build, neither is listed in a desktop or Android handler list, and the offer file is also absent from every release list.
+#[test]
+fn the_keep_awake_switch_is_ios_only_and_the_offer_file_is_a_debug_ios_door() {
+    let lib = text(&manifest().join("src").join("lib.rs"));
+    let item = |name: &str| -> String {
+        let at = lib.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("{name} exists"));
+        let head = &lib[..at];
+        // the attribute lines directly above the fn (stop at the first line that is not an attribute or a doc line)
+        let mut attrs = Vec::new();
+        for line in head.lines().rev().skip(0) {
+            let t = line.trim();
+            if t.starts_with("#[") || t.starts_with("///") || t.starts_with("async") || t.is_empty() { attrs.push(t.to_string()); } else { break; }
+        }
+        attrs.join(" ")
+    };
+    assert!(item("keep_awake").contains("#[cfg(target_os = \"ios\")]"), "keep_awake: {}", item("keep_awake"));
+    let door = item("debug_offer_from_file");
+    assert!(door.contains("#[cfg(all(debug_assertions, target_os = \"ios\"))]"), "debug_offer_from_file: {door}");
+    // the handler lists: every list that names them carries the iOS cfg, and the offer file only the debug one
+    for stanza in lib.split("let builder = builder.invoke_handler(").skip(1) {
+        let before = lib[..lib.find(stanza).unwrap()].lines().rev().find(|l| l.trim_start().starts_with("#[cfg(")).unwrap_or("").to_string();
+        let list = stanza.split("]);").next().unwrap();
+        if list.contains("keep_awake") {
+            assert!(before.contains("target_os = \"ios\"") && !before.contains("not(target_os = \"ios\")"), "{before}");
+        }
+        if list.contains("debug_offer_from_file") {
+            assert!(before.contains("debug_assertions") && !before.contains("not(debug_assertions)") && before.contains("target_os = \"ios\""), "{before}");
+        }
+    }
+    // the page calls keep_awake and the offer file in phone.ts only; the offer file's caller sits inside a DEV guard
+    let phone = text(&app_dir().join("src").join("phone.ts"));
+    assert!(phone.contains("\"keep_awake\"") && phone.contains("\"debug_offer_from_file\""));
+    let app = text(&app_dir().join("src").join("app.ts"));
+    let call = app.find("phone.debugOfferFromFile()").expect("the debug door's caller");
+    let guard = app[..call].rfind("if (import.meta.env.DEV) {").expect("inside a DEV guard");
+    assert!(!app[guard..call].contains("\n  }\n"), "the offer file is read only inside the DEV block");
 }
