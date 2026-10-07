@@ -322,6 +322,11 @@ mod tests {
             r#"{"relays": [{"id": "ab", "kind": "lan", "url": "http://h:2", "serve": true}]}"#,
             r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a"}, {"id": "ab", "kind": "folder", "path": "/b"}]}"#,
             r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "serve": true}, {"id": "cd", "kind": "folder", "path": "/b", "serve": true}]}"#,
+            // what serde_json refuses, pinned so the Python oracle keeps refusing the same (BL-8)
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "\ud800"}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": NaN}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": -Infinity}]}"#,
+            r#"{"relays": [{"id": "ab", "kind": "folder", "path": "/a", "x": 1e400}]}"#,
         ] {
             std::fs::write(&path, bad).expect("write");
             assert_eq!(read_list(&path), None, "{bad}");

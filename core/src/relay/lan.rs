@@ -704,8 +704,11 @@ mod tests {
             "http://x?y=1",
             "http://u:p@x:1",
             "http://x y",
+            "\u{1f}http://10.0.0.1:1", // `trim` removes White_Space only (BL-8: the Python oracle matches)
+            "http://10.0.0.1:1\u{1c}",
         ] {
             assert!(parse_base_url(bad).is_err(), "{bad}");
         }
+        assert_eq!(parse_base_url("\u{3000}http://10.0.0.1:1\n").as_deref(), Ok("http://10.0.0.1:1"));
     }
 }
