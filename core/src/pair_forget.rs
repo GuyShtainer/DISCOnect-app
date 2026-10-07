@@ -28,10 +28,14 @@ pub const MARKER_NAME: &str = "forget.pending";
 /// removes it, so the next start-up's rule (no store, no key file, no marker: sweep every item) retries the removal.
 pub const FIRST_RUN_MARKER: &str = "first-run.done";
 
-/// The files a forget touches, all beside the store.
+/// The files a forget touches, all beside the store. `db` is the store as spelled (the key file, relay.json and
+/// the markers sit beside that name); `store` is the same path with symlinks resolved (BL-2 review): SQLite puts
+/// `-wal`/`-shm` beside the link's *target* and the write lock is keyed on it, so those are named from `store`
+/// and the link itself goes too. The phone never makes a symlinked store; this is a CLI-only shape.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub db: PathBuf,
+    pub store: PathBuf,
     pub key: PathBuf,
     pub relay: PathBuf,
     pub marker: PathBuf,
@@ -43,6 +47,7 @@ impl Paths {
         let folder = db.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         Paths {
             db: db.to_path_buf(),
+            store: write_lock::resolved_store_path(db),
             key: key.to_path_buf(),
             relay: crate::home::relay_config_beside(db),
             marker: folder.join(MARKER_NAME),
@@ -50,14 +55,20 @@ impl Paths {
         }
     }
 
-    fn store_files(&self) -> [PathBuf; 5] {
-        [
-            self.db.clone(),
-            keys::sibling_with_suffix(&self.db, "-wal"),
-            keys::sibling_with_suffix(&self.db, "-shm"),
-            write_lock::lock_path_for(&self.db),
-            keys::sibling_with_suffix(&self.db, ".write-lock.holder"),
-        ]
+    /// The store's own files: the name as spelled (a link, when it is one), the store, its `-wal` and `-shm`, the
+    /// write lock and its holder — the last four beside the resolved store.
+    fn store_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![self.db.clone()];
+        if self.store != self.db {
+            files.push(self.store.clone());
+        }
+        files.extend([
+            keys::sibling_with_suffix(&self.store, "-wal"),
+            keys::sibling_with_suffix(&self.store, "-shm"),
+            keys::sibling_with_suffix(&self.store, ".write-lock"),
+            keys::sibling_with_suffix(&self.store, ".write-lock.holder"),
+        ]);
+        files
     }
 }
 
@@ -230,6 +241,32 @@ mod tests {
 
     fn gone(paths: &Paths) -> bool {
         paths.store_files().iter().all(|f| !f.exists()) && !paths.key.exists() && !paths.relay.exists() && !paths.marker.exists()
+    }
+
+    /// BL-2 review: a symlinked store name. SQLite keeps `-wal`/`-shm` beside the target and the lock is keyed on
+    /// it, so a forget by the link's name must take the link, the target and the target's sidecars.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_store_name_forgets_the_target_and_its_sidecars() {
+        let (dir, _) = seed("symlink");
+        let real = dir.join("real");
+        std::fs::create_dir(&real).unwrap();
+        for name in ["target.db", "target.db-wal", "target.db-shm", "target.db.write-lock", "target.db.write-lock.holder"] {
+            std::fs::write(real.join(name), b"x").unwrap();
+        }
+        let link = dir.join("linked.db");
+        std::os::unix::fs::symlink(real.join("target.db"), &link).unwrap();
+        let paths = Paths::beside(&link, &keys::sibling_with_suffix(&link, keys::KEY_FILE_SUFFIX));
+        std::fs::write(&paths.key, KEY_FILE).unwrap();
+        assert_eq!(paths.store, std::fs::canonicalize(real.join("target.db")).unwrap(), "the store is the link's target");
+        let mut items = fake(&paths, true);
+        let result = run(&paths, &mut items, &mut |_| false).unwrap();
+        assert_eq!(result, KeychainResult::Removed);
+        assert!(!link.exists() && std::fs::symlink_metadata(&link).is_err(), "the link itself is gone");
+        assert!(gone(&paths));
+        let left: Vec<_> = std::fs::read_dir(&real).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "the target and its -wal, -shm, lock and holder are gone: {left:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

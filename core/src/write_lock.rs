@@ -44,7 +44,7 @@ fn busy_message(holder: &Option<Value>) -> String {
 /// follows it and creates the target, so the lock must already sit beside the target); a store that does not
 /// exist yet and is no link (init, a landing) is taken as spelled; a symlinked folder needs no resolving (both
 /// spellings open the one lock file); a hard link is another name for the same inode and cannot be resolved.
-fn resolved(db_path: &Path) -> PathBuf {
+pub fn resolved_store_path(db_path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(db_path) {
         return real;
     }
@@ -61,7 +61,7 @@ fn resolved(db_path: &Path) -> PathBuf {
 }
 
 pub fn lock_path_for(db_path: &Path) -> PathBuf {
-    sibling_with_suffix(&resolved(db_path), ".write-lock")
+    sibling_with_suffix(&resolved_store_path(db_path), ".write-lock")
 }
 
 fn holder_path_for(resolved_db: &Path) -> PathBuf {
@@ -81,7 +81,7 @@ pub struct WriteLock {
 
 /// Take the exclusive write lock for `db_path`, waiting up to `timeout`.
 pub fn acquire(db_path: &Path, purpose: &str, timeout: Duration) -> Result<WriteLock, LockError> {
-    let db_path = resolved(db_path);
+    let db_path = resolved_store_path(db_path);
     let lock_path = sibling_with_suffix(&db_path, ".write-lock");
     let holder_path = holder_path_for(&db_path);
     if let Some(moved) = home::moved_legacy_home(&lock_path) {
