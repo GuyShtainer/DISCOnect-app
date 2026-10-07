@@ -79,8 +79,12 @@ pub struct KeyFile {
 /// (the password database is never consulted), an unset or empty `$HOME` leaves the `~` as written, and `./~/a` is
 /// a folder named `~`.
 pub fn expand_user(path: &Path) -> PathBuf {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    match (path.strip_prefix("~"), home) {
+    expand_user_in(path, std::env::var_os("HOME").as_deref())
+}
+
+/// [`expand_user`] with the home given explicitly (the one implementation; `home::resolve_in` shares it).
+pub fn expand_user_in(path: &Path, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    match (path.strip_prefix("~"), home.filter(|home| !home.is_empty())) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => path.to_path_buf(),
     }

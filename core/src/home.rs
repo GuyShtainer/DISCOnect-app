@@ -11,6 +11,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::keys;
 use crate::identity::{
     COMMAND, DATA_DIR, DB_FILENAME, ENV_PREFIX, LEGACY_DB_FILENAME, LEGACY_ENV_PREFIX, LEGACY_HOMES, PRODUCT,
 };
@@ -29,20 +30,16 @@ pub struct DefaultDb {
     pub legacy_home: Option<&'static str>,
 }
 
-fn expand(path: &Path, home: Option<&Path>) -> PathBuf {
-    match (path.strip_prefix("~"), home) {
-        (Ok(rest), Some(home)) => home.join(rest),
-        _ => path.to_path_buf(),
-    }
-}
-
 /// The decision, with its inputs explicit: `$DISCONECT_DB` (with `~` expanded) if set and non-empty;
 /// else `<home>/.disconect/disconect.db` if that **file** exists; else the old folder's file if it
-/// exists; else the new path. `None` only when no override is set and there is no home.
+/// exists; else the new path. `None` only when no override is set and there is no home: an unset **or empty**
+/// `$HOME` is no home, exactly as in `keys::expand_user`, and the password database is never consulted (the Python
+/// twin reads `$HOME` the same way, not through `Path.home()`).
 pub fn resolve_in(home: Option<&Path>, db_env: Option<&OsStr>) -> Option<DefaultDb> {
+    let home = home.filter(|h| !h.as_os_str().is_empty());
     if let Some(over) = db_env.filter(|v| !v.is_empty()) {
         return Some(DefaultDb {
-            path: expand(Path::new(over), home),
+            path: keys::expand_user_in(Path::new(over), home.map(Path::as_os_str)),
             legacy_home: None,
         });
     }
@@ -244,6 +241,13 @@ mod tests {
             Some(PathBuf::from("/x.db"))
         );
         assert_eq!(resolve_in(None, None), None);
+        // an empty $HOME is no home, like an unset one (the Python twin reads it the same way)
+        assert_eq!(resolve_in(Some(Path::new("")), None), None);
+        assert_eq!(
+            resolve_in(Some(Path::new("")), Some(OsStr::new("~/x.db"))).map(|d| d.path),
+            Some(PathBuf::from("~/x.db")),
+            "no home leaves the ~ as written"
+        );
     }
 
     #[test]
