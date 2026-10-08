@@ -933,3 +933,77 @@ fn relay_kind_in_sync_status() {
     ]}));
     assert_eq!(kind(&mut rig, 5), json!("mixed"));
 }
+
+const SENTINEL_FIT: &str = "monitoring_sentinels_counters";
+
+/// Device A (the synthetic monitoring FIT of device 42 imported) pushes to a folder relay; device B's store is
+/// seeded with `seed_sql` and pulls. Returns B's `sync.run` lines, its run rows and its bundle rows.
+type Pair<T> = Vec<(String, T)>;
+
+fn pull_over_a_hand_edited_cell(seed_sql: &str) -> (Vec<Value>, Pair<Option<String>>, Pair<String>) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let relay = tmp.path().join("relay");
+    let (_da, a) = encrypted_store(false);
+    let (_db, b) = encrypted_store(false);
+    for db in [&a, &b] {
+        relay_json(db, json!({"folder": relay}));
+    }
+    let drop = tmp.path().join("drop");
+    std::fs::create_dir_all(&drop).expect("mkdir");
+    std::fs::copy(fixtures().join("synthetic").join(format!("{SENTINEL_FIT}.fit.bin")), drop.join("a.fit")).expect("copy");
+    let mut rig_a = Rig::new(&a);
+    rig_a.unlock();
+    assert_eq!(rig_a.send(2, "import.run", json!({"path": drop}))[0]["event"], "progress");
+    assert_eq!(only_response(&rig_a.send(3, "sync.run", json!({})))["result"]["push"]["bundles"], 1);
+
+    let secret = keys::unlock(&keys::key_path_for(&b), PassphraseSource::Explicit(PASSPHRASE)).expect("unlock");
+    {
+        let opened = store::open_for_write_with(&b, "test", 5.0, Some(&secret)).expect("open");
+        opened.conn().execute_batch(&format!(
+            "INSERT INTO raw_records(stream, source_key, source_scope, transport, payload_kind, payload, payload_hash, \
+             payload_bytes, imported_at) VALUES('fit:monitoring_b','k','device','usb','fit',x'00','h',1,'2025-07-01T00:00:00Z'); {seed_sql}"
+        )).expect("seed");
+    }
+    let mut rig_b = Rig::new(&b);
+    rig_b.unlock();
+    let lines = rig_b.send(20, "sync.run", json!({}));
+    let opened = store::open_for_write_with(&b, "test", 5.0, Some(&secret)).expect("reopen");
+    let runs = opened.conn().prepare("SELECT status, error FROM import_runs ORDER BY id").expect("prepare")
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).expect("query")
+        .collect::<Result<Vec<_>, _>>().expect("rows");
+    let bundles = opened.conn().prepare("SELECT direction, status FROM relay_bundles ORDER BY direction").expect("prepare")
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).expect("query")
+        .collect::<Result<Vec<_>, _>>().expect("rows");
+    (lines, runs, bundles)
+}
+
+#[test]
+fn a_pull_over_a_corrupt_clock_stamp_is_bad_params_and_books_no_run() {
+    let (lines, runs, bundles) = pull_over_a_hand_edited_cell(
+        "INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15 00:00:00', 0)",
+    );
+    let text = "time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'";
+    assert_eq!(only_response(&lines)["error"], json!({"code": "bad_params", "message": text}));
+    assert_eq!(
+        sync_events(&lines),
+        [("push", "start"), ("push", "done"), ("pull", "start")].map(|(p, s)| (p.to_string(), s.to_string()))
+    );
+    // B's own push (its one seeded record) went out before the pull; nothing was pulled
+    assert_eq!((runs, bundles), (vec![], vec![("pushed".to_string(), "applied".to_string())]));
+}
+
+#[test]
+fn a_pull_over_a_corrupt_sample_stamp_is_bad_params_and_the_pull_run_is_failed() {
+    let (lines, runs, bundles) = pull_over_a_hand_edited_cell(
+        "INSERT INTO metric_samples(ts_utc, metric, value, source_scope, device_id, raw_record_id) \
+         VALUES('2025-06-15T12:00:00','stress',5,'device','42',1)",
+    );
+    let text = "time data '2025-06-15T12:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'";
+    assert_eq!(only_response(&lines)["error"], json!({"code": "bad_params", "message": text}));
+    assert_eq!(
+        sync_events(&lines),
+        [("push", "start"), ("push", "done"), ("pull", "start")].map(|(p, s)| (p.to_string(), s.to_string()))
+    );
+    assert_eq!(runs, vec![("failed".to_string(), Some(format!("ValueError: {text}")))]);
+    assert_eq!(bundles, vec![("pulled".to_string(), "applying".to_string()), ("pushed".to_string(), "applied".to_string())]);
+}

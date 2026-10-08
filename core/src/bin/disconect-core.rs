@@ -214,6 +214,8 @@ fn import_exit_code(err: &SourceError) -> u8 {
         SourceError::NotFound(_) => EXIT_USAGE,
         // the oracle's uncaught Python exception: traceback, exit 1
         SourceError::Abort(_) => 1,
+        // the oracle's uncaught ValueError from a hand-edited stored stamp: traceback, exit 1
+        SourceError::Writer(WriterError::BadStamp(_)) => 1,
         _ => EXIT_DATABASE,
     }
 }
