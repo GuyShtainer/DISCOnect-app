@@ -529,6 +529,41 @@ fn a_malformed_clock_offset_cell_reads_as_strptimes_text() {
     }
 }
 
+/// The twin of test_serve.py's `OFFSET_CELLS`: the cell's SQL literal and the offset used, or `bad_params`' text.
+const OFFSET_CELLS: [(&str, Result<i64, &str>); 10] = [
+    ("'abc'", Err("invalid literal for int() with base 10: 'abc'")),
+    ("3600.5", Ok(3600)),
+    ("-0.5", Ok(0)),
+    ("' 42 '", Ok(42)),
+    ("'1_000'", Ok(1000)),
+    ("'1__0'", Err("invalid literal for int() with base 10: '1__0'")),
+    ("'12abc'", Err("invalid literal for int() with base 10: '12abc'")),
+    ("''", Err("invalid literal for int() with base 10: ''")),
+    ("x'616263'", Err("invalid literal for int() with base 10: b'abc'")),
+    ("'it''s'", Err("invalid literal for int() with base 10: \"it's\"")),
+];
+
+#[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
+fn a_hand_edited_clock_offset_cell_reads_as_ints_value() {
+    // the twin of test_serve.py's test of the same name: `int()` of the stored cell is the offset
+    for (cell, outcome) in OFFSET_CELLS {
+        let (_dir, db) = live_copy();
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute("DELETE FROM clock_offsets", []).expect("delete");
+        conn.execute(&format!("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-30T03:00:00Z', {cell})"), [])
+            .expect("insert");
+        let reply = Rig::new(&db).send("data.sleep", json!({}));
+        match outcome {
+            Ok(seconds) => assert_eq!(reply["result"]["sessions"][0]["utc_offset_s"], seconds, "{cell}: {reply}"),
+            Err(text) => {
+                assert_eq!(reply["error"]["code"], "bad_params", "{cell}: {reply}");
+                assert_eq!(reply["error"]["message"], text, "{cell}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_mean_the_float_cannot_hold_is_internal_unexpected_overflowerror() {
     // the twin of test_serve.py's test of the same name: the one OverflowError the oracles no longer carry

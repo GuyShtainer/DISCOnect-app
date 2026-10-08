@@ -627,6 +627,38 @@ fn import_over_a_malformed_clock_offset_cell_is_bad_params_and_leaves_the_store_
 }
 
 #[test]
+fn import_over_a_malformed_clock_offset_value_is_bad_params_and_leaves_the_store_alone() {
+    // the twin of test_serve.py's test of the same name: `int()`'s text, before `begin_run`
+    for (cell, text) in [
+        ("'abc'", "invalid literal for int() with base 10: 'abc'"),
+        ("'1__0'", "invalid literal for int() with base 10: '1__0'"),
+        ("'12abc'", "invalid literal for int() with base 10: '12abc'"),
+        ("''", "invalid literal for int() with base 10: ''"),
+        ("x'616263'", "invalid literal for int() with base 10: b'abc'"),
+        ("'it''s'", "invalid literal for int() with base 10: \"it's\""),
+    ] {
+        let (_dir, db, folder) = corrupt_import_rig(&format!(
+            "INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15T00:00:00Z', {cell})"
+        ));
+        let before = import_store_state(&db);
+        let lines = Rig::new(&db).send(1, "import.run", json!({"path": folder}));
+        assert_eq!(error_of(&lines), ("bad_params".to_string(), text.to_string()), "{cell}");
+        assert!(before.0.is_empty());
+        assert_eq!(import_store_state(&db), before, "{cell}");
+    }
+}
+
+#[test]
+fn import_over_a_real_clock_offset_cell_imports_ok() {
+    // the twin of test_serve.py's test of the same name: `int(3600.5)` is 3600
+    let (_dir, db, folder) =
+        corrupt_import_rig("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15T00:00:00Z', 3600.5)");
+    let lines = Rig::new(&db).send(1, "import.run", json!({"path": folder}));
+    assert!(lines.iter().any(|l| l.get("result").is_some()), "{lines:?}");
+    assert_eq!(import_store_state(&db).0[0].1, "ok");
+}
+
+#[test]
 fn import_over_an_unparseable_derivation_cell_is_bad_params_and_the_run_is_booked_failed() {
     // the twin of test_serve.py's test of the same name; the steps derivation fails first, the samples one after it
     let failed = |counts: [i64; 4]| {

@@ -193,3 +193,31 @@ fn cli_import_over_a_corrupt_clock_cell_exits_1_like_the_oracles_uncaught_value_
         "error: ValueError: time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'"
     );
 }
+
+#[test]
+fn cli_import_over_a_corrupt_clock_offset_value_exits_1_like_the_oracles_uncaught_value_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let folder = synthetic_folder(dir.path());
+    let db = dir.path().join("corrupt.db");
+    {
+        let store = open(&db);
+        store
+            .conn()
+            .execute("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15T00:00:00Z', 'abc')", [])
+            .expect("seed");
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_disconect-core"))
+        .arg("--db")
+        .arg(&db)
+        .arg("import")
+        .arg(&folder)
+        .env_remove("DISCONECT_PASSPHRASE")
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.lines().last().expect("an error line"),
+        "error: ValueError: invalid literal for int() with base 10: 'abc'"
+    );
+}

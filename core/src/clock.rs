@@ -22,6 +22,88 @@ const MICROS: i64 = 1_000_000;
 #[error("{0}")]
 pub struct BadStamp(pub String);
 
+/// A `clock_offsets.offset_s` cell Python's `int()` refuses, with the twin's `ValueError` text (`invalid literal for
+/// int() with base 10: '<repr>'`). Boxed into rusqlite's conversion failure like [`BadStamp`].
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct BadOffset(pub String);
+
+/// `int(cell)` of a stored offset: INTEGER as is, REAL truncated toward zero, TEXT/BLOB by `int(str)`'s grammar.
+/// `Ok(None)` is a cell the twin accepts but an `i64` cannot hold (a huge or infinite REAL, an overlong digit
+/// string): the twin fails later with `OverflowError` (BACKLOG row); the caller keeps its database error.
+fn python_int(cell: &rusqlite::types::Value) -> Result<Option<i64>, BadOffset> {
+    use rusqlite::types::Value;
+    match cell {
+        Value::Integer(n) => Ok(Some(*n)),
+        Value::Real(x) if x.is_finite() && x.abs() < 9.2e18 => Ok(Some(x.trunc() as i64)),
+        Value::Real(_) | Value::Null => Ok(None),
+        Value::Text(text) => parse_int_literal(text.as_bytes())
+            .ok_or_else(|| BadOffset(format!("invalid literal for int() with base 10: {}", py_repr(text.as_bytes(), false)))),
+        Value::Blob(bytes) => parse_int_literal(bytes)
+            .ok_or_else(|| BadOffset(format!("invalid literal for int() with base 10: {}", py_repr(bytes, true)))),
+    }
+}
+
+/// Python's `int(str)` grammar over ASCII digits: surrounding whitespace, one sign, digits with single `_` between.
+/// `None` is a literal Python refuses; `Some(None)` one it accepts but an `i64` cannot hold.
+fn parse_int_literal(bytes: &[u8]) -> Option<Option<i64>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let body = text.trim_matches(|c: char| c.is_whitespace() || ('\x1c'..='\x1f').contains(&c));
+    let (negative, digits) = match body.as_bytes().first()? {
+        b'-' => (true, &body[1..]),
+        b'+' => (false, &body[1..]),
+        _ => (false, body),
+    };
+    let digits = digits.as_bytes();
+    if digits.is_empty() || digits[0] == b'_' || digits[digits.len() - 1] == b'_' || digits.windows(2).any(|w| w == b"__") {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for byte in digits.iter().filter(|b| **b != b'_') {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.saturating_mul(10).saturating_add(i128::from(byte - b'0'));
+    }
+    Some(i64::try_from(if negative { -value } else { value }).ok())
+}
+
+/// Python's `repr` of the cell text (`str`, or `bytes` with a `b` prefix): single quotes unless the text holds a
+/// single quote and no double quote; backslash, `\n`, `\r`, `\t` and other control bytes escaped.
+fn py_repr(bytes: &[u8], is_bytes: bool) -> String {
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') { '"' } else { '\'' };
+    let mut out = String::new();
+    if is_bytes {
+        out.push('b');
+    }
+    out.push(quote);
+    let push = |out: &mut String, c: char| match c {
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        c if c == quote => {
+            out.push('\\');
+            out.push(c);
+        }
+        c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
+        c => out.push(c),
+    };
+    if is_bytes {
+        for byte in bytes {
+            if *byte >= 0x80 {
+                out.push_str(&format!("\\x{byte:02x}"));
+            } else {
+                push(&mut out, char::from(*byte));
+            }
+        }
+    } else {
+        String::from_utf8_lossy(bytes).chars().for_each(|c| push(&mut out, c));
+    }
+    out.push(quote);
+    out
+}
+
 /// Sorted (moment, offset) pairs with nearest-neighbour lookup.
 #[derive(Debug, Default)]
 pub struct ClockOffsets {
@@ -40,13 +122,32 @@ impl ClockOffsets {
     pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
         let mut offsets = Self::new();
         let mut stmt = conn.prepare("SELECT ts_utc, offset_s FROM clock_offsets")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, rusqlite::types::Value>(1)?)))?;
         for row in rows {
             let (ts_utc, offset_s) = row?;
             // a malformed cell carries strptime's text (the twin raises it from `parse_iso_utc`)
             let ts_utc = parse_store_stamp(&ts_utc).map_err(|text| {
                 rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(BadStamp(text)))
             })?;
+            // then `int()` of the offset cell, in the twin's own order (the moment first)
+            let offset_s = match python_int(&offset_s) {
+                Ok(Some(seconds)) => seconds,
+                // a value the twin holds as a big int and fails on later (BACKLOG row): a database error here
+                Ok(None) => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        1,
+                        "offset_s".to_string(),
+                        offset_s.data_type(),
+                    ));
+                }
+                Err(bad) => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        offset_s.data_type(),
+                        Box::new(bad),
+                    ));
+                }
+            };
             offsets.add(ClockOffset { ts_utc, offset_s });
         }
         Ok(offsets)
@@ -56,7 +157,7 @@ impl ClockOffsets {
     /// begins (`BadStamp`, served `bad_params`); any other failure, a non-UTF-8 cell included, is a database error.
     pub fn load_for_write(conn: &Connection) -> Result<Self, crate::writer::WriterError> {
         Self::load(conn).map_err(|error| match error {
-            rusqlite::Error::FromSqlConversionFailure(_, _, inner) if inner.is::<BadStamp>() => {
+            rusqlite::Error::FromSqlConversionFailure(_, _, inner) if inner.is::<BadStamp>() || inner.is::<BadOffset>() => {
                 crate::writer::WriterError::BadStamp(inner.to_string())
             }
             other => crate::writer::WriterError::Db(other),

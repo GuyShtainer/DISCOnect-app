@@ -993,6 +993,20 @@ fn a_pull_over_a_corrupt_clock_stamp_is_bad_params_and_books_no_run() {
 }
 
 #[test]
+fn a_pull_over_a_corrupt_clock_offset_value_is_bad_params_and_books_no_run() {
+    let (lines, runs, bundles) = pull_over_a_hand_edited_cell(
+        "INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15T00:00:00Z', 'abc')",
+    );
+    let text = "invalid literal for int() with base 10: 'abc'";
+    assert_eq!(only_response(&lines)["error"], json!({"code": "bad_params", "message": text}));
+    assert_eq!(
+        sync_events(&lines),
+        [("push", "start"), ("push", "done"), ("pull", "start")].map(|(p, s)| (p.to_string(), s.to_string()))
+    );
+    assert_eq!((runs, bundles), (vec![], vec![("pushed".to_string(), "applied".to_string())]));
+}
+
+#[test]
 fn a_pull_over_a_corrupt_sample_stamp_is_bad_params_and_the_pull_run_is_failed() {
     let (lines, runs, bundles) = pull_over_a_hand_edited_cell(
         "INSERT INTO metric_samples(ts_utc, metric, value, source_scope, device_id, raw_record_id) \
