@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{NaiveDate, TimeZone, Utc};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
@@ -620,22 +620,28 @@ pub fn ledger_ordered(
 
 // ---- completeness (7b-12): how much of a day a per-minute metric's mean rests on -------------
 
+const DAY_S: i64 = 86_400;
+/// 9999-12-31T23:59:59Z, the calendar's last second.
+const LAST_SECOND: i64 = 253_402_300_799;
+
 /// `_day_bounds`: epoch seconds each window day starts at, plus the end of the last one
 /// (`window.days + 1` entries). Local midnight is read under the offset nearest to it; UTC is
 /// assumed where no offset is known. The bounds never step back (an offset jump of more than a day
 /// leaves the day between empty, so `partition_point` searches a sorted slice and no piece is
-/// negative); an offset that puts a midnight outside years 1-9999 is Python's `OverflowError`.
+/// negative). The bounds are plain integers, so the midnight after 9999-12-31 and a local midnight
+/// before year 1 are bounds too (the offset nearest to a moment past the calendar is read at its
+/// last second); only an offset i64 cannot subtract is Python's `OverflowError`.
 fn day_bounds(window: &Window, offsets: &ClockOffsets) -> Result<Vec<i64>, ReadError> {
     let mut bounds: Vec<i64> = Vec::with_capacity(window.days + 1);
+    let first = window.first.and_hms_opt(0, 0, 0).ok_or(ReadError::Overflow)?.and_utc().timestamp();
     for position in 0..=window.days {
-        let date = shift(window.first, i64::try_from(position).map_err(|_| ReadError::Overflow)?)?;
-        let midnight: Instant = date.and_hms_opt(0, 0, 0).ok_or(ReadError::Overflow)?.and_utc();
-        // `midnight - timedelta(seconds=offset)`
-        let bound = Duration::try_seconds(offsets.offset_at(midnight).unwrap_or(0))
-            .and_then(|by| midnight.checked_sub_signed(by))
-            .filter(|moment| (1..=9999).contains(&moment.year()))
-            .ok_or(ReadError::Overflow)?
-            .timestamp();
+        let midnight = i64::try_from(position)
+            .ok()
+            .and_then(|days| days.checked_mul(DAY_S))
+            .and_then(|seconds| first.checked_add(seconds))
+            .ok_or(ReadError::Overflow)?;
+        let moment: Instant = Utc.timestamp_opt(midnight.min(LAST_SECOND), 0).single().ok_or(ReadError::Overflow)?;
+        let bound = midnight.checked_sub(offsets.offset_at(moment).unwrap_or(0)).ok_or(ReadError::Overflow)?;
         bounds.push(bounds.last().map_or(bound, |previous| bound.max(*previous)));
     }
     Ok(bounds)

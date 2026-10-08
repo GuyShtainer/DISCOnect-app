@@ -11,6 +11,7 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use disconect_core::contract::Contract;
 use disconect_core::keys::PassphraseSource;
 use disconect_core::live::T_LIMIT;
+use disconect_core::read::coverage::{NOT_COVERED, calendar};
 use disconect_core::read::health::data_health;
 use disconect_core::read::queries::{fetch_window, live_day, load_offsets, sample_day_aggregates};
 use disconect_core::read::insight::{FactsQuery, period_facts};
@@ -303,6 +304,18 @@ fn reads_at_the_calendar_ends_answer_empty_instead_of_overflowing() {
     let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
     let pair = |a: NaiveDate, b: NaiveDate| fetch_window(a, b);
     assert_eq!(pair(ymd(1, 1, 1), ymd(1, 1, 1)), ("0001-01-01".to_string(), "0001-01-03".to_string()));
+    assert_eq!(pair(ymd(1, 1, 2), ymd(1, 1, 2)), ("0001-01-01".to_string(), "0001-01-04".to_string()));
     assert_eq!(pair(ymd(9999, 12, 31), ymd(9999, 12, 31)), ("9999-12-30".to_string(), "9999-12-31".to_string()));
+    assert_eq!(pair(ymd(9999, 12, 30), ymd(9999, 12, 30)), ("9999-12-29".to_string(), "9999-12-31".to_string()));
     assert_eq!(pair(ymd(9999, 12, 29), ymd(9999, 12, 29)), ("9999-12-28".to_string(), "9999-12-31".to_string()));
+    // the completeness day bounds: the midnight after 9999-12-31, and a local midnight before year 1 under a
+    // positive offset, are plain integers (the opus review of 1e2d688 found `data.metric` at 9999-12-31 still internal)
+    store
+        .conn()
+        .execute("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-01T12:00:00Z', 45900)", [])
+        .expect("offset");
+    for edge in ["0001-01-01", "9999-12-31"] {
+        let rows = calendar(store.conn(), contract, "heart_rate", "device", edge, edge).expect("calendar");
+        assert_eq!(rows, vec![(edge.to_string(), NOT_COVERED, None)], "{edge}");
+    }
 }

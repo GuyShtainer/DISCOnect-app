@@ -200,7 +200,11 @@ pub fn shift(date: NaiveDate, days: i64) -> Result<NaiveDate, ReadError> {
 /// calendar (0001-01-01 .. 9999-12-31) instead of failing. Twin of Python's `coverage.fetch_window`.
 pub fn fetch_window(first: NaiveDate, last: NaiveDate) -> (String, String) {
     let low = shift(first, -1).unwrap_or(first);
-    let high = shift(last, 2).unwrap_or(NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(last));
+    const CALENDAR_END: NaiveDate = match NaiveDate::from_ymd_opt(9999, 12, 31) {
+        Some(date) => date,
+        None => unreachable!(),
+    };
+    let high = shift(last, 2).unwrap_or(CALENDAR_END);
     (iso(low), iso(high))
 }
 

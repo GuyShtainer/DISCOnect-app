@@ -159,4 +159,8 @@ fn a_clock_offset_beyond_26_hours_is_dropped_and_counted_at_decode() {
         }
         assert_eq!(scan_clock_offsets(&bytes), decoded.offsets, "delta {delta}");
     }
+    // a `local_timestamp` below 0x10000000 is system seconds since power-on, not a wall clock: no pair, nothing dropped
+    let decoded = decode_fit(&monitoring_info_pair(base, 5)).expect("decodes");
+    assert!(decoded.offsets.is_empty(), "{:?}", decoded.offsets);
+    assert!(decoded.dropped.is_empty(), "{:?}", decoded.dropped);
 }
