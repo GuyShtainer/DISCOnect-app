@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Datelike, Duration, NaiveDate, Timelike};
+use chrono::{Datelike, Duration, NaiveDate};
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
@@ -551,7 +551,7 @@ fn local_minute(moment: Instant, offsets: &ClockOffsets) -> Result<String, ReadE
 
 /// `live_day`: the live link on one local day — its sessions (runs of `json:live` records whose spans
 /// overlap or touch, kept when their start or end falls on `day` on the watch's clock, each with its
-/// count of distinct folded minutes) and, per metric the fold keeps in contract order, the minutes
+/// count of distinct folded minutes from the first reading's minute) and, per metric the fold keeps in contract order, the minutes
 /// whose local day is `day` with their lower median (null when none).
 pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<Value, ReadError> {
     let date = parse_day(day, "day")?;
@@ -602,7 +602,7 @@ pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<V
     for (first, last) in &sessions {
         let (low, high) = (iso_utc(first), iso_utc(last));
         // the fold floors a reading to its minute, so the count starts at the first reading's minute
-        let minute = iso_utc(&first.with_second(0).ok_or(ReadError::Overflow)?);
+        let minute = first.format("%Y-%m-%dT%H:%M:00Z").to_string();
         let minutes: i64 = conn.query_row(
             "SELECT count(DISTINCT ts_utc) FROM metric_samples WHERE source_scope=? AND ts_utc BETWEEN ? AND ?",
             rusqlite::params![LIVE_SCOPE, minute, high],
