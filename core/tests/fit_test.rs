@@ -116,3 +116,47 @@ fn crc_mismatches_are_warnings_not_failures() {
         2
     );
 }
+
+/// A minimal FIT file: one `monitoring_info` message (global 103) stating `timestamp` and
+/// `local_timestamp` (both uint32, FIT seconds). The CRCs are zero; a mismatch is only a warning.
+fn monitoring_info_pair(timestamp: u32, local_timestamp: u32) -> Vec<u8> {
+    let mut records = vec![0x40, 0, 0, 103, 0, 2, 253, 4, 0x86, 0, 4, 0x86, 0x00];
+    records.extend_from_slice(&timestamp.to_le_bytes());
+    records.extend_from_slice(&local_timestamp.to_le_bytes());
+    let mut file = vec![14, 0x20, 0x5C, 0x08];
+    file.extend_from_slice(&u32::try_from(records.len()).expect("small").to_le_bytes());
+    file.extend_from_slice(b".FIT");
+    file.extend_from_slice(&[0, 0]);
+    file.extend_from_slice(&records);
+    file.extend_from_slice(&[0, 0]);
+    file
+}
+
+#[test]
+fn a_clock_offset_beyond_26_hours_is_dropped_and_counted_at_decode() {
+    let base: u32 = 1_100_000_000;
+    for (delta, kept) in [
+        (93_600_i64, true),
+        (-93_600, true),
+        (93_601, false),
+        (-93_601, false),
+        (100_000, false),
+        (0, true),
+    ] {
+        let local = u32::try_from(i64::from(base) + delta).expect("fits uint32");
+        let bytes = monitoring_info_pair(base, local);
+        let decoded = decode_fit(&bytes).expect("a dropped offset is not an error");
+        assert_eq!(decoded.offsets.len(), usize::from(kept), "delta {delta}");
+        if kept {
+            assert_eq!(decoded.offsets[0].offset_s, delta, "delta {delta}");
+            assert!(decoded.dropped.is_empty(), "delta {delta}");
+        } else {
+            assert_eq!(
+                decoded.dropped.get("clock_offset_out_of_range"),
+                Some(&1),
+                "delta {delta}"
+            );
+        }
+        assert_eq!(scan_clock_offsets(&bytes), decoded.offsets, "delta {delta}");
+    }
+}

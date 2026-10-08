@@ -196,6 +196,14 @@ pub fn shift(date: NaiveDate, days: i64) -> Result<NaiveDate, ReadError> {
         .ok_or(ReadError::Overflow)
 }
 
+/// ISO `[low, high)` bounds that over-fetch one day before `first` and two after `last`, clamped to the
+/// calendar (0001-01-01 .. 9999-12-31) instead of failing. Twin of Python's `coverage.fetch_window`.
+pub fn fetch_window(first: NaiveDate, last: NaiveDate) -> (String, String) {
+    let low = shift(first, -1).unwrap_or(first);
+    let high = shift(last, 2).unwrap_or(NaiveDate::from_ymd_opt(9999, 12, 31).unwrap_or(last));
+    (iso(low), iso(high))
+}
+
 /// `date.isoformat()`.
 pub fn iso(date: NaiveDate) -> String {
     format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
@@ -317,8 +325,7 @@ pub fn sample_day_aggregates(
     scopes: &[String],
 ) -> Result<BTreeMap<String, Vec<DayAggregate>>, ReadError> {
     // Local days can begin up to 14 h before/after their UTC namesake; over-fetch and filter.
-    let low = iso(shift(parse_date(start)?, -1)?);
-    let high = iso(shift(parse_date(end)?, 2)?);
+    let (low, high) = fetch_window(parse_date(start)?, parse_date(end)?);
     let mut buckets: BTreeMap<String, BTreeMap<String, Vec<f64>>> = BTreeMap::new();
     let mut statement = conn.prepare(
         "SELECT ts_utc, value, source_scope FROM metric_samples WHERE metric=? \
@@ -604,8 +611,7 @@ pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<V
         }));
     }
     // local days can begin up to 14 h before/after their UTC namesake; over-fetch and filter
-    let fetch_low = iso(shift(date, -1)?);
-    let fetch_high = iso(shift(date, 2)?);
+    let (fetch_low, fetch_high) = fetch_window(date, date);
     let mut metrics = Vec::new();
     for item in &contract.metrics {
         let folded = contract

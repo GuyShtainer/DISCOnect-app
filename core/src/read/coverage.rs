@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::ReadError;
-use super::queries::{iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
+use super::queries::{fetch_window, iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
 use crate::model::Instant;
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
@@ -300,8 +300,7 @@ fn present_days(
     }
     // Samples: resolve local dates once per UTC hour bucket, not per sample. Local days can begin up
     // to 14 h before/after their UTC namesake, so over-fetch one day each side.
-    let low = iso(shift(window.first, -1)?);
-    let high = iso(shift(window.last, 2)?);
+    let (low, high) = fetch_window(window.first, window.last);
     let mut statement = conn.prepare(
         "SELECT metric, source_scope, substr(ts_utc, 1, 13) FROM metric_samples \
          WHERE ts_utc >= ? AND ts_utc < ? GROUP BY 1, 2, 3",
@@ -724,8 +723,7 @@ fn worn_seconds(
     window: &Window,
     bounds: &[i64],
 ) -> Result<Vec<i64>, ReadError> {
-    let low = iso(shift(window.first, -1)?);
-    let high = iso(shift(window.last, 2)?);
+    let (low, high) = fetch_window(window.first, window.last);
     let mut seconds = vec![0; window.days];
     let mut previous: Option<i64> = None;
     let mut statement = conn.prepare(

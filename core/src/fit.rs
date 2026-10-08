@@ -41,6 +41,9 @@ pub struct FitDecodeError {
 }
 
 /// `date_time` values below this are system uptime, not wall time (FIT profile).
+/// A (timestamp, local timestamp) pair stating more than 26 h from UTC is dropped at decode.
+/// Twin of `MAX_CLOCK_OFFSET_S` in `fit_wellness.py`.
+const MAX_CLOCK_OFFSET_S: i64 = 26 * 3600;
 const MIN_WALL_SECS: i64 = 0x1000_0000;
 
 /// `stress_level` (message 227) field 3: the watch's own body-energy gauge, 0-100, one sample a
@@ -303,10 +306,12 @@ impl State {
     /// A (timestamp, local timestamp) pair states the watch's UTC offset.
     fn offset(&mut self, ts_utc: Option<Instant>, local: Option<Instant>) {
         if let (Some(ts), Some(local)) = (ts_utc, local) {
-            self.out.offsets.push(ClockOffset {
-                ts_utc: ts,
-                offset_s: (local - ts).num_seconds(),
-            });
+            let offset_s = (local - ts).num_seconds();
+            if offset_s.abs() > MAX_CLOCK_OFFSET_S {
+                self.out.drop("clock_offset_out_of_range");
+                return;
+            }
+            self.out.offsets.push(ClockOffset { ts_utc: ts, offset_s });
         }
     }
 

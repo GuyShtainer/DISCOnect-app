@@ -7,12 +7,12 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use disconect_core::contract::Contract;
 use disconect_core::keys::PassphraseSource;
 use disconect_core::live::T_LIMIT;
 use disconect_core::read::health::data_health;
-use disconect_core::read::queries::live_day;
+use disconect_core::read::queries::{fetch_window, live_day, load_offsets, sample_day_aggregates};
 use disconect_core::read::insight::{FactsQuery, period_facts};
 use disconect_core::wirejson::PyStr;
 use disconect_core::sources::{import_path, reparse_all};
@@ -282,4 +282,27 @@ fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
         let day = live_day(store.conn(), contract, &PyStr::from_text(asked)).expect("data.live skips the span");
         assert_eq!(day["sessions"], json!([]), "{asked}");
     }
+}
+
+#[test]
+fn reads_at_the_calendar_ends_answer_empty_instead_of_overflowing() {
+    // the over-fetch windows (-1 / +2 days) are clamped to 0001-01-01 .. 9999-12-31 (Python twin: test_live_fold.py)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open(&dir.path().join("s.db"));
+    let contract = Contract::get().expect("contract");
+    let offsets = load_offsets(store.conn()).expect("offsets");
+    for edge in ["0001-01-01", "9999-12-31"] {
+        let day = live_day(store.conn(), contract, &PyStr::from_text(edge)).expect("data.live");
+        assert_eq!(day["sessions"], json!([]), "{edge}");
+        assert!(day["metrics"].as_array().unwrap().iter().all(|m| m["minutes"] == json!(0)), "{edge}");
+        let found =
+            sample_day_aggregates(store.conn(), "heart_rate", edge, edge, &offsets, &["device".to_string()])
+                .expect("aggregates");
+        assert!(found.is_empty(), "{edge}");
+    }
+    let ymd = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+    let pair = |a: NaiveDate, b: NaiveDate| fetch_window(a, b);
+    assert_eq!(pair(ymd(1, 1, 1), ymd(1, 1, 1)), ("0001-01-01".to_string(), "0001-01-03".to_string()));
+    assert_eq!(pair(ymd(9999, 12, 31), ymd(9999, 12, 31)), ("9999-12-30".to_string(), "9999-12-31".to_string()));
+    assert_eq!(pair(ymd(9999, 12, 29), ymd(9999, 12, 29)), ("9999-12-28".to_string(), "9999-12-31".to_string()));
 }
