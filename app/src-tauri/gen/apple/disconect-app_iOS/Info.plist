@@ -41,7 +41,7 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>The Watch screen reads live values from your watch over Bluetooth. The watch is only read; nothing is written to it.</string>
+	<string>Only a development build on a Mac uses Bluetooth: its Watch screen can start a separate helper that reads live values from your watch. The watch is only read; nothing is written to it.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>DISCOnect syncs your own encrypted data with your computer on this network, in both directions.</string>
 	<key>NSAppTransportSecurity</key>

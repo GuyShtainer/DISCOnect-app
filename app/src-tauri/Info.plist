@@ -6,6 +6,6 @@
 	     of this app, so this app is the responsible process for macOS privacy) reads the watch over
 	     Bluetooth; without this string macOS kills the child (TCC, 2026-10-05). -->
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>The Watch screen reads live values from your watch over Bluetooth. The watch is only read; nothing is written to it.</string>
+	<string>Only a development build on a Mac uses Bluetooth: its Watch screen can start a separate helper that reads live values from your watch. The watch is only read; nothing is written to it.</string>
 </dict>
 </plist>
