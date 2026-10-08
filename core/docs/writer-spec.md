@@ -1,6 +1,6 @@
-# `writer` module — port spec (Bet 11 slice 1c)
+# `writer` module — port spec
 
-Source of truth: `projects/disconect/src/disconect/ingest/writer.py`, `ingest/clock.py`,
+Source of truth, in the Python core (<https://github.com/GuyShtainer/DISCOnect>): `src/disconect/ingest/writer.py`, `ingest/clock.py`,
 `ingest/sources.py`, `storage/_time.py`. Python wins on any disagreement; fix this page.
 
 ## Time text
@@ -37,7 +37,7 @@ else **`drop`** (verified in `sources.import_path`); `imported_at = now`. Duplic
    records_written += written, per-stream files/records, dropped reasons summed, first 3
    warnings kept up to 20) → IMPORTED.
 
-## Slice 2A surface (Bet 11b step 1)
+## The writer's surface
 - `write_fit(bytes, label, origin)` and `write_json_record(stream, source_key, record, decoded,
   label, origin)`: `origin = (transport, imported_at)` replaces the run's transport and now in
   `raw_records` (relay hop keeps provenance). JSON: duplicate test is `(stream, source_key)`
@@ -148,7 +148,7 @@ re-raise. Labels passed to `write_fit` are `mask_label(relative path)`: e-mail a
 `{email}`, long digit runs → `{id}`; labels appear only in the run's failure summary, never in a
 table.
 
-## Parity checklist for `tools/core_diff.py`
+## Parity checklist for the two-core differential test (`core_diff`, not published)
 Compare P and R on: `raw_records` (stream, source_key, source_scope, transport, device_id,
 start_utc, end_utc, payload_kind, payload_hash, payload_bytes, inflate(payload)); `metric_samples`
 (metric, ts_utc, value, source_scope, device_id, raw → (stream, source_key)); `daily_metrics` and

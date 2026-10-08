@@ -1,0 +1,30 @@
+# build products
+target/
+node_modules/
+dist/
+app/src-tauri/gen/apple/build/
+app/src-tauri/gen/apple/Externals/
+app/src-tauri/gen/apple/Pods/
+app/src-tauri/gen/apple/*.xcworkspace/xcuserdata/
+app/src-tauri/gen/apple/*.xcodeproj/xcuserdata/
+app/src-tauri/gen/apple/*.xcodeproj/project.xcworkspace/xcuserdata/
+app/src-tauri/resources/disconect-core/*
+!app/src-tauri/resources/disconect-core/README.txt
+app/src-tauri/resources/hearthbeat-core/*
+!app/src-tauri/resources/hearthbeat-core/README.txt
+# your data never enters the repo
+*.db
+*.db-wal
+*.db-shm
+*.hbdb-wal
+*.hbdb-shm
+*.fit
+*.FIT
+live-*.jsonl
+app/data/
+# Apple signing material
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+.DS_Store

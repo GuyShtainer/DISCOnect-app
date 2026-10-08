@@ -1,7 +1,8 @@
-# `fit` module — port spec (Bet 11 slice 1b)
+# `fit` module — port spec
 
-Source of truth: `projects/disconect/src/disconect/ingest/fit_wellness.py` (the oracle) and
-`docs/kb/21-fitparser-name-map.md` (parser differences). This page is the translation table;
+Source of truth: `src/disconect/ingest/fit_wellness.py` of the Python core
+(<https://github.com/GuyShtainer/DISCOnect>, the oracle) and the maintainer's unpublished name map of how
+`fitparser` and `fitdecode` differ ("the name map" below). This page is the translation table;
 when it and the Python disagree, the Python wins and this page is fixed.
 
 ## Shape of the output (`ingest/model.py`)
@@ -23,15 +24,15 @@ is stored in `raw_records.decode_summary` which the harness excludes, but keep t
 - Any decode error → `FitDecodeError { kind: "unrecognized_payload", message, stream: Some(stream)
   only if `file_id` was already seen, start_utc: seen_min, end_utc: seen_max }` (partial span kept).
 - **Dispatch by `(mesg_num, field_num)`.** Names below are documentation only.
-- Field reading helpers, applied to every field: absent ≡ invalid ≡ `""` ≡ None (kb/21 rules 2, 7);
+- Field reading helpers, applied to every field: absent ≡ invalid ≡ `""` ≡ None (name map rules 2, 7);
   `date_time` with raw < `0x10000000` ≡ None; developer fields (`developer_data_index.is_some()`)
   are skipped; `Value::Timestamp` → UTC instant via `with_timezone(&Utc)`; **`local_date_time`
   fields are recovered as FIT seconds by inverting fitparser's anchor** (`dt −
   Local.from_local_datetime(1989-12-31T00:00:00)`), then treated as a *wall clock read as UTC*:
   `local = FIT_EPOCH_UTC + seconds`.
 - `_text(enum)`: fitdecode gives the profile name when known, else the number as decimal text.
-  fitparser's newer profile names more values (kb/21 rule 1). For parity the port emits the
-  **number as text** whenever fitdecode 0.11's profile would (list in kb/21: sport 63/sub_sport
+  fitparser's newer profile names more values (name map rule 1). For parity the port emits the
+  **number as text** whenever fitdecode 0.11's profile would (list in the name map: sport 63/sub_sport
   77, event 78, file types 41/44/49/68/73/79 …); simplest correct rule: decode with
   `ReturnNumericEnumValues`, then map the number to a name through a small table of the enum
   names fitdecode knows for the five enums we store as text (`file_id.type`, `activity_type`,
@@ -66,7 +67,7 @@ stage)>`, `sleep_start/sleep_end`, `assessment: Option<map>`, `seen_min/seen_max
 | 18 | session | start_time(2), timestamp(253), sport(5), sub_sport(6), total_timer_time(8), total_elapsed_time(7), total_distance(9), total_calories(11), avg_heart_rate(16), max_heart_rate(17), enhanced_avg_speed(124) else avg_speed(14), total_ascent(22), total_descent(23) | start None → return; `_touch(start)`; `Activity{…}` with `_int` for calories/avg_hr/max_hr |
 
 Field numbers above come from the FIT profile as fitparser exposes them (`FitDataField::number`);
-verify each against the dump in `projects/fit-lab/parser-diff/` output before trusting this table.
+verify each against a field dump of a real file before trusting this table.
 
 ## Finish (`result()`)
 `_finish_sleep`: skip when no levels, no assessment and no start. Session(start=sleep_start,

@@ -1,1 +1,1 @@
-The PyInstaller sidecar lands here (tools/build-app.sh). Everything but this file is git-ignored.
+An optional packaged Python core (`hearthbeat-core`) may land here; this repository does not build it. Everything but this file is git-ignored.
