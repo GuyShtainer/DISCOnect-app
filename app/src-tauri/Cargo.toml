@@ -5,6 +5,7 @@ description = "DISCOnect app shell over the Rust core (in-process, or the sideca
 authors = ["Guy Shtainer"]
 license = "AGPL-3.0-or-later"
 edition = "2021"
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
