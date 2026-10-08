@@ -538,23 +538,34 @@ fn drop_sender(sender: mpsc::Sender<()>) {
 fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
     use disconect_core::relay::lan::{AUTH_HEADER, RESP_HEADER, resp_header_value, token_key, wall_clock};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
     let addr = listener.local_addr().expect("addr");
     let key = token_key(&master());
     let requests = Arc::new(AtomicUsize::new(0));
+    let methods = Arc::new(Mutex::new(Vec::<String>::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let (counter, stopped) = (Arc::clone(&requests), Arc::clone(&stop));
+    let (counter, seen, stopped) = (Arc::clone(&requests), Arc::clone(&methods), Arc::clone(&stop));
     // A fake relay that answers every request with a 401 tagged under the right key and a server clock
-    // 10 minutes ahead. It owns the port until the test ends (a listener dropped early frees a port the
-    // process's next relay server may rebind, and that one's answer is not this test's), it reads each
-    // request whole before answering (closing with an unread body is a reset, which the client reads as
-    // unreachable), and it counts the requests the client made.
+    // 10 minutes ahead. Hygiene, not a found cause (the relay-test flake row, 2026-10-08: the peer saw this
+    // test answer `not_found` once in seven full-suite runs on the simulator; neither a freed port nor a
+    // reset on close held up — the old fake's thread never dropped its listener, and the kernel delivers a
+    // queued answer before it reports the reset): the fake owns its port for the test's life, reads each
+    // request whole (headers, then the Content-Length body) so its close is a FIN, bounds every wait, and
+    // records what the client sent so the next failure says which `not_found` it was.
     let thread = std::thread::spawn(move || {
         while !stopped.load(Ordering::SeqCst) {
-            let Ok((mut stream, _)) = listener.accept() else { return };
-            if stopped.load(Ordering::SeqCst) {
-                return; // the test's wake-up connection
-            }
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(_) => return,
+            };
+            stream.set_nonblocking(false).expect("blocking"); // an accepted socket inherits O_NONBLOCK here
+            stream.set_read_timeout(Some(Duration::from_secs(10))).expect("read timeout");
             counter.fetch_add(1, Ordering::SeqCst);
             let mut raw = Vec::new();
             let mut chunk = [0u8; 4096];
@@ -571,6 +582,7 @@ fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
             let mut lines = head.split("\r\n");
             let mut first = lines.next().unwrap_or("").split(' ');
             let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+            seen.lock().expect("methods").push(method.to_string());
             let headers: Vec<(String, String)> = lines
                 .filter_map(|l| l.split_once(':'))
                 .map(|(n, v)| (n.to_ascii_lowercase(), v.trim().to_string()))
@@ -596,15 +608,16 @@ fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
     rig.unlock();
     let lines = rig.send(1, "sync.run", json!({}));
     let error = &only_response(&lines)["error"];
-    assert_eq!(error["code"], "relay_auth_failed");
+    let sent = methods.lock().expect("methods").clone();
+    assert_eq!(error["code"], "relay_auth_failed", "{error}; requests {sent:?}");
     assert!(
         error["message"].as_str().expect("message").contains("10 minutes off the relay's"),
         "{error}"
     );
     // the push's one PUT: the refusal ends the run (no retry, no pull) on this transport
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(sent, ["PUT"]);
     stop.store(true, Ordering::SeqCst);
-    drop(std::net::TcpStream::connect(addr)); // wake the accept so the thread sees the flag
     thread.join().expect("fake relay thread");
 }
 
