@@ -322,6 +322,36 @@ fn the_passphrase_variable_is_ignored_and_never_printed() {
 }
 
 #[test]
+fn a_read_that_overflows_is_the_bare_tool_error_text() {
+    // the MCP arm of the OverflowError pin (serve_test.rs / test_serve.py pin the serve wire): `Outcome::Crashed`
+    // is the framework's bare text, no detail — the oracles no longer carry one since the window clamp
+    let (_dir, db) = plain_store();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "INSERT INTO raw_records(stream, source_key, source_scope, transport, payload_kind, payload, payload_hash, \
+         payload_bytes, imported_at) VALUES('fit:monitoring_b','k','device','usb','fit',x'00','h',1,'2025-07-01T00:00:00Z')",
+        [],
+    )
+    .expect("raw record");
+    for day in ["2025-06-29", "2025-06-30"] {
+        conn.execute(
+            "INSERT INTO daily_metrics(date, metric, value, source_scope, device_id, raw_record_id) \
+             VALUES(?1,'steps',1e308,'device','7',1)",
+            [day],
+        )
+        .expect("daily row");
+    }
+    drop(conn);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_period_facts","arguments":{"end_date":"2025-06-30"}}}"#;
+    let (code, lines, _) = run(command(&db, dir.path()), &format!("{INIT}\n{call}\n"));
+    assert_eq!(code, Some(0));
+    let answer = &parsed(&lines)[1]["result"];
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert_eq!(answer["content"][0]["text"], "Error executing tool get_period_facts");
+}
+
+#[test]
 fn a_missing_store_still_serves_and_names_what_is_missing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("never.hbdb");

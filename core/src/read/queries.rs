@@ -114,7 +114,8 @@ pub fn parse_date(text: &str) -> Result<NaiveDate, ReadError> {
 /// `parse_day`: `YYYY-MM-DD` and nothing else, as a request's own text (which may hold a lone
 /// surrogate). Any other text, and a shape-correct day that is not on the calendar, is
 /// `ValueError("<name> must be YYYY-MM-DD")`. It never overflows: `9999-12-31` and `0001-01-01` parse;
-/// the `OverflowError` comes later, from the date arithmetic ([`window`], [`sample_day_aggregates`]).
+/// the window is clamped ([`earlier`]); an `OverflowError` comes only from a stored stamp whose local day
+/// leaves the calendar ([`local_day`], [`sample_day_aggregates`]).
 pub fn parse_day(text: &PyStr, name: &str) -> Result<NaiveDate, ReadError> {
     text.to_text()
         .and_then(|plain| parse_date(&plain).ok())
@@ -127,7 +128,7 @@ pub fn today_utc() -> NaiveDate {
 }
 
 /// `_window`: `(from, to)` of the `days` (clamped to `1..=cap`) ending on `end_date`, or on today's UTC date
-/// when it is absent or empty. `OverflowError` where the start leaves Python's date range.
+/// when it is absent or empty. A start before the calendar is cut at 0001-01-01 ([`earlier`]), never an error.
 pub fn window(
     days: i64,
     end_date: Option<&PyStr>,
@@ -202,21 +203,24 @@ pub const CALENDAR_START: NaiveDate = match NaiveDate::from_ymd_opt(1, 1, 1) {
     None => unreachable!(),
 };
 
+/// The calendar's last day.
+pub const CALENDAR_END: NaiveDate = match NaiveDate::from_ymd_opt(9999, 12, 31) {
+    Some(date) => date,
+    None => unreachable!(),
+};
+
 /// `days` days before `day`, never before the calendar's first day (0001-01-01): a window that would start
 /// before the calendar is shortened instead of failing the read (the rule `fetch_window` applies at the
-/// ends). Twin of Python's `coverage.earlier`.
+/// ends). Defined for `days >= 0` only (every caller passes a count); a negative `days` reads as 0, so the
+/// answer is never after `day`. Twin of Python's `coverage.earlier`.
 pub fn earlier(day: NaiveDate, days: i64) -> NaiveDate {
-    shift(day, days.checked_neg().unwrap_or(i64::MAX)).unwrap_or(CALENDAR_START)
+    shift(day, -days.max(0)).unwrap_or(CALENDAR_START)
 }
 
 /// ISO `[low, high)` bounds that over-fetch one day before `first` and two after `last`, clamped to the
 /// calendar (0001-01-01 .. 9999-12-31) instead of failing. Twin of Python's `coverage.fetch_window`.
 pub fn fetch_window(first: NaiveDate, last: NaiveDate) -> (String, String) {
-    let low = shift(first, -1).unwrap_or(first);
-    const CALENDAR_END: NaiveDate = match NaiveDate::from_ymd_opt(9999, 12, 31) {
-        Some(date) => date,
-        None => unreachable!(),
-    };
+    let low = earlier(first, 1);
     let high = shift(last, 2).unwrap_or(CALENDAR_END);
     (iso(low), iso(high))
 }

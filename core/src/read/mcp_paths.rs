@@ -75,8 +75,8 @@ fn object<const N: usize>(pairs: [(&str, Json); N]) -> Json {
 /// metric, so two series of one answer can start on different days). Names are served once each, in
 /// request order, but a label asked twice is answered twice; an unknown name lands in
 /// `ignored_metrics`; a known metric with no data in the window is one series with a null scope and a
-/// note. Errors, in Python's order: `source_scope`, then per metric `end_date` (`ValueError`) and the
-/// window arithmetic (`OverflowError`).
+/// note. Errors, in Python's order: `source_scope`, then per metric `end_date` (`ValueError`) and a stored
+/// stamp whose local day leaves the calendar (`OverflowError`); the window itself is clamped, never an error.
 pub fn metric_series(
     conn: &Connection,
     metrics: &[PyStr],

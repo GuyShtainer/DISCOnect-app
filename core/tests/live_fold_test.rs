@@ -358,7 +358,8 @@ fn a_window_that_would_start_before_the_calendar_is_shortened() {
     assert_eq!(earlier(jan, 4), ymd(1, 1, 1));
     assert_eq!(earlier(jan, 5), ymd(1, 1, 1));
     assert_eq!(earlier(jan, 1_000_000_000), ymd(1, 1, 1));
-    assert_eq!(earlier(jan, i64::MIN), ymd(1, 1, 1)); // the one negation that overflows is still the start
+    assert_eq!(earlier(jan, -5), jan); // outside the domain: a negative count reads as 0, never a later day
+    assert_eq!(earlier(jan, i64::MIN), jan);
     assert_eq!(earlier(ymd(9999, 12, 31), 1), ymd(9999, 12, 30));
     let end = disconect_core::wirejson::PyStr::from_text("0001-01-03");
     assert_eq!(window(7, Some(&end), 30).expect("window"), ("0001-01-01".to_string(), "0001-01-03".to_string()));

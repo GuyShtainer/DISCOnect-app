@@ -839,7 +839,7 @@ fn data_metric(session: &mut Session, call: &Call) -> Result<Value, Failure> {
         Some(text) => queries::parse_day(&text, "last_day")?,
         None => queries::parse_date(&queries::local_today(conn)?)?,
     };
-    let first = queries::earlier(last, days.clamp(1, cap) - 1); // shortened at the calendar's start, never internal
+    let first = queries::earlier(last, days.clamp(1, cap) - 1); // the window is shortened at the calendar's start, never an error
     let series = queries::metric_calendar(
         conn,
         contract,

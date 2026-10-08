@@ -522,6 +522,35 @@ fn a_malformed_clock_offset_cell_reads_as_strptimes_text() {
     }
 }
 
+#[test]
+fn a_mean_the_float_cannot_hold_is_internal_unexpected_overflowerror() {
+    // the twin of test_serve.py's test of the same name: the one OverflowError the oracles no longer carry
+    let (_dir, db) = plain_store();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    two_huge_step_days(&conn);
+    let reply = Rig::new(&db).send("data.facts", json!({"days": 7, "baseline_days": 28}));
+    assert_eq!(reply["error"]["code"], "internal", "{reply}");
+    assert_eq!(reply["error"]["message"], "unexpected OverflowError");
+}
+
+/// Two daily `steps` values of 1e308: their mean overflows Python's `fsum` (and the Rust twin answers `None`).
+fn two_huge_step_days(conn: &rusqlite::Connection) {
+    conn.execute(
+        "INSERT INTO raw_records(stream, source_key, source_scope, transport, payload_kind, payload, payload_hash, \
+         payload_bytes, imported_at) VALUES('fit:monitoring_b','k','device','usb','fit',x'00','h',1,'2025-07-01T00:00:00Z')",
+        [],
+    )
+    .expect("raw record");
+    for day in ["2025-06-29", "2025-06-30"] {
+        conn.execute(
+            "INSERT INTO daily_metrics(date, metric, value, source_scope, device_id, raw_record_id) \
+             VALUES(?1,'steps',1e308,'device','7',1)",
+            [day],
+        )
+        .expect("daily row");
+    }
+}
+
 fn only_offsets(conn: &rusqlite::Connection, pairs: &[(&str, i64)]) {
     conn.execute("DELETE FROM clock_offsets", []).expect("delete");
     for (moment, seconds) in pairs {

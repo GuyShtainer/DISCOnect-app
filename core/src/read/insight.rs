@@ -346,7 +346,8 @@ pub fn period_facts(conn: &Connection, query: &FactsQuery) -> Result<Value, Read
 /// no data in either range is a `no_data` fact, an unrequested one is omitted; a name the contract does not
 /// know (a label included) is listed in `ignored_metrics`. Without a `source_scope` the session scope
 /// `live` is left out (`fact_scopes_for`). Errors, in Python's order: `source_scope`,
-/// `end_date` (`ValueError`), then the window arithmetic and the sample over-fetch (`OverflowError`).
+/// `end_date` (`ValueError`), then a stored stamp whose local day leaves the calendar and a mean the float
+/// cannot hold (`OverflowError`); the window and baseline bounds are clamped, never an error.
 pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Json, ReadError> {
     let contract = Contract::get()?;
     let window_days = query.window_days.clamp(1, MAX_WINDOW_DAYS);
@@ -386,7 +387,8 @@ pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Jso
     };
     let end = parse_date(&as_of)?;
     // a window or baseline that would start before the calendar is shortened (at the extreme the baseline is
-    // the calendar's first day, which the window also holds) instead of failing the read
+    // the calendar's first day, which the window also holds) instead of failing the read; a one-day baseline
+    // never forms a comparison (MIN_BASELINE_DAYS >= 2), so the overlap decides nothing
     let window_start = earlier(end, window_days - 1);
     let baseline_end = earlier(window_start, 1);
     let baseline_start = earlier(baseline_end, baseline_days - 1);
