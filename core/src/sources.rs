@@ -396,7 +396,7 @@ pub fn import_path_with(
     }
     let is_export = looks_like_export(path);
     let transport = transport.unwrap_or(if is_export { TRANSPORT_CONNECT_EXPORT } else { TRANSPORT_DROP });
-    let mut writer = Writer::new(conn, ClockOffsets::load(conn)?, transport);
+    let mut writer = Writer::new(conn, ClockOffsets::load_for_write(conn)?, transport);
     writer.begin_run()?;
     let outcome = if is_export {
         export::collect_fit_members(path)
@@ -575,7 +575,7 @@ pub fn rederive_json(conn: &Connection, writer: &mut Writer<'_>, streams: &[Stri
         return Ok(());
     }
     let assumed = writer.offsets.assumed_utc();
-    writer.offsets = ClockOffsets::load(conn)?; // what a reparse would see
+    writer.offsets = ClockOffsets::load_for_write(conn)?; // what a reparse would see
     writer.offsets.set_assumed_utc(assumed);
     let mut decodable: Vec<(i64, Decoded)> = Vec::new();
     let mut undecodable: Vec<i64> = Vec::new();
@@ -847,7 +847,7 @@ fn clear_failures(conn: &Connection, raw_ids: &[i64]) -> rusqlite::Result<()> {
 /// first; `json:readiness` is redecoded as one batch. Everything is decoded once before anything
 /// is cleared: if any fails, nothing is touched and the run finishes `failed` unless `force`.
 pub fn reparse_all(conn: &Connection, streams: Option<&[String]>, force: bool) -> Result<ImportStats, SourceError> {
-    let mut writer = Writer::new(conn, ClockOffsets::load(conn)?, "reparse");
+    let mut writer = Writer::new(conn, ClockOffsets::load_for_write(conn)?, "reparse");
     writer.begin_run()?;
     let outcome = reparse_body(conn, &mut writer, streams, force);
     match outcome {
@@ -912,7 +912,7 @@ fn reparse_body(
     for raw_id in fit_ids {
         reparse_record(conn, writer, raw_id)?;
     }
-    writer.offsets = ClockOffsets::load(conn)?; // pick up any offset a FIT reparse just corrected
+    writer.offsets = ClockOffsets::load_for_write(conn)?; // pick up any offset a FIT reparse just corrected
     for raw_id in json_ids {
         reparse_record(conn, writer, raw_id)?;
     }

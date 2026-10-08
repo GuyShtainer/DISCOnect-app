@@ -553,3 +553,100 @@ fn a_missing_path_is_not_found_with_the_path_redacted_and_normalised_like_pathli
         "no such file or folder: nothing"
     );
 }
+
+// ---- write-path stamp rows (BACKLOG 477, 478): a hand-edited stored stamp on an import ----
+
+const STAMP_TEXT: &str = "time data '2025-06-15T12:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'";
+
+/// A fresh store holding one raw record and one hand-edited row (`seed_sql`), and a folder with the one
+/// synthetic monitoring FIT (device 42, 2025-06-15T06:00Z; steps intervals and stress samples).
+fn corrupt_import_rig(seed_sql: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (dir, db) = new_store();
+    let folder = dir.path().join("drop");
+    write(&folder, "a.fit", &fixture_fit("monitoring_sentinels_counters"));
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "INSERT INTO raw_records(stream, source_key, source_scope, transport, payload_kind, payload, payload_hash, \
+         payload_bytes, imported_at) VALUES('fit:monitoring_b','k','device','usb','fit',x'00','h',1,'2025-07-01T00:00:00Z')",
+        [],
+    )
+    .expect("raw");
+    conn.execute(seed_sql, []).expect("hand-edited row");
+    (dir, db, folder)
+}
+
+type RunRow = (i64, String, i64, i64, i64, i64, Option<String>);
+
+/// What an import leaves in the store: the run rows (no timestamps) and the table counts.
+fn import_store_state(db: &Path) -> (Vec<RunRow>, [i64; 4]) {
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, status, files_seen, files_imported, files_failed, records_written, error \
+             FROM import_runs ORDER BY id",
+        )
+        .expect("prepare");
+    let runs = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows");
+    let mut counts = [0_i64; 4];
+    for (at, table) in ["raw_records", "daily_metrics", "metric_samples", "monitoring_intervals"].iter().enumerate() {
+        counts[at] = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).expect("count");
+    }
+    (runs, counts)
+}
+
+fn error_of(lines: &[Value]) -> (String, String) {
+    let reply = lines.last().expect("response");
+    (
+        reply["error"]["code"].as_str().unwrap_or_default().to_string(),
+        reply["error"]["message"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+#[test]
+fn import_over_a_malformed_clock_offset_cell_is_bad_params_and_leaves_the_store_alone() {
+    // the twin of test_serve.py's test of the same name: the offsets load fails before `begin_run`
+    let (_dir, db, folder) =
+        corrupt_import_rig("INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15 00:00:00', 0)");
+    let before = import_store_state(&db);
+    let lines = Rig::new(&db).send(1, "import.run", json!({"path": folder}));
+    assert_eq!(
+        error_of(&lines),
+        (
+            "bad_params".to_string(),
+            "time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'".to_string()
+        )
+    );
+    assert!(before.0.is_empty());
+    assert_eq!(import_store_state(&db), before);
+}
+
+#[test]
+fn import_over_an_unparseable_derivation_cell_is_bad_params_and_the_run_is_booked_failed() {
+    // the twin of test_serve.py's test of the same name; the steps derivation fails first, the samples one after it
+    let failed = |counts: [i64; 4]| {
+        (vec![(1, "failed".to_string(), 1, 1, 0, 12, Some(format!("ValueError: {STAMP_TEXT}")))], counts)
+    };
+    for (seed_sql, state) in [
+        (
+            "INSERT INTO monitoring_intervals(ts_utc, activity_type, steps, source_scope, device_id, raw_record_id) \
+             VALUES('2025-06-15T12:00:00','walking',5,'device','42',1)",
+            failed([2, 3, 7, 2]),
+        ),
+        (
+            "INSERT INTO metric_samples(ts_utc, metric, value, source_scope, device_id, raw_record_id) \
+             VALUES('2025-06-15T12:00:00','stress',5,'device','42',1)",
+            failed([2, 11, 8, 1]),
+        ),
+    ] {
+        let (_dir, db, folder) = corrupt_import_rig(seed_sql);
+        let lines = Rig::new(&db).send(1, "import.run", json!({"path": folder}));
+        assert_eq!(error_of(&lines), ("bad_params".to_string(), STAMP_TEXT.to_string()), "{seed_sql}");
+        assert_eq!(import_store_state(&db), state, "{seed_sql}");
+    }
+}

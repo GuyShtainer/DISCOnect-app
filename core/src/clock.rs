@@ -52,6 +52,17 @@ impl ClockOffsets {
         Ok(offsets)
     }
 
+    /// [`load`](Self::load) for a write path: a malformed cell is the twin's `ValueError` raised before the run
+    /// begins (`BadStamp`, served `bad_params`); any other failure, a non-UTF-8 cell included, is a database error.
+    pub fn load_for_write(conn: &Connection) -> Result<Self, crate::writer::WriterError> {
+        Self::load(conn).map_err(|error| match error {
+            rusqlite::Error::FromSqlConversionFailure(_, _, inner) if inner.is::<BadStamp>() => {
+                crate::writer::WriterError::BadStamp(inner.to_string())
+            }
+            other => crate::writer::WriterError::Db(other),
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.moments.len()
     }
@@ -227,5 +238,25 @@ mod tests {
         let loaded = ClockOffsets::load(&conn).expect("load");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.offset_at(at(1_700_000_001)), Some(3600));
+    }
+
+    #[test]
+    fn load_for_write_maps_a_bad_stamp_to_the_value_arm_and_anything_else_to_the_database_arm() {
+        use crate::writer::WriterError;
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch("CREATE TABLE clock_offsets(ts_utc TEXT NOT NULL, offset_s INTEGER NOT NULL)").expect("table");
+        conn.execute("INSERT INTO clock_offsets VALUES('2025-06-15 00:00:00', 0)", []).expect("row");
+        match ClockOffsets::load_for_write(&conn) {
+            Err(WriterError::BadStamp(text)) => {
+                assert_eq!(text, "time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'");
+            }
+            other => panic!("expected BadStamp, got {other:?}"),
+        }
+        // a cell that is not UTF-8 is a database error on both cores
+        conn.execute("UPDATE clock_offsets SET ts_utc = CAST(x'ff' AS TEXT)", []).expect("non-utf8");
+        assert!(matches!(ClockOffsets::load_for_write(&conn), Err(WriterError::Db(_))));
+        // a table the store lacks is a database error too
+        conn.execute_batch("DROP TABLE clock_offsets").expect("drop");
+        assert!(matches!(ClockOffsets::load_for_write(&conn), Err(WriterError::Db(_))));
     }
 }

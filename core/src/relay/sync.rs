@@ -1184,7 +1184,7 @@ fn pull_core(
         report_gaps(conn, &mut result)?;
         return Ok(result);
     }
-    let mut writer = Writer::new(conn, ClockOffsets::load(conn)?, TRANSPORT_RELAY);
+    let mut writer = Writer::new(conn, ClockOffsets::load_for_write(conn)?, TRANSPORT_RELAY);
     writer.begin_run()?;
     if let Err(error) = apply_pending(
         conn,

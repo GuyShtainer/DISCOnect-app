@@ -22,7 +22,7 @@ use crate::clock::ClockOffsets;
 use crate::fit::{self, FitDecodeError};
 use crate::model::{Decoded, Instant, SleepSession};
 use crate::redact::redact_text;
-use crate::time::{iso_utc, parse_iso_utc, parse_store_stamp, utc_now_iso};
+use crate::time::{iso_utc, parse_store_stamp, utc_now_iso};
 
 /// Readings further apart than this are not consecutive: the watch recorded nothing in between.
 const STEP_GAP_MAX_S: i64 = 15 * 60;
@@ -34,8 +34,10 @@ pub enum WriterError {
     #[error("{0}")]
     Compress(String),
     /// A span stamp that is not the store's shape: `parse_iso_utc` raises `ValueError` in the
-    /// oracle's `keep_undecodable_record`, outside any handler, so the pull aborts.
-    #[error("{0}")]
+    /// oracle's `keep_undecodable_record`, outside any handler, so the pull aborts. Also a stored
+    /// `ts_utc` the daily derivations or the clock-offset load refuse. Displays as the failed run's
+    /// recorded error (`ValueError: <strptime's text>`); the serve wire carries the bare text.
+    #[error("ValueError: {0}")]
     BadStamp(String),
 }
 
@@ -1166,7 +1168,7 @@ impl<'c> Writer<'c> {
     /// is the sum over types. The record stamped exactly at local midnight closes the day just
     /// ended, so a record is dated by the moment one second before its timestamp. Written as
     /// source_scope `local`. Returns the step-day rows upserted.
-    pub fn derive_daily_steps(&mut self) -> rusqlite::Result<i64> {
+    pub fn derive_daily_steps(&mut self) -> Result<i64, WriterError> {
         let Some((span_lo, span_hi)) = self.interval_span else { return Ok(0) };
         let low = iso_utc(&(span_lo - Duration::days(1)));
         let high = iso_utc(&(span_hi + Duration::days(1)));
@@ -1190,7 +1192,7 @@ impl<'c> Writer<'c> {
             let mut per_day: BTreeMap<String, Vec<TypeMax>> = BTreeMap::new();
             let mut latest: BTreeMap<String, (String, i64)> = BTreeMap::new();
             for (ts_text, activity_type, steps, distance, raw_id) in rows {
-                let Some(moment) = parse_iso_utc(&ts_text) else { continue };
+                let moment = parse_store_stamp(&ts_text).map_err(WriterError::BadStamp)?; // strptime's text, like the oracle
                 let date = self.offsets.local_date(moment - second);
                 if !(first_day <= date && date <= last_day) {
                     continue;
@@ -1236,7 +1238,7 @@ impl<'c> Writer<'c> {
 
     /// Daily stress average, heart-rate min/max and energy-gauge figures from the device samples
     /// written this run, as source_scope `local`. Returns day rows upserted.
-    pub fn derive_daily_from_samples(&mut self) -> rusqlite::Result<i64> {
+    pub fn derive_daily_from_samples(&mut self) -> Result<i64, WriterError> {
         let Some((span_lo, span_hi)) = self.sample_span else { return Ok(0) };
         let low = iso_utc(&(span_lo - Duration::days(1)));
         let high = iso_utc(&(span_hi + Duration::days(1)));
@@ -1263,7 +1265,7 @@ impl<'c> Writer<'c> {
                 let mut per_day: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
                 let mut latest: BTreeMap<String, (String, i64)> = BTreeMap::new();
                 for (ts_text, value, raw_id) in rows {
-                    let Some(moment) = parse_iso_utc(&ts_text) else { continue };
+                    let moment = parse_store_stamp(&ts_text).map_err(WriterError::BadStamp)?; // strptime's text, like the oracle
                     let date = self.offsets.local_date(moment);
                     if !(first_day <= date && date <= last_day) {
                         continue;
