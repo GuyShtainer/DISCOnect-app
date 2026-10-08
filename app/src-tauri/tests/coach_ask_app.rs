@@ -24,10 +24,6 @@ use common::socket::Server;
 
 const NOW: &str = "2025-07-02T09:30:00Z";
 
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
-}
-
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
@@ -74,7 +70,7 @@ fn rig(dir: &Scratch) -> (tauri::App<tauri::test::MockRuntime>, PathBuf, MutexGu
     let guard = serial();
     env_init();
     let db = dir.0.join("store.hbdb");
-    std::fs::copy(repo().join("projects/disconect/tests/fixtures/serve/synthetic.hbdb"), &db).expect("copy the synthetic store");
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../disconect/tests/fixtures/serve/synthetic.hbdb"), &db).expect("copy the synthetic store");
     let core = Sidecar::start_inproc(db, Arc::new(Quiet)).expect("in-process core");
     let app = tauri::test::mock_builder()
         .manage(Core(Ok(core)))

@@ -27,8 +27,10 @@ use serde_json::{json, Value};
 const NOW: &str = "2025-07-02T09:30:00Z";
 const PASSPHRASE: &str = "core-test-passphrase-2026"; // the committed fixture key's passphrase (synthetic)
 
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..")
+/// The core crate, spelled so that the one `../../core` => `../../core` rewrite of the standalone
+/// repository's history split reaches it.
+fn core_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../core")
 }
 
 struct Scratch(PathBuf);
@@ -66,7 +68,7 @@ fn env_init() {
 }
 
 fn synthetic_copy(dir: &Scratch, name: &str) -> PathBuf {
-    let src = repo().join("projects/disconect/tests/fixtures/serve/synthetic.hbdb");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../disconect/tests/fixtures/serve/synthetic.hbdb");
     let dst = dir.0.join(name);
     std::fs::copy(src, &dst).expect("copy the synthetic store");
     dst
@@ -108,7 +110,7 @@ fn inproc_lines(db: &Path, input: &str) -> Vec<String> {
 fn core_binary() -> PathBuf {
     // On iOS the comparison binary is the simulator build of the core (a macOS one cannot run there).
     let triple = if cfg!(target_os = "ios") { "aarch64-apple-ios-sim/" } else { "" };
-    let bin = repo().join(format!("projects/disconect-core/target/{triple}debug/disconect-core"));
+    let bin = core_dir().join(format!("target/{triple}debug/disconect-core"));
     assert!(
         bin.is_file(),
         "build the sidecar to compare with: cargo build in projects/disconect-core"
@@ -264,7 +266,7 @@ async fn a_fit_that_panics_the_parser_fails_the_file_not_the_app() {
     let inbox = dir.0.join("inbox");
     std::fs::create_dir_all(&inbox).expect("mkdir");
     std::fs::copy(
-        repo().join("projects/disconect-core/tests/fixtures/synthetic/hdr255.fit.bin"),
+        core_dir().join("tests/fixtures/synthetic/hdr255.fit.bin"),
         inbox.join("hdr255.fit"),
     )
     .expect("copy hdr255");
@@ -285,7 +287,7 @@ async fn a_fit_that_panics_the_parser_fails_the_file_not_the_app() {
     // fitparser itself panic (it slices `input[0..253]`); the core's `catch_unwind` turns that into a failed
     // file. Guard that the bytes still panic the parser in this build (a fitparser upgrade that fixed it
     // would otherwise leave this test proving nothing):
-    let bytes = std::fs::read(repo().join("projects/disconect-core/tests/fixtures/synthetic/hdr255.fit.bin")).expect("read hdr255");
+    let bytes = std::fs::read(core_dir().join("tests/fixtures/synthetic/hdr255.fit.bin")).expect("read hdr255");
     let direct = disconect_core::fit::decode_fit(&bytes).expect_err("hdr255 does not decode");
     assert_eq!(direct.kind, "unrecognized_payload");
     assert!(direct.message.contains("parser panicked on this input"), "{}", direct.message);
@@ -400,7 +402,7 @@ async fn the_environment_passphrase_is_never_an_unlock_path_in_process() {
     env_init();
     let dir = scratch();
     let db = dir.0.join("store.hbdb");
-    let fixtures = repo().join("projects/disconect-core/tests/fixtures");
+    let fixtures = core_dir().join("tests/fixtures");
     std::fs::copy(fixtures.join("empty-v3.hbdb"), &db).expect("copy db");
     std::fs::copy(
         fixtures.join("test.keys.json"),
