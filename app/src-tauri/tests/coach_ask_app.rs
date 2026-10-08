@@ -89,6 +89,7 @@ fn local(port: u16) -> Settings {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn a_question_through_the_app_handle_calls_a_tool_on_the_core_and_returns_its_trace() {
     let dir = scratch();
     let (app, config, _serial) = rig(&dir);
@@ -119,6 +120,7 @@ fn a_question_through_the_app_handle_calls_a_tool_on_the_core_and_returns_its_tr
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn the_gate_reads_the_saved_settings_again_before_every_request_and_off_stops_the_next_question() {
     let dir = scratch();
     let (app, config, _serial) = rig(&dir);

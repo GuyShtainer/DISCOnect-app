@@ -18,6 +18,7 @@ mod common;
 use common::fixtures::{all_answers, has_clock_time, sendable, within_coach_limits, Answer, SENDABLE, STORES};
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn the_fixtures_hold_the_expected_calls() {
     let all = all_answers();
     for store in STORES {
@@ -30,6 +31,7 @@ fn the_fixtures_hold_the_expected_calls() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn every_sendable_answer_projects_validates_and_carries_no_clock_text_or_log() {
     let all = all_answers();
     let mut checked = 0;
@@ -52,6 +54,7 @@ fn every_sendable_answer_projects_validates_and_carries_no_clock_text_or_log() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn the_contract_answer_is_never_sent() {
     let all = all_answers();
     let contracts: Vec<_> = all.iter().filter(|a| a.tool == "get_contract").collect();
@@ -63,6 +66,7 @@ fn the_contract_answer_is_never_sent() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn every_projection_fits_its_budget_and_the_numbers_are_recorded() {
     let all = all_answers();
     // tool -> (max raw, max projected, max fitted) over every call / over the calls the coach would make
@@ -124,6 +128,7 @@ fn every_projection_fits_its_budget_and_the_numbers_are_recorded() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn a_raw_answer_is_refused_by_the_schema() {
     let all = all_answers();
     let mut refused = 0;
@@ -140,6 +145,7 @@ fn a_raw_answer_is_refused_by_the_schema() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn an_injected_timestamp_free_text_key_or_datetime_date_fails_validation() {
     let all = all_answers();
     let activities = all
@@ -169,6 +175,7 @@ fn an_injected_timestamp_free_text_key_or_datetime_date_fails_validation() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn sleep_sessions_keep_order_and_minutes_and_lose_every_clock() {
     let all = all_answers();
     let with_stages = all
@@ -191,6 +198,7 @@ fn sleep_sessions_keep_order_and_minutes_and_lose_every_clock() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn health_keeps_days_and_counts_and_drops_the_import_log() {
     let all = all_answers();
     let health = all.iter().find(|a| a.tool == "get_data_health" && a.store == "synthetic").expect("health");
@@ -207,6 +215,7 @@ fn health_keeps_days_and_counts_and_drops_the_import_log() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn facts_default_to_no_points_and_the_toggle_brings_them_back() {
     let all = all_answers();
     let points = all
@@ -222,6 +231,7 @@ fn facts_default_to_no_points_and_the_toggle_brings_them_back() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn clamped_arguments_never_exceed_the_coach_limits_for_any_fixture_request() {
     let all = all_answers();
     for a in &all {

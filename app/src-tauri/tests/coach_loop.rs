@@ -341,6 +341,7 @@ fn assert_pairing_in_turns(conv: &Conversation) {
 // ---- the five evals -----------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn eval_1_a_coverage_gap_reaches_the_model_projected_and_the_answer_cites_its_dates() {
     let args = r#"{"metrics":["steps"]}"#;
     let expected = oracle().expected("get_metric_series", args);
@@ -374,6 +375,7 @@ fn eval_1_a_coverage_gap_reaches_the_model_projected_and_the_answer_cites_its_da
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn eval_2_an_insufficient_baseline_passes_projected_and_the_model_says_insufficient_data() {
     let expected = oracle().expected("get_period_facts", "{}");
     let view: Value = serde_json::from_str(&expected).expect("json");
@@ -402,6 +404,7 @@ fn eval_2_an_insufficient_baseline_passes_projected_and_the_model_says_insuffici
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn eval_3_a_label_metric_sends_its_labels_and_no_values() {
     let args = r#"{"metrics":["hrv_status"],"days":30}"#;
     let expected = oracle().expected("get_metric_series", args);
@@ -452,6 +455,7 @@ fn eval_4_a_locked_store_tells_the_model_one_word_and_the_turn_goes_on() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn eval_5_provider_errors_are_closed_and_leave_the_conversation_consistent() {
     let runner = Runner::oracle();
     let mut conv = Conversation::new();
@@ -521,6 +525,7 @@ fn an_unknown_tool_name_and_arguments_that_are_not_json_get_fixed_strings_and_ne
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn limits_five_calls_in_a_round_or_a_seventh_round_end_the_turn_and_roll_it_back() {
     let runner = Runner::oracle();
     let settings = local();
@@ -564,6 +569,7 @@ fn an_answer_from_the_core_the_projection_refuses_is_withheld_not_forwarded() {
 // ---- the window ---------------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn ten_questions_with_three_tool_calls_each_stay_under_the_budget_and_keep_the_pairing() {
     let calls = [("get_sleep_detail", "{}"), ("list_activities", "{}"), ("get_metric_series", r#"{"metrics":["steps"],"days":5}"#)];
     let contents: Vec<String> = calls.iter().map(|(name, args)| oracle().expected(name, args)).collect();
@@ -620,6 +626,7 @@ fn provider_bodies_of(requests: &[Value]) -> Vec<Vec<u8>> {
 // ---- off mode and the key -----------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn switching_the_coach_off_mid_question_stops_the_next_request() {
     // the model asks for a tool, the user switches the coach off while the tool runs: the request that would
     // carry the tool result is refused, so nothing leaves after the switch
@@ -649,6 +656,7 @@ fn switching_the_coach_off_mid_question_stops_the_next_request() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn a_failed_question_still_reports_what_left_before_the_failure() {
     let runner = Runner::oracle();
     let settings = local();
@@ -759,6 +767,7 @@ fn off_sends_nothing_builds_no_egress_and_never_reads_the_key() {
 // ---- the real socket ----------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn the_real_egress_puts_only_the_capture_on_a_loopback_socket() {
     const KEY: &str = "sk-test-socket-0123456789";
     let args = r#"{"metrics":["steps"]}"#;

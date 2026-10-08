@@ -168,6 +168,7 @@ fn requests(items: &[(&str, Value)]) -> String {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn in_process_lines_equal_the_sidecars_byte_for_byte() {
     env_init();
     let dir = scratch();
@@ -215,6 +216,7 @@ fn collect() -> Arc<Collect> {
 }
 
 #[tokio::test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 async fn the_router_path_answers_what_the_sidecar_answers() {
     env_init();
     let dir = scratch();
@@ -259,6 +261,7 @@ async fn the_router_path_answers_what_the_sidecar_answers() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 async fn a_fit_that_panics_the_parser_fails_the_file_not_the_app() {
     env_init();
     let dir = scratch();
@@ -362,6 +365,7 @@ fn flaky_runner(session: Session, mut reader: ChannelReader) -> i32 {
 }
 
 #[tokio::test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 async fn a_core_thread_panic_fails_the_caller_and_restarts_once() {
     env_init();
     let dir = scratch();
@@ -442,6 +446,7 @@ async fn the_environment_passphrase_is_never_an_unlock_path_in_process() {
 }
 
 #[tokio::test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 async fn an_empty_folder_dropped_through_the_import_entry_point_answers_started_then_done_with_zero_files() {
     env_init();
     let dir = scratch();
@@ -465,6 +470,7 @@ async fn an_empty_folder_dropped_through_the_import_entry_point_answers_started_
 }
 
 #[tokio::test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 async fn data_contract_lists_the_trend_metrics_and_marks_heart_rate_a_sample() {
     // stands in for the un-capturable open Trends select (pitch 7b-6 section 4)
     env_init();

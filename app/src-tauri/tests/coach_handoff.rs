@@ -35,6 +35,7 @@ fn a_window_outside_seven_twenty_eight_ninety_is_refused_before_any_tool_runs() 
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn build_text_over_real_fixture_answers_names_itself_carries_the_disclaimer_and_stays_in_bounds() {
     let call = canned("synthetic");
     let result = build_text(28, false, &call).expect("builds over real answers");
@@ -51,6 +52,7 @@ fn build_text_over_real_fixture_answers_names_itself_carries_the_disclaimer_and_
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed synthetic stores and transcripts (projects/disconect/tests/fixtures/serve), which are developed in the monorepo and are not in this repository")]
 fn build_text_never_carries_a_clock_time() {
     let call = canned("synthetic-v1");
     let result = build_text(7, false, &call).expect("builds");
