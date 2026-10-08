@@ -243,6 +243,7 @@ fn judge(want: &Json, answer: &Answer) -> Option<String> {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn every_recorded_case_is_answered_like_python() {
     pin_clock();
     let source = std::fs::read_to_string(crate_dir().join("tests/fixtures/read_paths.json"))

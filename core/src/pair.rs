@@ -687,6 +687,7 @@ mod wire_constants {
     /// kb/24 § offer URL grammar: the vectors every parser of the offer text shares
     /// (`projects/disconect/tests/fixtures/pair-offer-urls.json`).
     #[test]
+    #[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
     fn offer_url_vectors_are_shared_with_the_python_oracle() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../disconect/tests/fixtures/pair-offer-urls.json");

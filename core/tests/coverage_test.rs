@@ -60,16 +60,19 @@ fn check(store_file: &str, ledger_file: &str, refinements: bool) {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_ledger_equals_the_oracles_on_the_synthetic_store() {
     check("synthetic.hbdb", "ledger-synthetic.json.gz", true);
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_ledger_equals_the_oracles_on_a_schema_v1_store() {
     check("synthetic-v1.hbdb", "ledger-synthetic-v1.json.gz", false);
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_ledger_shows_every_status_gap_truncation_and_drift_somewhere() {
     let fixture = gunzip_json(&fixtures().join("ledger-synthetic.json.gz"));
     let mut statuses = std::collections::BTreeSet::new();

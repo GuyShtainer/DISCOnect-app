@@ -78,6 +78,7 @@ fn failure(response: &Value) -> (&str, &str) {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_call_that_is_not_well_formed_is_invalid_params() {
     let (_dir, db) = plain_store();
     let mut rig = Rig::new(&db);
@@ -105,6 +106,7 @@ fn a_call_that_is_not_well_formed_is_invalid_params() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn an_unknown_tool_and_rejected_arguments_have_their_own_codes() {
     let (_dir, db) = plain_store();
     let mut rig = Rig::new(&db);
@@ -135,6 +137,7 @@ fn an_unknown_tool_and_rejected_arguments_have_their_own_codes() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_tool_that_fails_answers_its_error_text_under_tool_error() {
     let (_dir, db) = plain_store();
     let mut rig = Rig::new(&db);
@@ -151,6 +154,7 @@ fn a_tool_that_fails_answers_its_error_text_under_tool_error() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_result_names_the_tool_and_coerces_like_the_mcp() {
     let (_dir, db) = plain_store();
     let mut rig = Rig::new(&db);

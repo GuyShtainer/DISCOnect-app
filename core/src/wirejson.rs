@@ -797,6 +797,7 @@ mod tests {
 
     /// `tests/fixtures/mcp/pydantic_floats.json`: what `pydantic_core.to_json` wrote for each float.
     #[test]
+    #[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
     fn every_float_pydantic_wrote_is_reproduced() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../disconect/tests/fixtures/mcp/pydantic_floats.json");

@@ -124,21 +124,25 @@ fn gunzip(path: &Path) -> String {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_rust_core_answers_the_committed_script_like_the_python_oracle() {
     replay("synthetic.hbdb", "oracle-synthetic.jsonl.gz");
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_schema_v1_store() {
     replay("synthetic-v1.hbdb", "oracle-synthetic-v1.jsonl.gz");
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_store_that_never_imported() {
     replay("empty.hbdb", "oracle-empty.jsonl.gz");
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn the_rust_core_answers_the_committed_script_like_the_python_oracle_on_a_store_with_live_readings() {
     replay("synthetic-live.hbdb", "oracle-synthetic-live.jsonl.gz");
 }

@@ -231,6 +231,7 @@ mod tests {
     /// The outcomes `tests/fixtures/strptime-stamps.json` holds were read off the Python the fixture
     /// names (`test_time.py` checks them against its interpreter); a stored cell must read the same here.
     #[test]
+    #[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
     fn a_stored_stamp_reads_as_strptime_reads_it() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../disconect/tests/fixtures/strptime-stamps.json");

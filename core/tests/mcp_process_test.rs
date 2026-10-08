@@ -81,6 +81,7 @@ fn parsed(lines: &[String]) -> Vec<Value> {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn before_initialize_only_ping_is_answered_and_a_second_initialize_is_accepted() {
     let (dir, db) = plain_store();
     let input = [
@@ -113,6 +114,7 @@ fn before_initialize_only_ping_is_answered_and_a_second_initialize_is_accepted()
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn malformed_lines_get_no_answer_and_ids_are_echoed_exactly() {
     let (dir, db) = plain_store();
     let lone = r#"{"jsonrpc":"2.0","id":9,"method":"ping","params":{"x":"\ud800"}}"#;
@@ -170,6 +172,7 @@ fn malformed_lines_get_no_answer_and_ids_are_echoed_exactly() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_bare_cr_ends_a_line_like_pythons_text_stdin() {
     let (dir, db) = plain_store();
     let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\r\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}";
@@ -184,6 +187,7 @@ fn a_bare_cr_ends_a_line_like_pythons_text_stdin() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn end_of_input_ends_the_process_with_exit_zero_within_two_seconds() {
     let (dir, db) = plain_store();
     let mut child = command(&db, dir.path()).spawn().expect("spawn");
@@ -233,6 +237,7 @@ fn ask(stdin: &mut impl Write, stdout: &mut impl BufRead, request: &str) -> Valu
 /// The one way a call can meet an encrypted store: it was encrypted while the server ran (Guy's `key init`
 /// with Claude Desktop open). The server keeps serving and says what to do in the app's words, not Python's.
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_store_encrypted_mid_session_is_answered_in_the_apps_words_and_the_server_keeps_going() {
     let (dir, db) = plain_store();
     let mut child = command(&db, dir.path()).spawn().expect("spawn");
@@ -322,6 +327,7 @@ fn the_passphrase_variable_is_ignored_and_never_printed() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn a_read_that_overflows_is_the_bare_tool_error_text() {
     // the MCP arm of the OverflowError pin (serve_test.rs / test_serve.py pin the serve wire): `Outcome::Crashed`
     // is the framework's bare text, no detail — the oracles no longer carry one since the window clamp
@@ -373,6 +379,7 @@ fn a_missing_store_still_serves_and_names_what_is_missing() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn stderr_gets_one_line_per_method_and_never_a_parameter() {
     let (dir, db) = plain_store();
     let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_activities","arguments":{"limit":"DISTINCTIVE-ARGUMENT"}}}"#;
@@ -399,6 +406,7 @@ fn stderr_gets_one_line_per_method_and_never_a_parameter() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn stray_arguments_are_a_usage_error() {
     let (dir, db) = plain_store();
     let mut with_json = command(&db, dir.path());
@@ -410,6 +418,7 @@ fn stray_arguments_are_a_usage_error() {
 
 /// A model can send a long list: the de-duplication of names must not be quadratic (it was, over a `Vec`).
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn fifty_thousand_metric_names_are_answered_in_two_seconds() {
     let (dir, db) = plain_store();
     let names: Vec<String> = (0..50_000)

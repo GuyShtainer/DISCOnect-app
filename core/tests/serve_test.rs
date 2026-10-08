@@ -339,6 +339,7 @@ fn live_minutes(result: &Value, metric: &str) -> (i64, Value) {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn live_day_merges_overlapping_files_and_keeps_a_midnight_session_on_one_local_day() {
     let (_dir, db) = live_copy();
     let mut rig = Rig::new(&db);
@@ -365,6 +366,7 @@ fn live_day_merges_overlapping_files_and_keeps_a_midnight_session_on_one_local_d
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn live_day_of_a_watch_behind_utc_is_the_local_day_not_the_utc_day() {
     // `day` is the date on the watch's own clock (the stated offset nearest the session's start/end), never
     // the UTC date. The store's watch ran -05:00 from 1 March to 10 April: a session at 2025-03-06T01:00:30Z..01:05:30Z
@@ -404,6 +406,7 @@ fn pair(a: &str, b: &str) -> (String, String) {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_latest_and_named_in_the_watchs_own_clock() {
     let (_dir, db) = live_copy();
     let mut rig = Rig::new(&db);
@@ -433,6 +436,7 @@ fn sleep_night_latest_and_named_in_the_watchs_own_clock() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_with_no_record_or_no_sleep_says_why() {
     let (_dir, db) = live_copy();
     let mut rig = Rig::new(&db);
@@ -451,6 +455,7 @@ fn sleep_night_with_no_record_or_no_sleep_says_why() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_bad_date_is_bad_params() {
     let (_dir, db) = live_copy();
     let mut rig = Rig::new(&db);
@@ -462,6 +467,7 @@ fn sleep_night_bad_date_is_bad_params() {
 /// 7b-4 review N6 (BACKLOG), twin of the Python test: each stage instant is read under the offset nearest to
 /// it; a +1 h change at 22:30Z inside the 06-15 night.
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_stages_across_a_clock_change_show_the_watchs_wall_clock() {
     let (_dir, db) = live_copy();
     let conn = rusqlite::Connection::open(&db).expect("open");
@@ -481,6 +487,7 @@ fn sleep_night_stages_across_a_clock_change_show_the_watchs_wall_clock() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_without_an_offset_has_no_local_keys_and_a_stage_can_cross_midnight() {
     let (_dir, db) = live_copy();
     let conn = rusqlite::Connection::open(&db).expect("open");
@@ -560,6 +567,7 @@ fn only_offsets(conn: &rusqlite::Connection, pairs: &[(&str, i64)]) {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_without_an_end_takes_the_offset_nearest_its_start() {
     // the 06-30 device session runs 21:00Z..04:00Z; the 05:00Z offset is nearest its end, the 21:00Z one its start
     let (_dir, db) = live_copy();
@@ -576,6 +584,7 @@ fn sleep_night_without_an_end_takes_the_offset_nearest_its_start() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn sleep_night_with_two_equally_near_offsets_takes_the_earlier() {
     let (_dir, db) = live_copy();
     let conn = rusqlite::Connection::open(&db).expect("open");
@@ -667,6 +676,7 @@ fn facts_need_an_unlocked_store_and_then_answer() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn facts_parameters_are_integers_and_are_clamped_like_the_oracle() {
     let (_dir, db) = synthetic_copy();
     let mut rig = Rig::new(&db);
@@ -685,6 +695,7 @@ fn facts_parameters_are_integers_and_are_clamped_like_the_oracle() {
 }
 
 #[test]
+#[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
 fn facts_leave_out_the_convention_text_and_the_manufacturer_name() {
     let (_dir, db) = synthetic_copy();
     let result = Rig::new(&db).send("data.facts", json!({}))["result"].clone();
