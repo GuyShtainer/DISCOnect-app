@@ -537,30 +537,53 @@ fn drop_sender(sender: mpsc::Sender<()>) {
 #[test]
 fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
     use disconect_core::relay::lan::{AUTH_HEADER, RESP_HEADER, resp_header_value, token_key, wall_clock};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let key = token_key(&master());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (counter, stopped) = (Arc::clone(&requests), Arc::clone(&stop));
+    // A fake relay that answers every request with a 401 tagged under the right key and a server clock
+    // 10 minutes ahead. It owns the port until the test ends (a listener dropped early frees a port the
+    // process's next relay server may rebind, and that one's answer is not this test's), it reads each
+    // request whole before answering (closing with an unread body is a reset, which the client reads as
+    // unreachable), and it counts the requests the client made.
     let thread = std::thread::spawn(move || {
-        // answers every request with a 401 tagged under the right key and a server clock 10 minutes ahead
-        for _ in 0..2 {
+        while !stopped.load(Ordering::SeqCst) {
             let Ok((mut stream, _)) = listener.accept() else { return };
+            if stopped.load(Ordering::SeqCst) {
+                return; // the test's wake-up connection
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
             let mut raw = Vec::new();
             let mut chunk = [0u8; 4096];
-            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            let header_end = loop {
+                if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break raw.len(),
+                    Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+            let mut lines = head.split("\r\n");
+            let mut first = lines.next().unwrap_or("").split(' ');
+            let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
+            let headers: Vec<(String, String)> = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(n, v)| (n.to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            let header = |name: &str| headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+            let auth = header(&AUTH_HEADER.to_ascii_lowercase()).unwrap_or_default();
+            let body_len: usize = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            while raw.len() < header_end + body_len {
                 match stream.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => raw.extend_from_slice(&chunk[..n]),
                 }
             }
-            let head = String::from_utf8_lossy(&raw).to_string();
-            let mut lines = head.split("\r\n");
-            let mut first = lines.next().unwrap_or("").split(' ');
-            let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
-            let auth = lines
-                .filter_map(|l| l.split_once(':'))
-                .find(|(n, _)| n.eq_ignore_ascii_case(AUTH_HEADER))
-                .map(|(_, v)| v.trim().to_string())
-                .unwrap_or_default();
             let tag = resp_header_value(&*key, method, target, &auth, wall_clock() + 600, 401, b"").expect("tag");
             let _ = stream.write_all(
                 format!("HTTP/1.1 401 X\r\nConnection: close\r\n{RESP_HEADER}: {tag}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
@@ -578,7 +601,11 @@ fn a_verified_refusal_ten_minutes_off_is_relay_auth_failed() {
         error["message"].as_str().expect("message").contains("10 minutes off the relay's"),
         "{error}"
     );
-    drop(thread);
+    // the push's one PUT: the refusal ends the run (no retry, no pull) on this transport
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    stop.store(true, Ordering::SeqCst);
+    drop(std::net::TcpStream::connect(addr)); // wake the accept so the thread sees the flag
+    thread.join().expect("fake relay thread");
 }
 
 fn site_row(id: &str, pushed: i64, healed: i64, pulled: i64, error: Value) -> Value {
