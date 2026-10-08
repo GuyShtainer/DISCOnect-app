@@ -15,6 +15,13 @@ use crate::time::{iso_utc, parse_store_stamp};
 
 const MICROS: i64 = 1_000_000;
 
+/// A `clock_offsets.ts_utc` cell `strptime` refuses, with its text: the twin's `ValueError`. Boxed into
+/// rusqlite's conversion failure by [`ClockOffsets::load`] so a reader can tell it from a cell that is not
+/// even UTF-8 (which the twin raises as a database error).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct BadStamp(pub String);
+
 /// Sorted (moment, offset) pairs with nearest-neighbour lookup.
 #[derive(Debug, Default)]
 pub struct ClockOffsets {
@@ -38,7 +45,7 @@ impl ClockOffsets {
             let (ts_utc, offset_s) = row?;
             // a malformed cell carries strptime's text (the twin raises it from `parse_iso_utc`)
             let ts_utc = parse_store_stamp(&ts_utc).map_err(|text| {
-                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, text.into())
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(BadStamp(text)))
             })?;
             offsets.add(ClockOffset { ts_utc, offset_s });
         }

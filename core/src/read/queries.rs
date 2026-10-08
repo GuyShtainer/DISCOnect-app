@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use super::ReadError;
 use super::coverage;
 use super::pyrepr;
-use crate::clock::ClockOffsets;
+use crate::clock::{BadStamp, ClockOffsets};
 use crate::contract::Contract;
 use crate::model::Instant;
 use crate::time::{iso_utc, now_instant, parse_store_stamp};
@@ -216,8 +216,10 @@ pub fn iso(date: NaiveDate) -> String {
 /// The clock offsets of the store; a malformed `ts_utc` cell is Python's `ValueError`, its text `strptime`'s.
 pub fn load_offsets(conn: &Connection) -> Result<ClockOffsets, ReadError> {
     ClockOffsets::load(conn).map_err(|error| match error {
-        rusqlite::Error::FromSqlConversionFailure(_, _, text) => ReadError::Value(text.to_string()),
-        other => ReadError::Db(other),
+        rusqlite::Error::FromSqlConversionFailure(_, _, inner) if inner.is::<BadStamp>() => {
+            ReadError::Value(inner.to_string())
+        }
+        other => ReadError::Db(other), // a cell that is not UTF-8 is a database error on both cores
     })
 }
 

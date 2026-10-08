@@ -25,27 +25,17 @@ pub fn parse_iso_utc(text: &str) -> Option<Instant> {
 /// the same moment. The error is Python 3.14's `ValueError` text, which the serve layer carries to the wire
 /// as `bad_params`, so a malformed cell reads the same from both cores.
 ///
-/// CPython's `_strptime` compiles the format to one regex, matched at the start of the text and ignoring
-/// case: `(\d\d\d\d)-(1[0-2]|0[1-9]|[1-9])-(3[01]|[12]\d|0[1-9]|[1-9]| [1-9])T(2[0-3]|[0-1]\d|\d):`
-/// `([0-5]\d|\d):(6[0-1]|[0-5]\d|\d)Z`. No match is `time data <repr> does not match format …`; a match
-/// that leaves text over is `unconverted data remains: <rest>`; then the `datetime` constructor checks the
-/// year, the day of the month and the second, in that order, with its own texts. Python's `\d` also takes
-/// non-ASCII decimal digits; this mirror reads ASCII only (the one documented divergence).
+/// CPython 3.14's `_strptime` compiles the format to one regex, matched at the start of the text and
+/// ignoring case: `(\d\d\d\d)-(1[0-2]|0[1-9]|[1-9])-(3[01]|[12]\d|0[1-9]|[1-9]| [1-9])T(2[0-3]|[0-1]\d|\d| \d):`
+/// `([0-5]\d|\d):(6[0-1]|[0-5]\d|\d)Z` (3.14 gave `%H` the spaced one-digit arm `%d` always had). No match
+/// is `time data <repr> does not match format …`; a match that leaves text over is `unconverted data
+/// remains: <rest>`; then the `datetime` constructor checks the year, the day of the month and the second,
+/// in that order, with its own texts. Python's `\d` also takes non-ASCII decimal digits; this mirror reads
+/// ASCII only (the one documented divergence). `tests/fixtures/strptime-stamps.json` pins both cores.
 pub fn parse_store_stamp(text: &str) -> Result<Instant, String> {
     let shape = || format!("time data {} does not match format '{ISO}'", pyrepr::repr_str(text));
     let mut scan = Scan { bytes: text.as_bytes(), at: 0 };
-    let year = scan.year().ok_or_else(shape)?;
-    scan.literal(b'-').then_some(()).ok_or_else(shape)?;
-    let month = scan.month().ok_or_else(shape)?;
-    scan.literal(b'-').then_some(()).ok_or_else(shape)?;
-    let day = scan.day().ok_or_else(shape)?;
-    scan.literal(b'T').then_some(()).ok_or_else(shape)?;
-    let hour = scan.hour().ok_or_else(shape)?;
-    scan.literal(b':').then_some(()).ok_or_else(shape)?;
-    let minute = scan.minute().ok_or_else(shape)?;
-    scan.literal(b':').then_some(()).ok_or_else(shape)?;
-    let second = scan.second().ok_or_else(shape)?;
-    scan.literal(b'Z').then_some(()).ok_or_else(shape)?;
+    let (year, month, day, hour, minute, second) = scan.fields().ok_or_else(shape)?;
     if scan.at != scan.bytes.len() {
         return Err(format!("unconverted data remains: {}", &text[scan.at..])); // the prefix is ASCII: a char boundary
     }
@@ -86,6 +76,17 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
+    /// The six groups with their literals, in the format's order: None where the regex has no match.
+    fn fields(&mut self) -> Option<(u32, u32, u32, u32, u32, u32)> {
+        let year = self.year()?;
+        let month = self.literal(b'-').then(|| self.month())??;
+        let day = self.literal(b'-').then(|| self.day())??;
+        let hour = self.literal(b'T').then(|| self.hour())??;
+        let minute = self.literal(b':').then(|| self.minute())??;
+        let second = self.literal(b':').then(|| self.second())??;
+        self.literal(b'Z').then_some((year, month, day, hour, minute, second))
+    }
+
     fn digit(&self, ahead: usize) -> Option<u32> {
         self.bytes.get(self.at + ahead).filter(|b| b.is_ascii_digit()).map(|b| u32::from(b - b'0'))
     }
@@ -106,6 +107,16 @@ impl Scan<'_> {
             self.at += 1;
             a
         })
+    }
+
+    /// A space then one bounded digit (`%d`'s and `%H`'s ` [1-9]` / ` \d` arms).
+    fn spaced(&mut self, ok: impl Fn(u32) -> bool) -> Option<u32> {
+        if self.bytes.get(self.at) != Some(&b' ') {
+            return None;
+        }
+        let a = self.digit(1).filter(|&d| ok(d))?;
+        self.at += 2;
+        Some(a)
     }
 
     /// A literal, ASCII case-insensitively (`re.IGNORECASE`).
@@ -135,18 +146,15 @@ impl Scan<'_> {
             .or_else(|| self.two(|a| a == 1 || a == 2, |_| true))
             .or_else(|| self.two(|a| a == 0, |b| b >= 1))
             .or_else(|| self.one(|a| a >= 1))
-            .or_else(|| {
-                let spaced = self.bytes.get(self.at) == Some(&b' ') && self.digit(1).is_some_and(|d| d >= 1);
-                spaced.then(|| {
-                    self.at += 1;
-                    self.one(|a| a >= 1)
-                })?
-            })
+            .or_else(|| self.spaced(|a| a >= 1))
     }
 
-    /// `2[0-3]|[0-1]\d|\d`
+    /// `2[0-3]|[0-1]\d|\d| \d`
     fn hour(&mut self) -> Option<u32> {
-        self.two(|a| a == 2, |b| b <= 3).or_else(|| self.two(|a| a <= 1, |_| true)).or_else(|| self.one(|_| true))
+        self.two(|a| a == 2, |b| b <= 3)
+            .or_else(|| self.two(|a| a <= 1, |_| true))
+            .or_else(|| self.one(|_| true))
+            .or_else(|| self.spaced(|_| true))
     }
 
     /// `[0-5]\d|\d`
@@ -220,58 +228,22 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::{iso_from_unix, iso_utc, parse_store_stamp};
 
-    /// Every outcome below was read off CPython 3.14.0 (`datetime.strptime(text, ISO)`); a stored cell must
-    /// read the same from both cores.
-    const STRPTIME_TABLE: &[(&str, Result<&str, &str>)] = &[
-        ("2025-06-15T00:00:00Z", Ok("2025-06-15T00:00:00Z")),
-        ("2025-6-1T0:0:0Z", Ok("2025-06-01T00:00:00Z")),
-        ("2025-06-15t00:00:00z", Ok("2025-06-15T00:00:00Z")),
-        ("2025-06- 5T00:00:00Z", Ok("2025-06-05T00:00:00Z")),
-        ("2025-06-15T1:2:3Z", Ok("2025-06-15T01:02:03Z")),
-        ("2025-06-15T00:00:0Z", Ok("2025-06-15T00:00:00Z")),
-        ("9999-12-31T23:59:59Z", Ok("9999-12-31T23:59:59Z")),
-        ("0001-01-01T00:00:00Z", Ok("0001-01-01T00:00:00Z")),
-        ("2024-02-29T00:00:00Z", Ok("2024-02-29T00:00:00Z")),
-        ("2000-02-29T00:00:00Z", Ok("2000-02-29T00:00:00Z")),
-        ("2025-06-15 00:00:00", Err("time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("", Err("time data '' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("x", Err("time data 'x' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-13-01T00:00:00Z", Err("time data '2025-13-01T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-00-10T00:00:00Z", Err("time data '2025-00-10T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-01-00T00:00:00Z", Err("time data '2025-01-00T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-32T00:00:00Z", Err("time data '2025-06-32T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T24:00:00Z", Err("time data '2025-06-15T24:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:60:00Z", Err("time data '2025-06-15T00:60:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:00:62Z", Err("time data '2025-06-15T00:00:62Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        (" 2025-06-15T00:00:00Z", Err("time data ' 2025-06-15T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:00:00+00:00", Err("time data '2025-06-15T00:00:00+00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15", Err("time data '2025-06-15' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:00:00", Err("time data '2025-06-15T00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-6-1-T00:00:00Z", Err("time data '2025-6-1-T00:00:00Z' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:00:00Ž", Err("time data '2025-06-15T00:00:00Ž' does not match format '%Y-%m-%dT%H:%M:%SZ'")),
-        ("2025-06-15T00:00:00Z ", Err("unconverted data remains:  ")),
-        ("2025-06-15T00:00:00ZZ", Err("unconverted data remains: Z")),
-        ("2025-06-15T00:00:0ZZ", Err("unconverted data remains: Z")),
-        ("2025-06-15T00:00:00Z\n", Err("unconverted data remains: \n")),
-        ("2025-06-15T00:00:00Z\0", Err("unconverted data remains: \0")),
-        ("2025-06-15T00:00:00Z\"\\", Err("unconverted data remains: \"\\")),
-        ("2025-06-3T00:00:00Z1", Err("unconverted data remains: 1")),
-        ("2025-02-30T00:00:00Z", Err("day 30 must be in range 1..28 for month 2 in year 2025")),
-        ("2025-04-31T00:00:00Z", Err("day 31 must be in range 1..30 for month 4 in year 2025")),
-        ("2025-02-29T00:00:00Z", Err("day 29 must be in range 1..28 for month 2 in year 2025")),
-        ("2100-02-29T00:00:00Z", Err("day 29 must be in range 1..28 for month 2 in year 2100")),
-        ("2025-06-15T00:00:60Z", Err("second must be in 0..59, not 60")),
-        ("2025-06-15T00:00:61Z", Err("second must be in 0..59, not 61")),
-        ("0000-01-01T00:00:00Z", Err("year must be in 1..9999, not 0")),
-        ("0000-02-30T00:00:60Z", Err("year must be in 1..9999, not 0")),
-        ("2025-02-30T00:00:60Z", Err("day 30 must be in range 1..28 for month 2 in year 2025")),
-    ];
-
+    /// The outcomes `tests/fixtures/strptime-stamps.json` holds were read off the Python the fixture
+    /// names (`test_time.py` checks them against its interpreter); a stored cell must read the same here.
     #[test]
     fn a_stored_stamp_reads_as_strptime_reads_it() {
-        for (text, expected) in STRPTIME_TABLE {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../disconect/tests/fixtures/strptime-stamps.json");
+        let table: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("fixture")).expect("json");
+        let rows = table["rows"].as_array().expect("rows");
+        assert!(rows.len() >= 50);
+        for row in rows {
+            let text = row[0].as_str().expect("text");
+            let outcome = row[2].as_str().expect("outcome");
+            let expected = if row[1] == "ok" { Ok(outcome) } else { Err(outcome) };
             let got = parse_store_stamp(text).map(|moment| iso_utc(&moment));
-            assert_eq!(got.as_deref().map_err(String::as_str), *expected, "{text:?}");
+            assert_eq!(got.as_deref().map_err(String::as_str), expected, "{text:?}");
         }
     }
 

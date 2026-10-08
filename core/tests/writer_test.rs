@@ -16,7 +16,7 @@ use disconect_core::model::{
 };
 use disconect_core::store::{self, Store};
 use disconect_core::time::parse_iso_utc;
-use disconect_core::writer::{WriteOutcome, Writer, json_summary};
+use disconect_core::writer::{KeptRow, WriteOutcome, Writer, WriterError, json_summary};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -631,4 +631,20 @@ fn parse_failures_carry_the_given_hash_bounds_and_raw_record() {
         ),
         3
     );
+}
+
+#[test]
+fn a_kept_records_span_stamp_strptime_refuses_is_bad_stamp_with_its_text() {
+    // the oracle's keep_undecodable_record raises strptime's ValueError, uncaught, with this text
+    let (_dir, store) = open();
+    let conn = store.conn();
+    let mut writer = writer(conn, "relay");
+    let row = KeptRow { source_scope: "", device_id: None, start_utc: Some("2025-06-15 00:00:00"), end_utc: None };
+    let outcome = writer.keep_undecodable_record("json:unknown", "k1", &row, b"{}", "label", None, None);
+    match outcome {
+        Err(WriterError::BadStamp(text)) => {
+            assert_eq!(text, "time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'")
+        }
+        other => panic!("expected BadStamp, got {other:?}"),
+    }
 }
