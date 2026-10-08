@@ -11,7 +11,7 @@ use chrono::Duration;
 use rusqlite::{Connection, params};
 
 use crate::model::{ClockOffset, Instant};
-use crate::time::{iso_utc, parse_iso_utc};
+use crate::time::{iso_utc, parse_store_stamp};
 
 const MICROS: i64 = 1_000_000;
 
@@ -36,12 +36,9 @@ impl ClockOffsets {
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
         for row in rows {
             let (ts_utc, offset_s) = row?;
-            let ts_utc = parse_iso_utc(&ts_utc).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    "clock_offsets.ts_utc is not YYYY-MM-DDTHH:MM:SSZ".into(),
-                )
+            // a malformed cell carries strptime's text (the twin raises it from `parse_iso_utc`)
+            let ts_utc = parse_store_stamp(&ts_utc).map_err(|text| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, text.into())
             })?;
             offsets.add(ClockOffset { ts_utc, offset_s });
         }

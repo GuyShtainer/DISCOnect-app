@@ -505,6 +505,23 @@ fn sleep_night_without_an_offset_has_no_local_keys_and_a_stage_can_cross_midnigh
     assert_eq!(bare["sessions"][0]["stages"][0]["start_utc"], "2025-06-14T20:30:00Z");
 }
 
+#[test]
+fn a_malformed_clock_offset_cell_reads_as_strptimes_text() {
+    // the twin of test_serve.py's test of the same name: the three texts strptime gives a stored cell
+    let (_dir, db) = plain_store();
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    for (cell, text) in [
+        ("2025-06-15 00:00:00", "time data '2025-06-15 00:00:00' does not match format '%Y-%m-%dT%H:%M:%SZ'"),
+        ("2025-02-30T00:00:00Z", "day 30 must be in range 1..28 for month 2 in year 2025"),
+        ("2025-06-15T00:00:00Z ", "unconverted data remains:  "),
+    ] {
+        only_offsets(&conn, &[(cell, 0)]);
+        let reply = Rig::new(&db).send("data.health", json!({}));
+        assert_eq!(reply["error"]["code"], "bad_params", "{cell:?}: {reply}");
+        assert_eq!(reply["error"]["message"], text, "{cell:?}");
+    }
+}
+
 fn only_offsets(conn: &rusqlite::Connection, pairs: &[(&str, i64)]) {
     conn.execute("DELETE FROM clock_offsets", []).expect("delete");
     for (moment, seconds) in pairs {

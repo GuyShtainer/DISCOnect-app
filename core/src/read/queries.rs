@@ -17,7 +17,7 @@ use super::pyrepr;
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
 use crate::model::Instant;
-use crate::time::{iso_utc, now_instant, parse_iso_utc};
+use crate::time::{iso_utc, now_instant, parse_store_stamp};
 use crate::wirejson::PyStr;
 use crate::writer::{py_round, py_sum};
 
@@ -213,24 +213,17 @@ pub fn iso(date: NaiveDate) -> String {
     format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
 }
 
-/// The clock offsets of the store; an unparseable stored moment is Python's `ValueError`.
+/// The clock offsets of the store; a malformed `ts_utc` cell is Python's `ValueError`, its text `strptime`'s.
 pub fn load_offsets(conn: &Connection) -> Result<ClockOffsets, ReadError> {
     ClockOffsets::load(conn).map_err(|error| match error {
-        rusqlite::Error::FromSqlConversionFailure(..) => {
-            ReadError::Value("time data does not match format '%Y-%m-%dT%H:%M:%SZ'".into())
-        }
+        rusqlite::Error::FromSqlConversionFailure(_, _, text) => ReadError::Value(text.to_string()),
         other => ReadError::Db(other),
     })
 }
 
-/// `parse_iso_utc` of a stored moment; a malformed one is Python's `ValueError`.
+/// `parse_iso_utc` of a stored moment; a malformed one is Python's `ValueError`, its text `strptime`'s.
 pub(crate) fn parse_moment(stamp: &str) -> Result<Instant, ReadError> {
-    parse_iso_utc(stamp).ok_or_else(|| {
-        ReadError::Value(format!(
-            "time data {} does not match format '%Y-%m-%dT%H:%M:%SZ'",
-            pyrepr::repr_str(stamp)
-        ))
-    })
+    parse_store_stamp(stamp).map_err(ReadError::Value)
 }
 
 /// The watch-local date at `moment`, or one microsecond before it (`before`); date arithmetic that
@@ -695,6 +688,7 @@ pub fn latest_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::parse_iso_utc;
 
     #[test]
     fn dates_parse_strictly_and_shift_within_pythons_range() {

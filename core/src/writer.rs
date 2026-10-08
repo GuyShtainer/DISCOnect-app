@@ -22,7 +22,7 @@ use crate::clock::ClockOffsets;
 use crate::fit::{self, FitDecodeError};
 use crate::model::{Decoded, Instant, SleepSession};
 use crate::redact::redact_text;
-use crate::time::{iso_utc, parse_iso_utc, utc_now_iso};
+use crate::time::{iso_utc, parse_iso_utc, parse_store_stamp, utc_now_iso};
 
 /// Readings further apart than this are not consecutive: the watch recorded nothing in between.
 const STEP_GAP_MAX_S: i64 = 15 * 60;
@@ -1000,9 +1000,7 @@ impl<'c> Writer<'c> {
         let stamp = |text: Option<&str>| -> Result<Option<Instant>, WriterError> {
             match text.filter(|t| !t.is_empty()) {
                 None => Ok(None),
-                Some(t) => parse_iso_utc(t).map(Some).ok_or_else(|| {
-                    WriterError::BadStamp(format!("time data {t:?} does not match format '%Y-%m-%dT%H:%M:%SZ'"))
-                }),
+                Some(t) => parse_store_stamp(t).map(Some).map_err(WriterError::BadStamp), // strptime's text
             }
         };
         let mut shell = Decoded::new(stream, if row.source_scope.is_empty() { "vendor_cloud" } else { row.source_scope });
