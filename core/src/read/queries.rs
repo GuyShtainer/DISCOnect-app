@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate, Timelike};
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
@@ -601,9 +601,11 @@ pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<V
     let mut out_sessions = Vec::new();
     for (first, last) in &sessions {
         let (low, high) = (iso_utc(first), iso_utc(last));
+        // the fold floors a reading to its minute, so the count starts at the first reading's minute
+        let minute = iso_utc(&first.with_second(0).ok_or(ReadError::Overflow)?);
         let minutes: i64 = conn.query_row(
             "SELECT count(DISTINCT ts_utc) FROM metric_samples WHERE source_scope=? AND ts_utc BETWEEN ? AND ?",
-            rusqlite::params![LIVE_SCOPE, low, high],
+            rusqlite::params![LIVE_SCOPE, minute, high],
             |row| row.get(0),
         )?;
         out_sessions.push(json!({

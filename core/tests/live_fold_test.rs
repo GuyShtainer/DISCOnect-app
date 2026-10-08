@@ -267,6 +267,7 @@ fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
     let heart = day["metrics"].as_array().unwrap().iter().find(|m| m["metric"] == "heart_rate").unwrap();
     assert_eq!(heart["minutes"], json!(1));
     assert_eq!(day["sessions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(day["sessions"][0]["minutes"], json!(1)); // 23:59:59 owns the folded minute 23:59
     let now = Utc.with_ymd_and_hms(2025, 6, 16, 12, 0, 0).unwrap();
     let report = data_health(store.conn(), contract, 30, now).expect("health");
     assert_eq!(report["live"]["last_day"], json!("9999-01-01"));
@@ -283,6 +284,33 @@ fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
         let day = live_day(store.conn(), contract, &PyStr::from_text(asked)).expect("data.live skips the span");
         assert_eq!(day["sessions"], json!([]), "{asked}");
     }
+}
+
+#[test]
+fn a_session_owns_the_minute_of_a_first_reading_off_the_minute() {
+    // the fold floors readings to the minute, so a session starting at :10 owns that minute: readings at
+    // 1750000030 and 1750000330 are 2 session minutes, as heart_rate says (Python twin: test_live_fold.py)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let folder = dir.path().join("off");
+    fs::create_dir_all(&folder).expect("mkdir");
+    write_session(
+        &folder.join("live-off.jsonl"),
+        &[
+            json!({"t": 1_750_000_030, "metric": "heart_rate", "value": 61}),
+            json!({"t": 1_750_000_330, "metric": "heart_rate", "value": 62}),
+        ],
+    );
+    let store = open(&dir.path().join("s.db"));
+    import_path(store.conn(), &folder, None, None).expect("import");
+    let contract = Contract::get().expect("contract");
+    let day = live_day(store.conn(), contract, &PyStr::from_text("2025-06-15")).expect("data.live");
+    assert_eq!(
+        day["sessions"],
+        json!([{"start_utc": "2025-06-15T15:07:10Z", "end_utc": "2025-06-15T15:12:10Z",
+                "start_local": "2025-06-15T15:07", "end_local": "2025-06-15T15:12", "minutes": 2}])
+    );
+    let heart = day["metrics"].as_array().unwrap().iter().find(|m| m["metric"] == "heart_rate").unwrap();
+    assert_eq!(heart["minutes"], json!(2));
 }
 
 #[test]
