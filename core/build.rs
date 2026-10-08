@@ -9,8 +9,9 @@ use std::path::Path;
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(monorepo)");
     println!("cargo::rerun-if-changed=build.rs");
-    println!("cargo::rerun-if-changed=../disconect/tests/fixtures/serve");
+    // A path that does not exist would make cargo rerun this script (and rebuild the crate) every time.
     if Path::new(env!("CARGO_MANIFEST_DIR")).join("../disconect/tests/fixtures/serve").is_dir() {
+        println!("cargo::rerun-if-changed=../disconect/tests/fixtures/serve");
         println!("cargo::rustc-cfg=monorepo");
     }
 }

@@ -11,8 +11,9 @@ fn main() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (cfg, relative) in [("monorepo", "../../disconect/tests/fixtures/serve"), ("ble_lab", "../../ble-lab")] {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
-        println!("cargo::rerun-if-changed={relative}");
+        // A path that does not exist would make cargo rerun this script every time.
         if here.join(relative).is_dir() {
+            println!("cargo::rerun-if-changed={relative}");
             println!("cargo::rustc-cfg={cfg}");
         }
     }
