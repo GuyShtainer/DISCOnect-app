@@ -530,7 +530,7 @@ fn a_malformed_clock_offset_cell_reads_as_strptimes_text() {
 }
 
 /// The twin of test_serve.py's `OFFSET_CELLS`: the cell's SQL literal and the offset used, or `bad_params`' text.
-const OFFSET_CELLS: [(&str, Result<i64, &str>); 10] = [
+const OFFSET_CELLS: [(&str, Result<i64, &str>); 17] = [
     ("'abc'", Err("invalid literal for int() with base 10: 'abc'")),
     ("3600.5", Ok(3600)),
     ("-0.5", Ok(0)),
@@ -541,7 +541,23 @@ const OFFSET_CELLS: [(&str, Result<i64, &str>); 10] = [
     ("''", Err("invalid literal for int() with base 10: ''")),
     ("x'616263'", Err("invalid literal for int() with base 10: b'abc'")),
     ("'it''s'", Err("invalid literal for int() with base 10: \"it's\"")),
+    ("char(28) || '7'", Err("invalid literal for int() with base 10: '\\x1c7'")),
+    ("'7' || char(31)", Err("invalid literal for int() with base 10: '7\\x1f'")),
+    ("char(160) || '7'", Ok(7)),
+    ("x'1c37'", Err("invalid literal for int() with base 10: b'\\x1c7'")),
+    ("x'c2a037'", Err("invalid literal for int() with base 10: b'\\xc2\\xa07'")),
+    ("x'0b37'", Ok(7)),
+    ("replace(hex(zeroblob(125)), '0', 'a')", Err(LONG_LITERAL_TEXT)),
 ];
+
+/// `int()`'s text for the 250-character cell: CPython's `%.200R` keeps the first 200 characters of the repr.
+const LONG_LITERAL_TEXT: &str = concat!(
+    "invalid literal for int() with base 10: '",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+);
 
 #[test]
 #[cfg_attr(not(monorepo), ignore = "needs the Python oracle's committed fixtures (projects/disconect/tests/fixtures), which are developed in the monorepo and are not in this repository")]
@@ -556,10 +572,7 @@ fn a_hand_edited_clock_offset_cell_reads_as_ints_value() {
         let reply = Rig::new(&db).send("data.sleep", json!({}));
         match outcome {
             Ok(seconds) => assert_eq!(reply["result"]["sessions"][0]["utc_offset_s"], seconds, "{cell}: {reply}"),
-            Err(text) => {
-                assert_eq!(reply["error"]["code"], "bad_params", "{cell}: {reply}");
-                assert_eq!(reply["error"]["message"], text, "{cell}");
-            }
+            Err(text) => assert_eq!(reply["error"], json!({"code": "bad_params", "message": text}), "{cell}"),
         }
     }
 }

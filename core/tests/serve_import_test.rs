@@ -636,6 +636,12 @@ fn import_over_a_malformed_clock_offset_value_is_bad_params_and_leaves_the_store
         ("''", "invalid literal for int() with base 10: ''"),
         ("x'616263'", "invalid literal for int() with base 10: b'abc'"),
         ("'it''s'", "invalid literal for int() with base 10: \"it's\""),
+        ("char(28) || '7'", "invalid literal for int() with base 10: '\\x1c7'"),
+        ("'7' || char(31)", "invalid literal for int() with base 10: '7\\x1f'"),
+        ("x'1c37'", "invalid literal for int() with base 10: b'\\x1c7'"),
+        ("x'c2a037'", "invalid literal for int() with base 10: b'\\xc2\\xa07'"),
+        // `%.200R`: the repr of a 250-character text is cut at 200 characters
+        ("replace(hex(zeroblob(125)), '0', 'a')", &format!("invalid literal for int() with base 10: '{}", "a".repeat(199))),
     ] {
         let (_dir, db, folder) = corrupt_import_rig(&format!(
             "INSERT INTO clock_offsets(ts_utc, offset_s) VALUES('2025-06-15T00:00:00Z', {cell})"

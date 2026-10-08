@@ -35,26 +35,40 @@ fn python_int(cell: &rusqlite::types::Value) -> Result<Option<i64>, BadOffset> {
     use rusqlite::types::Value;
     match cell {
         Value::Integer(n) => Ok(Some(*n)),
-        Value::Real(x) if x.is_finite() && x.abs() < 9.2e18 => Ok(Some(x.trunc() as i64)),
+        // inside i64 exactly: -2**63 is the lowest value, 2**63 the first one past the top
+        Value::Real(x) if *x >= -9_223_372_036_854_775_808.0 && *x < 9_223_372_036_854_775_808.0 => {
+            Ok(Some(x.trunc() as i64))
+        }
         Value::Real(_) | Value::Null => Ok(None),
-        Value::Text(text) => parse_int_literal(text.as_bytes())
-            .ok_or_else(|| BadOffset(format!("invalid literal for int() with base 10: {}", py_repr(text.as_bytes(), false)))),
-        Value::Blob(bytes) => parse_int_literal(bytes)
-            .ok_or_else(|| BadOffset(format!("invalid literal for int() with base 10: {}", py_repr(bytes, true)))),
+        // `int(str)` strips Unicode whitespace (`str.isspace` less U+001C..U+001F); `int(bytes)` only ASCII's
+        Value::Text(text) => parse_int_literal(text.trim_matches(char::is_whitespace).as_bytes())
+            .ok_or_else(|| invalid_literal(text.as_bytes(), false)),
+        Value::Blob(bytes) => parse_int_literal(trim_py_bytes(bytes)).ok_or_else(|| invalid_literal(bytes, true)),
     }
 }
 
-/// Python's `int(str)` grammar over ASCII digits: surrounding whitespace, one sign, digits with single `_` between.
-/// `None` is a literal Python refuses; `Some(None)` one it accepts but an `i64` cannot hold.
-fn parse_int_literal(bytes: &[u8]) -> Option<Option<i64>> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let body = text.trim_matches(|c: char| c.is_whitespace() || ('\x1c'..='\x1f').contains(&c));
-    let (negative, digits) = match body.as_bytes().first()? {
+/// `bytes.strip()`'s set (`Py_ISSPACE`): space, `\t \n \x0b \x0c \r` (Rust's `trim_ascii` leaves out `\x0b`).
+fn trim_py_bytes(bytes: &[u8]) -> &[u8] {
+    let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let start = bytes.iter().position(|b| !space(b)).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| !space(b)).map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// The twin's `ValueError` text: CPython formats it with `%.200R`, so the repr is cut at 200 characters.
+fn invalid_literal(bytes: &[u8], is_bytes: bool) -> BadOffset {
+    let repr: String = py_repr(bytes, is_bytes).chars().take(200).collect();
+    BadOffset(format!("invalid literal for int() with base 10: {repr}"))
+}
+
+/// Python's `int()` grammar over ASCII digits, on a literal its caller already trimmed: one sign, digits with single
+/// `_` between. `None` is a literal Python refuses; `Some(None)` one it accepts but an `i64` cannot hold.
+fn parse_int_literal(body: &[u8]) -> Option<Option<i64>> {
+    let (negative, digits) = match body.first()? {
         b'-' => (true, &body[1..]),
         b'+' => (false, &body[1..]),
         _ => (false, body),
     };
-    let digits = digits.as_bytes();
     if digits.is_empty() || digits[0] == b'_' || digits[digits.len() - 1] == b'_' || digits.windows(2).any(|w| w == b"__") {
         return None;
     }
