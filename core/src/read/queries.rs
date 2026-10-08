@@ -567,7 +567,14 @@ pub fn live_day(conn: &Connection, contract: &Contract, day: &PyStr) -> Result<V
         while let Some(row) = rows.next()? {
             let first = parse_moment(text(row.get_ref(0)?)?)?;
             let last = parse_moment(text(row.get_ref(1)?)?)?;
-            if local_day(&offsets, first, false)? != day && local_day(&offsets, last, false)? != day {
+            // a row written before the live import bound was lowered (9999-01-01Z) may have no local day the
+            // calendar can hold: it is never listed instead of failing the whole read (the Python twin's _span_days)
+            let (Some(first_day), Some(last_day)) =
+                (offsets.local_date_checked(first, false), offsets.local_date_checked(last, false))
+            else {
+                continue;
+            };
+            if first_day != day && last_day != day {
                 continue;
             }
             match sessions.last_mut() {

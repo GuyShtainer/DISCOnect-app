@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use disconect_core::contract::Contract;
 use disconect_core::keys::PassphraseSource;
+use disconect_core::live::T_LIMIT;
 use disconect_core::read::health::data_health;
 use disconect_core::read::queries::live_day;
 use disconect_core::read::insight::{FactsQuery, period_facts};
@@ -246,8 +247,8 @@ fn health_keeps_live_apart() {
 
 #[test]
 fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
-    // T_LIMIT = 9999-01-01T00:00:00Z (the number the Python twin derives); the last reading is 9998-12-31T23:59:59Z
-    const T_LIMIT: i64 = 253_370_764_800;
+    // 9999-01-01T00:00:00Z, the number the Python twin derives; the last reading is 9998-12-31T23:59:59Z
+    assert_eq!(T_LIMIT, 253_370_764_800);
     let dir = tempfile::tempdir().expect("tempdir");
     let folder = dir.path().join("late");
     fs::create_dir_all(&folder).expect("mkdir");
@@ -264,7 +265,21 @@ fn a_reading_at_the_last_accepted_stamp_reads_back_at_a_plus_14_hour_offset() {
     assert_eq!(day["sessions"][0]["end_local"], json!("9999-01-01T13:59"));
     let heart = day["metrics"].as_array().unwrap().iter().find(|m| m["metric"] == "heart_rate").unwrap();
     assert_eq!(heart["minutes"], json!(1));
+    assert_eq!(day["sessions"].as_array().map(Vec::len), Some(1));
     let now = Utc.with_ymd_and_hms(2025, 6, 16, 12, 0, 0).unwrap();
     let report = data_health(store.conn(), contract, 30, now).expect("health");
     assert_eq!(report["live"]["last_day"], json!("9999-01-01"));
+    // a store written before the bound was lowered may hold a span past it: data.live skips it instead of failing
+    store
+        .conn()
+        .execute(
+            "UPDATE raw_records SET start_utc='9999-12-31T23:59:59Z', end_utc='9999-12-31T23:59:59Z' \
+             WHERE stream='json:live'",
+            [],
+        )
+        .expect("legacy span");
+    for asked in ["9999-01-01", "2025-06-15"] {
+        let day = live_day(store.conn(), contract, &PyStr::from_text(asked)).expect("data.live skips the span");
+        assert_eq!(day["sessions"], json!([]), "{asked}");
+    }
 }

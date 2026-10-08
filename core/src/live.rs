@@ -49,8 +49,10 @@ fn non_empty_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Exclusive upper bound of a reading's `t` (unix seconds, 9999-01-01Z): a millisecond stamp falls outside, and a year of headroom keeps every local-day conversion inside the calendar whatever the clock offset.
-const T_LIMIT: i64 = 253_370_764_800;
+/// Exclusive upper bound of a reading's `t` (unix seconds, 9999-01-01Z): a millisecond stamp falls outside, and a
+/// year of headroom keeps every local-day conversion inside the calendar for any clock offset within a year (the
+/// offset itself is unbounded today: BACKLOG). The Python twin is `ingest/live.T_LIMIT`.
+pub const T_LIMIT: i64 = 253_370_764_800;
 
 /// A number (never a bool) in `0 <= t < T_LIMIT`.
 fn is_time(value: &Value) -> bool {
