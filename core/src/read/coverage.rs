@@ -468,8 +468,23 @@ fn analyse(
     first_day: &str,
     last_day: &str,
 ) -> Result<Analysis, ReadError> {
+    analyse_with(conn, contract, first_day, last_day, None)
+}
+
+/// [`analyse`] with offsets the caller already loaded (`None` loads them here, after the window is parsed, as
+/// `_analyse` does).
+fn analyse_with(
+    conn: &Connection,
+    contract: &Contract,
+    first_day: &str,
+    last_day: &str,
+    offsets: Option<ClockOffsets>,
+) -> Result<Analysis, ReadError> {
     let window = Window::new(first_day, last_day)?;
-    let offsets = load_offsets(conn)?;
+    let offsets = match offsets {
+        Some(known) => known,
+        None => load_offsets(conn)?,
+    };
     let refinements = has_table(conn, "export_ranges")? && has_table(conn, "import_failures")?;
     let (streams_for, drift) = declared_and_drift(conn, contract)?;
     let (covered, undatable) = covered_by_stream(conn, &window, &offsets, refinements, &contract.session_streams)?;
@@ -555,13 +570,25 @@ pub fn ledger_ordered(
     last_day: &str,
     window_days: i64,
 ) -> Result<Json, ReadError> {
+    ledger_ordered_with(conn, contract, last_day, window_days, None)
+}
+
+/// [`ledger_ordered`] with offsets the caller already loaded (`data.health` loads the table once).
+pub fn ledger_ordered_with(
+    conn: &Connection,
+    contract: &Contract,
+    last_day: &str,
+    window_days: i64,
+    offsets: Option<ClockOffsets>,
+) -> Result<Json, ReadError> {
     let window_days = window_days.clamp(1, MAX_WINDOW_DAYS);
     let last = parse_date(last_day)?;
-    let analysis = analyse(
+    let analysis = analyse_with(
         conn,
         contract,
         &iso(shift(last, -(window_days - 1))?),
         &iso(last),
+        offsets,
     )?;
     let window = &analysis.window;
     let mut rows = Vec::new();

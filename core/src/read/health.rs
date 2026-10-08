@@ -411,19 +411,20 @@ pub fn data_health_ordered(
     }
     let live_records: i64 =
         conn.query_row("SELECT COUNT(*) FROM raw_records WHERE stream='json:live'", [], |row| row.get(0))?;
+    // one load of clock_offsets: the live block, local_today and the coverage ledger share it
+    let known_offsets = queries::load_offsets(conn)?;
     let live = {
         let mut statement = conn.prepare(
             "SELECT COUNT(*), MIN(ts_utc), MAX(ts_utc) FROM metric_samples WHERE source_scope='live'",
         )?;
         // BL-9: the days are the watch's local days, like every other day in the product
-        let offsets = queries::load_offsets(conn)?;
         let mut rows = statement.query([])?;
         let Some(row) = rows.next()? else { return Err(ReadError::Unexpected("TypeError")) };
         Json::object([
             ("records", Json::int(live_records)),
             ("samples", late.json(row, 0)?),
-            ("first_day", live_day(row, 1, &offsets)?),
-            ("last_day", live_day(row, 2, &offsets)?),
+            ("first_day", live_day(row, 1, &known_offsets)?),
+            ("last_day", live_day(row, 2, &known_offsets)?),
         ])
     };
     let activities: i64 =
@@ -470,8 +471,8 @@ pub fn data_health_ordered(
         })
         .collect();
 
-    let local_today = queries::local_today_at(conn, now)?;
-    let ledger = coverage::ledger_ordered(conn, contract, &local_today, window_days)?;
+    let local_today = queries::local_today_with(&known_offsets, now)?;
+    let ledger = coverage::ledger_ordered_with(conn, contract, &local_today, window_days, Some(known_offsets))?;
     let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let agreement = source_agreement_ordered(conn, contract)?;
     late.finish()?;

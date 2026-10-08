@@ -264,7 +264,12 @@ pub fn local_today(conn: &Connection) -> Result<String, ReadError> {
 
 /// [`local_today`] for a given `now` (the tests pin it without touching the process environment).
 pub fn local_today_at(conn: &Connection, now: Instant) -> Result<String, ReadError> {
-    let local = local_day(&load_offsets(conn)?, now, false)?;
+    local_today_with(&load_offsets(conn)?, now)
+}
+
+/// [`local_today_at`] with offsets the caller already loaded (`data.health` loads the table once).
+pub fn local_today_with(offsets: &ClockOffsets, now: Instant) -> Result<String, ReadError> {
+    let local = local_day(offsets, now, false)?;
     let utc = iso(now.date_naive());
     Ok(if local > utc { local } else { utc })
 }
