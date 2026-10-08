@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::ReadError;
-use super::queries::{fetch_window, iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
+use super::queries::{earlier, fetch_window, iso, load_offsets, local_day, parse_date, parse_moment, shift, text};
 use crate::model::Instant;
 use crate::clock::ClockOffsets;
 use crate::contract::Contract;
@@ -586,7 +586,7 @@ pub(crate) fn ledger_ordered_with(
     let analysis = analyse_with(
         conn,
         contract,
-        &iso(shift(last, -(window_days - 1))?),
+        &iso(earlier(last, window_days - 1)),
         &iso(last),
         offsets,
     )?;

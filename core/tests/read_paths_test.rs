@@ -25,12 +25,12 @@ use disconect_core::wirejson::{self, Json, PyStr};
 const NOW: &str = "2025-07-02T09:30:00Z";
 /// What the generator wrote: cases per function, and how many of them are errors.
 const EXPECTED: [(&str, usize, usize); 6] = [
-    ("metric_series", 319, 95),
+    ("metric_series", 319, 85),
     ("sleep_detail", 130, 75),
     ("list_activities", 43, 0),
-    ("period_facts", 388, 150),
+    ("period_facts", 388, 130),
     ("parse_day", 54, 46),
-    ("window", 180, 68),
+    ("window", 180, 36),
 ];
 
 fn crate_dir() -> PathBuf {

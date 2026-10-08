@@ -138,7 +138,7 @@ pub fn window(
         Some(text) => parse_day(text, "end_date")?,
         None => today_utc(),
     };
-    let start = shift(end, 1 - days)?;
+    let start = earlier(end, days - 1);
     Ok((iso(start), iso(end)))
 }
 
@@ -194,6 +194,19 @@ pub fn shift(date: NaiveDate, days: i64) -> Result<NaiveDate, ReadError> {
         .and_then(|delta| date.checked_add_signed(delta))
         .filter(|moved| (1..=9999).contains(&moved.year()))
         .ok_or(ReadError::Overflow)
+}
+
+/// The calendar's first day: where a window that would start earlier is cut instead of failing.
+pub const CALENDAR_START: NaiveDate = match NaiveDate::from_ymd_opt(1, 1, 1) {
+    Some(date) => date,
+    None => unreachable!(),
+};
+
+/// `days` days before `day`, never before the calendar's first day (0001-01-01): a window that would start
+/// before the calendar is shortened instead of failing the read (the rule `fetch_window` applies at the
+/// ends). Twin of Python's `coverage.earlier`.
+pub fn earlier(day: NaiveDate, days: i64) -> NaiveDate {
+    shift(day, days.checked_neg().unwrap_or(i64::MAX)).unwrap_or(CALENDAR_START)
 }
 
 /// ISO `[low, high)` bounds that over-fetch one day before `first` and two after `last`, clamped to the

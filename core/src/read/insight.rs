@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::ReadError;
 use super::numerics::{fmean, stdev};
-use super::queries::{self, iso, parse_date, round2, shift};
+use super::queries::{self, earlier, iso, parse_date, round2};
 use crate::contract::{Contract, MetricContract};
 use crate::wirejson::{Json, PyStr};
 
@@ -385,9 +385,11 @@ pub fn period_facts_ordered(conn: &Connection, query: &FactsQuery) -> Result<Jso
         return Ok(out);
     };
     let end = parse_date(&as_of)?;
-    let window_start = shift(end, 1 - window_days)?;
-    let baseline_end = shift(window_start, -1)?;
-    let baseline_start = shift(baseline_end, 1 - baseline_days)?;
+    // a window or baseline that would start before the calendar is shortened (at the extreme the baseline is
+    // the calendar's first day, which the window also holds) instead of failing the read
+    let window_start = earlier(end, window_days - 1);
+    let baseline_end = earlier(window_start, 1);
+    let baseline_start = earlier(baseline_end, baseline_days - 1);
     let bounds = Bounds {
         window_from: iso(window_start),
         window_to: as_of.clone(),
