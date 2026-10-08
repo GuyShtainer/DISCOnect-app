@@ -574,7 +574,7 @@ pub fn ledger_ordered(
 }
 
 /// [`ledger_ordered`] with offsets the caller already loaded (`data.health` loads the table once).
-pub fn ledger_ordered_with(
+pub(crate) fn ledger_ordered_with(
     conn: &Connection,
     contract: &Contract,
     last_day: &str,

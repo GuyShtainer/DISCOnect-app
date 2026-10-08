@@ -268,7 +268,7 @@ pub fn local_today_at(conn: &Connection, now: Instant) -> Result<String, ReadErr
 }
 
 /// [`local_today_at`] with offsets the caller already loaded (`data.health` loads the table once).
-pub fn local_today_with(offsets: &ClockOffsets, now: Instant) -> Result<String, ReadError> {
+pub(crate) fn local_today_with(offsets: &ClockOffsets, now: Instant) -> Result<String, ReadError> {
     let local = local_day(offsets, now, false)?;
     let utc = iso(now.date_naive());
     Ok(if local > utc { local } else { utc })

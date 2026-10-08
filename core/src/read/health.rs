@@ -411,13 +411,13 @@ pub fn data_health_ordered(
     }
     let live_records: i64 =
         conn.query_row("SELECT COUNT(*) FROM raw_records WHERE stream='json:live'", [], |row| row.get(0))?;
-    // one load of clock_offsets: the live block, local_today and the coverage ledger share it
+    // one load of clock_offsets: the live block (BL-9: its days are the watch's local days, like every other day
+    // in the product), local_today and the coverage ledger share it
     let known_offsets = queries::load_offsets(conn)?;
     let live = {
         let mut statement = conn.prepare(
             "SELECT COUNT(*), MIN(ts_utc), MAX(ts_utc) FROM metric_samples WHERE source_scope='live'",
         )?;
-        // BL-9: the days are the watch's local days, like every other day in the product
         let mut rows = statement.query([])?;
         let Some(row) = rows.next()? else { return Err(ReadError::Unexpected("TypeError")) };
         Json::object([
